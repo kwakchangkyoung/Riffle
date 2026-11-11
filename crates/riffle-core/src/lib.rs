@@ -1,18 +1,12 @@
 pub mod error;
-
-pub use error::{Error, Result};
+pub mod index;
+pub mod lines;
+pub mod source;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io;
+mod tests;
 
-    #[test]
-    fn test_io_error_conversion() {
-        let io_err = io::Error::new(io::ErrorKind::NotFound, "파일을 찾을 수 없음");
-        let err: Error = io_err.into();
-        match err {
-            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
-        }
-    }
-}
+pub use error::{Error, Result};
+pub use index::{CHECKPOINT_INTERVAL, IndexProgress, LineIndex};
+pub use lines::{Line, LogFile, MAX_DISPLAY_BYTES};
+pub use source::Source;
