@@ -23,6 +23,7 @@ fn print_usage() {
     eprintln!("    lines <start> <cnt>  지정 범위 줄 텍스트를 원문 그대로 출력 (0-based)");
     eprintln!("    open                 열기 후 첫 20줄 읽기까지의 소요 시간 및 내용 출력");
     eprintln!("    search <query> [opt] 파일 전체 검색 (매치 수, 첫 매치/전체 시간, 첫 5줄 출력)");
+    eprintln!("                       옵션: --regex --ignore-case --count-only(줄 출력 생략)");
     eprintln!(
         "    tail                 인덱싱 후 200ms마다 refresh하여 추가분/로테이션 출력 (Ctrl+C까지)"
     );
@@ -67,11 +68,13 @@ fn main() {
             let query = &args[3];
             let mut regex = false;
             let mut case_sensitive = true;
+            let mut count_only = false;
 
             for arg in &args[4..] {
                 match arg.as_str() {
                     "--regex" => regex = true,
                     "--ignore-case" | "-i" => case_sensitive = false,
+                    "--count-only" => count_only = true,
                     other => {
                         eprintln!("경고: 알 수 없는 옵션 '{}'", other);
                     }
@@ -82,7 +85,7 @@ fn main() {
                 regex,
                 case_sensitive,
             };
-            run_search(file_path, query, options);
+            run_search(file_path, query, options, count_only);
         }
         "tail" => run_tail(file_path),
         "copy" => {
@@ -228,8 +231,9 @@ fn run_open(path: &Path) {
     }
 }
 
-/// search 서브커맨드: 파일 전체 검색 실행 후 매치 통계 및 첫 5줄 출력
-fn run_search(path: &Path, query: &str, options: SearchOptions) {
+/// search 서브커맨드: 파일 전체 검색 실행 후 매치 통계 및 첫 5줄 출력.
+/// count_only이면 줄 내용 출력(파일 재스캔)을 생략해 검색 자체의 비용만 측정한다.
+fn run_search(path: &Path, query: &str, options: SearchOptions, count_only: bool) {
     let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
         eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
         process::exit(1);
@@ -287,7 +291,7 @@ fn run_search(path: &Path, query: &str, options: SearchOptions) {
         total_elapsed.as_secs_f64()
     );
 
-    if !first_5_lines.is_empty() {
+    if !count_only && !first_5_lines.is_empty() {
         println!("\n처음 5개 매치 줄 (1-based 줄 번호):");
         print_matching_lines(&log_file, &first_5_lines);
     }
@@ -395,14 +399,16 @@ fn print_matching_lines(log_file: &LogFile, line_nos: &[u64]) {
         return;
     }
 
-    // 인덱스가 없는 경우(인덱싱 전/취소) 64KB 청크로 순차 스캔하며 대상 줄만 출력
+    // 인덱스가 없는 경우(인덱싱 전/취소) 파일을 1MB 청크로 한 번만 순차 스캔한다.
+    // 개행 탐색은 새로 읽은 구간에만 적용하고(이미 검사한 부분 재스캔 없음),
+    // 대상 줄의 앞 MAX_DISPLAY_BYTES만 보관하므로 메모리는 버퍼 수준으로 유지된다.
     let source = log_file.source();
     let total = source.len();
     let mut cur_line = 0u64;
     let mut target_idx = 0usize;
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 1024 * 1024];
     let mut offset = 0u64;
-    let mut carry: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
 
     while offset < total && target_idx < line_nos.len() {
         let want = (total - offset).min(buf.len() as u64) as usize;
@@ -414,32 +420,44 @@ fn print_matching_lines(log_file: &LogFile, line_nos: &[u64]) {
             break;
         }
         offset += n as u64;
-        carry.extend_from_slice(&buf[..n]);
 
-        // 마지막 개행까지는 완성된 줄이므로 처리하고, 나머지는 carry에 남긴다
-        let Some(complete_end) = memchr::memrchr(b'\n', &carry).map(|p| p + 1) else {
-            continue;
-        };
-
-        let mut seg_start = 0usize;
-        for nl_pos in memchr::memchr_iter(b'\n', &carry[..complete_end]) {
-            let raw_line = &carry[seg_start..nl_pos];
-            if cur_line == line_nos[target_idx] {
-                print_raw_line(cur_line, raw_line);
-                target_idx += 1;
-                if target_idx >= line_nos.len() {
-                    break;
+        let mut pos = 0usize;
+        while pos < n && target_idx < line_nos.len() {
+            match memchr::memchr(b'\n', &buf[pos..n]) {
+                Some(rel) => {
+                    let nl = pos + rel;
+                    // cur_line의 마지막 조각을 붙여 줄 완성 → 대상이면 출력
+                    if cur_line == line_nos[target_idx] {
+                        append_capped(&mut line_buf, &buf[pos..nl]);
+                        print_raw_line(cur_line, &line_buf);
+                        line_buf.clear();
+                        target_idx += 1;
+                    }
+                    cur_line += 1;
+                    pos = nl + 1;
+                }
+                None => {
+                    // 개행 없이 청크 끝까지 → cur_line의 첫/중간 조각
+                    if cur_line == line_nos[target_idx] {
+                        append_capped(&mut line_buf, &buf[pos..n]);
+                    }
+                    pos = n;
                 }
             }
-            cur_line += 1;
-            seg_start = nl_pos + 1;
         }
-        carry.drain(..seg_start);
     }
 
     // 파일 끝: 개행 없이 끝난 마지막 줄 처리
-    if target_idx < line_nos.len() && !carry.is_empty() && cur_line == line_nos[target_idx] {
-        print_raw_line(cur_line, &carry);
+    if target_idx < line_nos.len() && cur_line == line_nos[target_idx] && !line_buf.is_empty() {
+        print_raw_line(cur_line, &line_buf);
+    }
+}
+
+/// line_buf가 MAX_DISPLAY_BYTES를 넘지 않도록 조각을 추가한다.
+fn append_capped(buf: &mut Vec<u8>, piece: &[u8]) {
+    let room = riffle_core::MAX_DISPLAY_BYTES.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&piece[..piece.len().min(room)]);
     }
 }
 

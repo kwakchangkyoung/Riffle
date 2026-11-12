@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crate::index::{IndexProgress, LineIndex};
@@ -127,7 +129,15 @@ fn empty_line(line_no: u64) -> Line {
 fn make_line(raw_prefix: &[u8], byte_len: u64, line_no: u64, matcher: Option<&Matcher>) -> Line {
     let take = (byte_len as usize).min(raw_prefix.len());
     let raw_line = &raw_prefix[..take];
-    let (text, truncated) = if byte_len > MAX_DISPLAY_BYTES as u64 {
+    // 줄 전체를 읽은 경우에만 끝의 '\r'을 표시 길이 계산에서 제외한다.
+    // (16KB+1바이트이고 끝이 '\r'인 줄은 \r 제외 시 16KB에 들어가 잘리지 않는다)
+    let full = take as u64 == byte_len;
+    let content_len = if full && raw_line.ends_with(b"\r") {
+        byte_len - 1
+    } else {
+        byte_len
+    };
+    let (text, truncated) = if content_len > MAX_DISPLAY_BYTES as u64 {
         let display_slice =
             truncate_utf8_boundary(&raw_line[..MAX_DISPLAY_BYTES.min(raw_line.len())]);
         (String::from_utf8_lossy(display_slice).into_owned(), true)
@@ -193,12 +203,21 @@ fn decode_line_at(
     Ok((make_line(head, byte_len, line_no, matcher), next_offset))
 }
 
+/// 줄 시작 오프셋 캐시 최대 항목 수
+const LINE_START_CACHE_MAX: usize = 4096;
+
 /// 로그 파일 핸들.
 /// Source(read_at 파일)와 LineIndex(희소 줄 인덱스)를 소유하며,
 /// Send + Sync를 만족하여 Arc<LogFile> 형태로 여러 스레드에서 공유할 수 있다.
 pub struct LogFile {
     source: Source,
     index: LineIndex,
+    /// line_no -> 시작 바이트 오프셋 소형 캐시.
+    /// 체크포인트 사이에 긴 줄이 끼어 있으면 line_start 계산이 그 긴 줄을
+    /// 매번 재스캔하므로, 최근에 확인한 시작 오프셋을 기억해 재스캔을 피한다.
+    line_start_cache: Mutex<HashMap<u64, u64>>,
+    /// refresh() 직렬화용 (동시 호출 시 체크포인트 중복 반영 방지)
+    refresh_lock: Mutex<()>,
 }
 
 impl LogFile {
@@ -206,7 +225,39 @@ impl LogFile {
     pub fn open(path: &Path) -> Result<LogFile> {
         let source = Source::open(path)?;
         let index = LineIndex::new(source.len());
-        Ok(LogFile { source, index })
+        Ok(LogFile {
+            source,
+            index,
+            line_start_cache: Mutex::new(HashMap::new()),
+            refresh_lock: Mutex::new(()),
+        })
+    }
+
+    /// N번째 줄의 시작 오프셋을 캐시를 거쳐 반환한다.
+    /// 캐시 미스 시 index.line_start로 계산하고 결과를 저장한다.
+    fn line_start_offset(&self, line_no: u64) -> Option<u64> {
+        if let Some(&off) = self.line_start_cache.lock().unwrap().get(&line_no) {
+            return Some(off);
+        }
+        let off = self.index.line_start(&self.source, line_no)?;
+        let mut cache = self.line_start_cache.lock().unwrap();
+        if cache.len() >= LINE_START_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(line_no, off);
+        Some(off)
+    }
+
+    /// 확인된 줄 시작 오프셋을 캐시에 기록한다 (next_offset 확보 시 호출).
+    fn cache_line_start(&self, line_no: u64, offset: u64) {
+        if offset >= self.source.len() {
+            return; // 파일 끝 이후는 유효한 줄 시작이 아님
+        }
+        let mut cache = self.line_start_cache.lock().unwrap();
+        if cache.len() >= LINE_START_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(line_no, offset);
     }
 
     /// 파일 소스에 대한 참조를 반환한다.
@@ -249,7 +300,7 @@ impl LogFile {
         let actual_count = (end_line - start) as usize;
         let mut lines = Vec::with_capacity(actual_count);
 
-        let mut current_offset = match self.index.line_start(&self.source, start) {
+        let mut current_offset = match self.line_start_offset(start) {
             Some(offset) => offset,
             None => return Ok(Vec::new()),
         };
@@ -281,6 +332,7 @@ impl LogFile {
                     // 개행이 청크에 없음: 청크 경계에 걸친 긴 줄이므로 개별 디코딩
                     let (line, next_offset) =
                         decode_line_at(&self.source, current_offset, line_no, matcher)?;
+                    self.cache_line_start(line_no + 1, next_offset);
                     lines.push(line);
                     current_offset = next_offset;
                 }
@@ -325,13 +377,13 @@ impl LogFile {
                     let lines_to_skip = (line_no - prev - 1) as usize;
                     match self.source.nth_newline(current_offset, lines_to_skip - 1) {
                         Ok(Some(nl_pos)) => nl_pos + 1,
-                        _ => match self.index.line_start(&self.source, line_no) {
+                        _ => match self.line_start_offset(line_no) {
                             Some(off) => off,
                             None => continue,
                         },
                     }
                 }
-                _ => match self.index.line_start(&self.source, line_no) {
+                _ => match self.line_start_offset(line_no) {
                     Some(off) => off,
                     None => continue,
                 },
@@ -339,6 +391,7 @@ impl LogFile {
 
             let (line, next_offset) =
                 decode_line_at(&self.source, target_offset, line_no, matcher)?;
+            self.cache_line_start(line_no + 1, next_offset);
             lines.push(line);
             prev_line_no = Some(line_no);
             current_offset = next_offset;
@@ -361,7 +414,7 @@ impl LogFile {
         if start > end {
             return Ok(String::new());
         }
-        let Some(mut offset) = self.index.line_start(&self.source, start) else {
+        let Some(mut offset) = self.line_start_offset(start) else {
             return Ok(String::new());
         };
 
@@ -406,8 +459,9 @@ impl LogFile {
             }
         }
 
-        // 개행 없이 파일 끝까지 읽은 경우 pending이 마지막 줄 원문이다.
-        if line_no <= end {
+        // 개행 없이 파일 끝까지 읽었는데 pending이 비어 있으면
+        // (읽는 도중 파일이 잘린 경우) 빈 줄을 추가하지 않는다.
+        if line_no <= end && !pending.is_empty() {
             push_raw_line(&mut out, &pending, need_sep, max_bytes)?;
         }
 
@@ -422,7 +476,7 @@ impl LogFile {
         if no >= total_lines {
             return Ok(None);
         }
-        let Some(mut offset) = self.index.line_start(&self.source, no) else {
+        let Some(mut offset) = self.line_start_offset(no) else {
             return Ok(None);
         };
 
@@ -469,8 +523,12 @@ impl LogFile {
     /// 길이 증가면 Appended → Unchanged.
     /// 파일이 외부에서 잘렸거나 교체된 경우 인덱스는 건드리지 않고 해당 결과만 반환한다.
     pub fn refresh(&self) -> Result<RefreshOutcome> {
+        // 동시 refresh 호출 직렬화: 체크포인트 중복 반영과 경합을 막는다
+        let _guard = self.refresh_lock.lock().unwrap();
+
         // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
         if !self.source.path_matches()? {
+            self.line_start_cache.lock().unwrap().clear();
             return Ok(RefreshOutcome::Replaced);
         }
 
@@ -478,6 +536,7 @@ impl LogFile {
         let file_len = self.source.file_len()?;
         let known_len = self.source.len();
         if file_len < known_len {
+            self.line_start_cache.lock().unwrap().clear();
             return Ok(RefreshOutcome::Truncated);
         }
 
@@ -499,6 +558,9 @@ impl LogFile {
             self.source.set_len(known_len);
             return Err(e);
         }
+        // 이전 마지막 줄이 개행 없이 끝나 있었다면 추가분과 이어져
+        // 줄 경계가 바뀔 수 있으므로 시작 오프셋 캐시를 무효화한다
+        self.line_start_cache.lock().unwrap().clear();
 
         // 실제로 커버된 길이까지만 확인된 길이로 확정한다.
         // (읽는 도중 파일이 잘려 일부만 반영됐으면 다음 refresh가 나머지를 이어서 처리)

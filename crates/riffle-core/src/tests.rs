@@ -1509,3 +1509,126 @@ fn test_read_text_range_100k_lines_matches_naive() {
         assert_eq!(s, expected, "범위 ({}, {}) 불일치", start, end);
     }
 }
+
+// ===== Phase 7 A2/A3/A5 회귀 테스트 =====
+
+/// 검색 헬퍼: 패턴으로 search를 실행해 (outcome, 매치 줄 번호) 반환
+fn run_search(content: &[u8], pattern: &str, regex: bool) -> (SearchOutcome, Vec<u64>) {
+    let tmp = TempTestFile::new("p7_search", content);
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    let matcher = Matcher::new(
+        pattern,
+        SearchOptions {
+            regex,
+            case_sensitive: true,
+        },
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut matched_lines = Vec::new();
+    let outcome = search(
+        &log_file,
+        &matcher,
+        &cancel,
+        &mut |batch| matched_lines.extend_from_slice(batch),
+        &mut |_| {},
+    )
+    .unwrap();
+    (outcome, matched_lines)
+}
+
+#[test]
+fn test_search_regex_cross_line_match_rejected() {
+    // A2: `foo\sbar`는 "foo\nbar"의 개행을 넘어 매치할 수 있지만
+    // 어느 한 줄의 텍스트 안에 매치가 없으므로 기록되지 않아야 한다.
+    let (outcome, lines) = run_search(b"foo\nbar\nbaz foo bar\n", r"foo\sbar", true);
+    assert_eq!(outcome, SearchOutcome::Completed { total: 1 });
+    assert_eq!(lines, vec![2]);
+}
+
+#[test]
+fn test_search_regex_empty_match_pattern() {
+    // A3: `z*`는 모든 위치에서 빈 매치를 반환하지만
+    // 비어있지 않은 매치("z" 포함 줄)만 기록해야 한다.
+    let (outcome, lines) = run_search(b"abc\nazb\nzzz\nfoo\n", "z*", true);
+    assert_eq!(outcome, SearchOutcome::Completed { total: 2 });
+    assert_eq!(lines, vec![1, 2]);
+
+    // `(foo)?` 도 동일: "foo"가 있는 줄만 매치
+    let (outcome, lines) = run_search(b"xxfoo\nbar\nfoofoo\n", "(foo)?", true);
+    assert_eq!(outcome, SearchOutcome::Completed { total: 2 });
+    assert_eq!(lines, vec![0, 2]);
+}
+
+#[test]
+fn test_search_regex_nullable_filter_soundness() {
+    // 첫 바이트 필터를 사용하는 널러블 패턴들에서 결과가 정확해야 한다
+    for (pattern, content, expected) in [
+        ("a?b", b"xb\nab\nac\n".as_slice(), vec![0u64, 1]),
+        (
+            "colou?r",
+            b"color\ncolour\ncolr\n".as_slice(),
+            vec![0u64, 1],
+        ),
+        ("z*", b"no match\nhas z\n".as_slice(), vec![1u64]),
+        ("(?:ab)?c", b"c\nabc\nx\n".as_slice(), vec![0u64, 1]),
+        (
+            "ERROR|WARN?",
+            b"WARN\nERROR\ninfo\n".as_slice(),
+            vec![0u64, 1],
+        ),
+    ] {
+        let (outcome, lines) = run_search(content, pattern, true);
+        assert_eq!(
+            outcome,
+            SearchOutcome::Completed {
+                total: expected.len() as u64
+            },
+            "pattern {}",
+            pattern
+        );
+        assert_eq!(lines, expected, "pattern {}", pattern);
+    }
+}
+
+#[test]
+fn test_line_crlf_boundary_not_truncated() {
+    // A5: 정확히 16KB+1바이트이고 끝이 '\r'인 줄은 \r 제외 시 16KB에 들어가므로
+    // truncated=false 여야 한다.
+    let mut content = Vec::new();
+    let mut line = vec![b'x'; MAX_DISPLAY_BYTES]; // 16384바이트
+    line.push(b'\r'); // +1 = 16385, 끝이 \r
+    content.extend_from_slice(&line);
+    content.push(b'\n');
+    content.extend_from_slice(b"next\n");
+
+    let tmp = TempTestFile::new("cr_boundary", &content);
+    let f = LogFile::open(tmp.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    f.build_index(&cancel, &mut |_| {}).unwrap();
+
+    let lines = f.read_lines(0, 1, None).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].truncated, "16KB+\\r 줄이 잘림으로 표시됨");
+    assert_eq!(lines[0].byte_len, (MAX_DISPLAY_BYTES + 1) as u64);
+}
+
+#[test]
+fn test_line_start_cache_consistency() {
+    // A4: 캐시 사용 후에도 read_lines 결과가 동일해야 한다
+    let mut content = Vec::new();
+    content.extend_from_slice(&vec![b'L'; 300 * 1024]); // 긴 줄 1
+    content.push(b'\n');
+    for i in 0..100 {
+        content.extend_from_slice(format!("normal line {}\n", i).as_bytes());
+    }
+    let tmp = TempTestFile::new("line_cache", &content);
+    let f = LogFile::open(tmp.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    f.build_index(&cancel, &mut |_| {}).unwrap();
+
+    let first = f.read_lines(1, 10, None).unwrap();
+    let second = f.read_lines(1, 10, None).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first[0].text, "normal line 0");
+}

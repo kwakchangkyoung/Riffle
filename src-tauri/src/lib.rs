@@ -7,6 +7,8 @@ pub mod opened;
 pub mod recent;
 pub mod state;
 pub mod tail;
+#[cfg(test)]
+mod testutil;
 
 use commands::{
     cancel_search, close_file, copy_lines, get_filtered_lines, get_full_line, get_lines,

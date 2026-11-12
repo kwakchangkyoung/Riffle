@@ -12,15 +12,15 @@ import {
 
 interface SearchBarProps {
     fileId: number | null;
-    topLine: number;
+    getTopLine: () => number; // 최신 topLine 조회 함수 (매 프레임 리렌더 방지)
     visibleRows: number;
     findSignal?: number; // 증가할 때마다 검색 입력창에 포커스 (메뉴 찾기 이벤트용)
     isFilterMode: boolean;
     onToggleFilterMode: () => void;
     onNavigateToHit: (hit: SearchHit) => void;
     onSearchStarted: (query: QueryOptions, searchId: number) => void;
-    onSearchProgress: (matchCount: number) => void;
-    onSearchDone: (total: number, capped: boolean) => void;
+    onSearchProgress: (searchId: number, matchCount: number) => void;
+    onSearchDone: (searchId: number, total: number, capped: boolean) => void;
     onSearchDensityRequest: (searchId: number) => void;
     onClearSearch: () => void;
     currentHit: SearchHit | null;
@@ -35,7 +35,7 @@ interface SearchBarProps {
 export const SearchBar: React.FC<SearchBarProps> = React.memo(
     ({
         fileId,
-        topLine,
+        getTopLine,
         isFilterMode,
         findSignal = 0,
         onToggleFilterMode,
@@ -68,8 +68,6 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         const searchSeqRef = useRef(0);
         const userNavigatedRef = useRef(false);
         const hasAutoNavigatedRef = useRef(false);
-        const topLineRef = useRef(topLine);
-        topLineRef.current = topLine;
 
         // 메뉴 "찾기" 이벤트(findSignal 증가) 시 검색 입력창 포커스.
         // 마운트 시점의 값은 초기값으로 간주해 무시한다.
@@ -83,41 +81,40 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             }
         }, [findSignal]);
 
-        // 파일 변경 시 검색 상태 초기화
-        useEffect(() => {
+        // 이전 활성 검색과 화면 캐시를 해제한다.
+        // 검색어가 비었거나 무효 정규식이 확정되었을 때만 호출한다.
+        const releaseActiveSearch = useCallback(() => {
             if (activeSearchIdRef.current !== null) {
                 cancelSearch(activeSearchIdRef.current).catch(() => {});
                 activeSearchIdRef.current = null;
             }
-            setQueryText("");
-            setValidationError(null);
+            onClearSearch();
             setIsSearching(false);
             setMatchCount(0);
             setIsSearchDone(false);
             setIsCapped(false);
+            setScannedBytes(0);
+            setTotalBytes(0);
             setCurrentHit(null);
-            onClearSearch();
-        }, [fileId]); // eslint-disable-line react-hooks/exhaustive-deps
+            setValidationError(null);
+        }, [onClearSearch, setCurrentHit]);
 
-        // 250ms 디바운스 검색어 유효성 검사 및 검색 시작
+        // 파일 변경 시 검색 상태 초기화
+        useEffect(() => {
+            releaseActiveSearch();
+            setQueryText("");
+        }, [fileId, releaseActiveSearch]);
+
+        // 250ms 디바운스 검색어 유효성 검사 및 검색 시작.
+        // 디바운스 대기 중에는 이전 활성 쿼리와 본문 캐시를 그대로 유지해
+        // 키 입력마다 화면이 깜빡이지 않게 한다.
         useEffect(() => {
             const trimmed = queryText.trim();
             const seq = ++searchSeqRef.current;
 
-            // 검색 조건이 변경되면 입력 중/무효 상태로 간주하여 즉시 이전 활성 쿼리 및 하이라이트 해제
-            if (activeSearchIdRef.current !== null) {
-                cancelSearch(activeSearchIdRef.current).catch(() => {});
-                activeSearchIdRef.current = null;
-            }
-            onClearSearch();
-            setIsSearching(false);
-            setMatchCount(0);
-            setIsSearchDone(false);
-            setIsCapped(false);
-            setCurrentHit(null);
-
             if (!trimmed || fileId === null) {
-                setValidationError(null);
+                // 빈 검색어는 즉시 확정: 이전 검색을 해제한다
+                releaseActiveSearch();
                 return;
             }
 
@@ -141,12 +138,9 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                             : err instanceof Error
                               ? err.message
                               : "잘못된 검색어입니다.";
+                    // 무효 정규식 확정: 이전 활성 쿼리를 해제하고 에러 표시
+                    releaseActiveSearch();
                     setValidationError(msg);
-                    setIsSearching(false);
-                    setMatchCount(0);
-                    setIsSearchDone(false);
-                    setCurrentHit(null);
-                    onClearSearch();
                     return;
                 }
 
@@ -164,73 +158,87 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
 
                 // 2. 검색 시작 (유효성 검사 통과 및 시작된 경우에만 활성 쿼리로 등록)
                 try {
+                    // Channel 이벤트는 invoke 응답(searchId)보다 먼저 도착할 수 있다.
+                    // 응답 전 이벤트는 버퍼링했다가 resolve 직후 순서대로 재생한다.
+                    const bufferedEvents: SearchEvent[] = [];
+                    let resolvedId = 0;
+                    let hasResolvedId = false;
+
+                    const dispatchEvent = (
+                        event: SearchEvent,
+                        searchId: number,
+                    ) => {
+                        if (event.type === "progress") {
+                            setScannedBytes(event.scannedBytes);
+                            setTotalBytes(event.totalBytes);
+                            setMatchCount(event.matchCount);
+                            onSearchProgress(searchId, event.matchCount);
+                            onSearchDensityRequest(searchId);
+
+                            // 첫 매치 발견 시 사용자가 아직 직접 이동하지 않았다면 첫 결과로 자동 이동
+                            if (
+                                event.matchCount > 0 &&
+                                !userNavigatedRef.current &&
+                                !hasAutoNavigatedRef.current
+                            ) {
+                                hasAutoNavigatedRef.current = true;
+                                const from = Math.floor(getTopLine());
+                                searchNav(searchId, from, true)
+                                    .then((hit) => {
+                                        if (
+                                            searchSeqRef.current !== seq ||
+                                            userNavigatedRef.current
+                                        )
+                                            return;
+                                        if (hit) {
+                                            setCurrentHit(hit);
+                                            onNavigateToHit(hit);
+                                        } else {
+                                            searchHitAt(searchId, 0).then(
+                                                (wrapHit) => {
+                                                    if (
+                                                        searchSeqRef.current !==
+                                                            seq ||
+                                                        userNavigatedRef.current
+                                                    )
+                                                        return;
+                                                    if (wrapHit) {
+                                                        setCurrentHit(wrapHit);
+                                                        onNavigateToHit(
+                                                            wrapHit,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    })
+                                    .catch(() => {});
+                            }
+                        } else if (event.type === "done") {
+                            setIsSearching(false);
+                            setIsSearchDone(true);
+                            setIsCapped(event.capped);
+                            setMatchCount(event.total);
+                            onSearchDone(searchId, event.total, event.capped);
+                            onSearchDensityRequest(searchId);
+                        } else if (event.type === "cancelled") {
+                            setIsSearching(false);
+                        } else if (event.type === "error") {
+                            setIsSearching(false);
+                            setValidationError(event.message);
+                        }
+                    };
+
                     const searchId = await search(
                         fileId,
                         queryDto,
                         (event: SearchEvent) => {
                             if (searchSeqRef.current !== seq) return;
-
-                            if (event.type === "progress") {
-                                setScannedBytes(event.scannedBytes);
-                                setTotalBytes(event.totalBytes);
-                                setMatchCount(event.matchCount);
-                                onSearchProgress(event.matchCount);
-                                onSearchDensityRequest(searchId);
-
-                                // 첫 매치 발견 시 사용자가 아직 직접 이동하지 않았다면 첫 결과로 자동 이동
-                                if (
-                                    event.matchCount > 0 &&
-                                    !userNavigatedRef.current &&
-                                    !hasAutoNavigatedRef.current
-                                ) {
-                                    hasAutoNavigatedRef.current = true;
-                                    const from = Math.floor(topLineRef.current);
-                                    searchNav(searchId, from, true)
-                                        .then((hit) => {
-                                            if (
-                                                searchSeqRef.current !== seq ||
-                                                userNavigatedRef.current
-                                            )
-                                                return;
-                                            if (hit) {
-                                                setCurrentHit(hit);
-                                                onNavigateToHit(hit);
-                                            } else {
-                                                searchHitAt(searchId, 0).then(
-                                                    (wrapHit) => {
-                                                        if (
-                                                            searchSeqRef.current !==
-                                                                seq ||
-                                                            userNavigatedRef.current
-                                                        )
-                                                            return;
-                                                        if (wrapHit) {
-                                                            setCurrentHit(
-                                                                wrapHit,
-                                                            );
-                                                            onNavigateToHit(
-                                                                wrapHit,
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            }
-                                        })
-                                        .catch(() => {});
-                                }
-                            } else if (event.type === "done") {
-                                setIsSearching(false);
-                                setIsSearchDone(true);
-                                setIsCapped(event.capped);
-                                setMatchCount(event.total);
-                                onSearchDone(event.total, event.capped);
-                                onSearchDensityRequest(searchId);
-                            } else if (event.type === "cancelled") {
-                                setIsSearching(false);
-                            } else if (event.type === "error") {
-                                setIsSearching(false);
-                                setValidationError(event.message);
+                            if (!hasResolvedId) {
+                                bufferedEvents.push(event);
+                                return;
                             }
+                            dispatchEvent(event, resolvedId);
                         },
                     );
 
@@ -239,8 +247,16 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                         return;
                     }
 
+                    resolvedId = searchId;
+                    hasResolvedId = true;
                     activeSearchIdRef.current = searchId;
                     onSearchStarted(queryDto, searchId);
+
+                    // 응답 전에 도착한 이벤트를 순서대로 재생
+                    for (const event of bufferedEvents) {
+                        dispatchEvent(event, searchId);
+                    }
+                    bufferedEvents.length = 0;
                 } catch (err) {
                     if (searchSeqRef.current !== seq) return;
                     setIsSearching(false);
@@ -268,7 +284,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             const fromLine =
                 currentHit !== null
                     ? currentHit.line
-                    : Math.floor(topLineRef.current);
+                    : Math.floor(getTopLine());
 
             try {
                 let hit = await searchNav(searchId, fromLine, true);
@@ -283,7 +299,13 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             } catch (err) {
                 console.error("다음 검색 결과 탐색 실패:", err);
             }
-        }, [currentHit, matchCount, onNavigateToHit, setCurrentHit]);
+        }, [
+            currentHit,
+            matchCount,
+            onNavigateToHit,
+            setCurrentHit,
+            getTopLine,
+        ]);
 
         // 이전 결과로 이동
         const handlePrev = useCallback(async () => {
@@ -294,7 +316,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             const fromLine =
                 currentHit !== null
                     ? currentHit.line
-                    : Math.floor(topLineRef.current);
+                    : Math.floor(getTopLine());
 
             try {
                 let hit = await searchNav(searchId, fromLine, false);
@@ -310,7 +332,13 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             } catch (err) {
                 console.error("이전 검색 결과 탐색 실패:", err);
             }
-        }, [currentHit, matchCount, onNavigateToHit, setCurrentHit]);
+        }, [
+            currentHit,
+            matchCount,
+            onNavigateToHit,
+            setCurrentHit,
+            getTopLine,
+        ]);
 
         // 키보드 이벤트: Enter (다음), Shift+Enter (이전), Esc (블러)
         const handleInputKeyDown = (
@@ -329,16 +357,26 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             }
         };
 
-        // 검색창 외부 전역 단축키: Enter / Shift+Enter로 다음/이전 탐색
+        // 검색창 외부 전역 단축키: Enter / Shift+Enter로 다음/이전 탐색.
+        // 입력/버튼 등에 포커스가 있거나 모달이 열려 있거나 이미 처리된
+        // 이벤트(defaultPrevented)는 무시한다 (예: 줄 이동 다이얼로그 Enter).
         useEffect(() => {
             const handleGlobalKeyDown = (e: KeyboardEvent) => {
+                if (e.key !== "Enter" || e.defaultPrevented) return;
+                const active = document.activeElement;
                 if (
-                    document.activeElement === inputRef.current ||
-                    document.activeElement instanceof HTMLTextAreaElement
+                    active instanceof HTMLInputElement ||
+                    active instanceof HTMLTextAreaElement ||
+                    active instanceof HTMLSelectElement ||
+                    active instanceof HTMLButtonElement ||
+                    (active instanceof HTMLElement && active.isContentEditable)
                 ) {
                     return;
                 }
-                if (e.key === "Enter" && activeSearchIdRef.current !== null) {
+                if (document.querySelector('[aria-modal="true"]') !== null) {
+                    return;
+                }
+                if (activeSearchIdRef.current !== null) {
                     e.preventDefault();
                     if (e.shiftKey) {
                         handlePrev();
@@ -351,6 +389,10 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             return () =>
                 window.removeEventListener("keydown", handleGlobalKeyDown);
         }, [handleNext, handlePrev]);
+
+        // 검색 세션이 살아 있고(isSearching/isSearchDone) 결과가 있을 때만
+        // 필터/이동 버튼을 활성화한다. ref가 아닌 state로 판단해 리렌더에 반영된다.
+        const canNavigate = (isSearching || isSearchDone) && matchCount > 0;
 
         // 결과 건수 및 진행률 텍스트
         let resultCountText = "";
@@ -449,9 +491,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                     <button
                         type="button"
                         onClick={onToggleFilterMode}
-                        disabled={
-                            !activeSearchIdRef.current || matchCount === 0
-                        }
+                        disabled={!canNavigate}
                         className={`h-6 px-2 text-xs rounded cursor-pointer transition-colors flex items-center space-x-1 ${
                             isFilterMode
                                 ? "bg-indigo-600 text-white font-medium"
@@ -482,9 +522,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                         <button
                             type="button"
                             onClick={handlePrev}
-                            disabled={
-                                !activeSearchIdRef.current || matchCount === 0
-                            }
+                            disabled={!canNavigate}
                             className="h-6 w-6 flex items-center justify-center rounded text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
                             title="이전 결과 (Shift+Enter)"
                         >
@@ -493,9 +531,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                         <button
                             type="button"
                             onClick={handleNext}
-                            disabled={
-                                !activeSearchIdRef.current || matchCount === 0
-                            }
+                            disabled={!canNavigate}
                             className="h-6 w-6 flex items-center justify-center rounded text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
                             title="다음 결과 (Enter)"
                         >

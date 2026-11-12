@@ -30,8 +30,9 @@ export const Gutter: React.FC<GutterProps> = React.memo(
         onLineClick,
     }) => {
         // 전체 줄 수의 자릿수에 비례하여 폭 계산 (최소 4글자 폭 확보)
+        // 모노스페이스 글자 폭은 폰트 크기의 약 0.6em이므로 fontSize에 연동한다
         const digits = Math.max(4, String(totalLines || 1).length);
-        const gutterWidthPx = (digits + 2) * 8 + 16;
+        const gutterWidthPx = Math.ceil((digits + 2) * fontSize * 0.6) + 16;
 
         const lines: React.ReactNode[] = [];
         for (let i = 0; i < rowCount; i++) {

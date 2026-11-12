@@ -18,6 +18,15 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 /// FSEvents 지연 등에 대비한 폴링 주기
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// tail 감시 루프의 내부 채널 메시지.
+/// notify 이벤트와 외부 중지 신호(Stop)를 하나의 채널로 받아
+/// 대기 중에도 즉시 깨어날 수 있게 한다.
+/// 이벤트 내용은 사용하지 않고 도착 여부만이 wake 신호다.
+pub enum TailLoopMsg {
+    Event,
+    Stop,
+}
+
 /// tail 모드 이벤트 DTO (프론트엔드 ipc.ts의 TailEvent와 1:1)
 #[derive(Serialize, Clone)]
 #[serde(
@@ -80,39 +89,40 @@ fn refresh_once(file: &LogFile, on_event: &mut impl FnMut(TailEvent)) -> bool {
 /// tail 감시 루프 본체.
 /// 파일의 부모 디렉터리를 NonRecursive로 감시하고, 이벤트 수신 또는 1초 타임아웃마다
 /// 디바운스(50ms) 확인 후 refresh()를 호출한다.
-/// stop 플래그가 서거나 로테이션(Rotated)이 감지되면 반환한다.
+/// stop 플래그가 서거나 Stop 메시지가 오거나 로테이션(Rotated)이 감지되면 반환한다.
+/// `tx`는 notify watcher가 Event를 보내는 송신자, `rx`는 루프가 받는 수신자다
+/// (Stop 전송자는 TailHandle이 보관해 중지 시 즉시 깨운다).
 pub fn run_tail_loop(
     file: Arc<LogFile>,
     watch_dir: &Path,
     stop: Arc<AtomicBool>,
+    tx: std::sync::mpsc::Sender<TailLoopMsg>,
+    rx: std::sync::mpsc::Receiver<TailLoopMsg>,
     mut on_event: impl FnMut(TailEvent),
 ) {
-    // notify 이벤트를 std mpsc 채널로 전달
-    let (tx, rx) = std::sync::mpsc::channel::<NotifyEvent>();
+    // notify 이벤트를 TailLoopMsg::Event로 변환해 같은 채널로 전달.
+    // 루프 자체도 송신자 하나를 잡아 두어 감시자가 죽어도 채널이 끊기지 않게 한다
+    // (Stop 수신을 위해 항상 recv_timeout을 사용해야 하므로).
+    let keepalive_tx = tx.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
-        if let Ok(event) = res {
-            let _ = tx.send(event);
+        if res.is_ok() {
+            let _ = tx.send(TailLoopMsg::Event);
         }
     })
     .ok();
 
-    // 감시자 생성/등록 실패 시에도 1초 폴링으로 계속 동작한다
-    let mut watcher_gone = watcher.is_none();
-    let mut watch_failed = false;
+    // 감시자 생성/등록 실패 시에도 타임아웃 폴링으로 계속 동작한다
     if let Some(w) = watcher.as_mut()
         && let Err(e) = w.watch(watch_dir, RecursiveMode::NonRecursive)
     {
         on_event(TailEvent::Error {
             message: format!("디렉터리 감시 시작 실패 ('{}'): {e}", watch_dir.display()),
         });
-        watch_failed = true;
-    }
-    if watch_failed {
         watcher = None;
-        watcher_gone = true;
     }
     // 감시자는 이 함수가 반환할 때까지 살아 있어야 한다
     let _watcher = watcher;
+    let _keepalive_tx = keepalive_tx;
 
     // 시작 시 한 번 즉시 확인 (열기 이후 변경분 반영)
     if !refresh_once(&file, &mut on_event) {
@@ -125,7 +135,7 @@ pub fn run_tail_loop(
             break;
         }
 
-        // 디바운스 잔여 시간 또는 폴링 주기만큼 대기 (이벤트 수신 시 즉시 깸)
+        // 디바운스 잔여 시간 또는 폴링 주기만큼 대기 (이벤트/Stop 수신 시 즉시 깸)
         let since = last_refresh.elapsed();
         let wait = if since >= DEBOUNCE {
             POLL_INTERVAL
@@ -133,13 +143,9 @@ pub fn run_tail_loop(
             DEBOUNCE - since
         };
 
-        if watcher_gone {
-            std::thread::sleep(wait);
-        } else {
-            match rx.recv_timeout(wait) {
-                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => watcher_gone = true,
-            }
+        match rx.recv_timeout(wait) {
+            Ok(TailLoopMsg::Event) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(TailLoopMsg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
         }
 
         if stop.load(Ordering::Relaxed) {
@@ -181,12 +187,21 @@ where
     let file = open_file.file.clone();
     let watch_dir = watch_dir_of(&open_file.path);
 
+    // Stop 메시지로 대기 중인 루프를 즉시 깨우기 위한 채널.
+    // 송신자 하나는 watcher용(run_tail_loop 인자), 하나는 TailHandle이 보관한다.
+    let (tx, rx) = std::sync::mpsc::channel::<TailLoopMsg>();
+    let wake_tx = tx.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
+    let thread_tx = tx;
     let thread = std::thread::spawn(move || {
-        run_tail_loop(file, &watch_dir, thread_stop, on_event);
+        run_tail_loop(file, &watch_dir, thread_stop, thread_tx, rx, on_event);
     });
-    open_file.tail = Some(TailHandle { stop, thread });
+    open_file.tail = Some(TailHandle {
+        stop,
+        wake: wake_tx,
+        thread,
+    });
     Ok(())
 }
 
@@ -198,6 +213,8 @@ pub fn disable_tail(state: &AppState, id: u32) {
     };
     if let Some(handle) = handle {
         handle.stop.store(true, Ordering::Relaxed);
+        // Stop 메시지로 루프를 즉시 깨운 뒤 join하므로 최대 1초 블로킹이 없다
+        let _ = handle.wake.send(TailLoopMsg::Stop);
         let _ = handle.thread.join();
     }
 }
@@ -233,15 +250,7 @@ mod tests {
 
     impl TempFile {
         fn create(content: &[u8]) -> Self {
-            let unique_name = format!(
-                "riffle_tail_test_{}_{}.log",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let path = std::env::temp_dir().join(unique_name);
+            let path = crate::testutil::temp_log_path("tail_test");
             let mut file = std::fs::File::create(&path).expect("임시 파일 생성 실패");
             file.write_all(content).expect("임시 파일 쓰기 실패");
             file.sync_all().expect("임시 파일 플러시 실패");
@@ -302,8 +311,10 @@ mod tests {
         let events2 = events.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, move |e| {
+            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
                 events2.lock().unwrap().push(e);
             });
         });
@@ -328,6 +339,7 @@ mod tests {
         drop(events);
 
         stop.store(true, Ordering::Relaxed);
+        let _ = stop_tx.send(TailLoopMsg::Stop);
         handle.join().expect("tail 스레드 join 실패");
     }
 
@@ -341,8 +353,10 @@ mod tests {
         let events2 = events.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, move |e| {
+            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
                 events2.lock().unwrap().push(e);
             });
         });
@@ -364,6 +378,7 @@ mod tests {
         drop(events);
 
         // 로테이션 감지 후 루프는 스스로 종료한다
+        let _ = stop_tx.send(TailLoopMsg::Stop);
         handle.join().expect("tail 스레드 join 실패");
         let _ = std::fs::remove_file(&moved);
     }
@@ -378,8 +393,10 @@ mod tests {
         let events2 = events.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, move |e| {
+            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
                 events2.lock().unwrap().push(e);
             });
         });
@@ -403,6 +420,7 @@ mod tests {
         )));
         drop(events);
 
+        let _ = stop_tx.send(TailLoopMsg::Stop);
         handle.join().expect("tail 스레드 join 실패");
     }
 

@@ -43,6 +43,8 @@ export const GotoLineDialog: React.FC<GotoLineDialogProps> = ({
     const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
         if (e.key === "Enter") {
             e.preventDefault();
+            // 전역 Enter 핸들러(검색 결과 이동)가 다시 반응하지 않게 차단
+            e.stopPropagation();
             handleSubmit();
         } else if (e.key === "Escape") {
             e.preventDefault();
@@ -53,6 +55,8 @@ export const GotoLineDialog: React.FC<GotoLineDialogProps> = ({
 
     return (
         <div
+            role="dialog"
+            aria-modal="true"
             className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/30 dark:bg-black/50"
             onMouseDown={(e) => {
                 if (e.target === e.currentTarget) onClose();

@@ -7,6 +7,7 @@ interface ScrollbarProps {
     onScroll: (topLine: number) => void;
     densityBins?: number[];
     onTrackHeightChange?: (height: number) => void;
+    onDraggingChange?: (dragging: boolean) => void; // 드래그 시작/종료 알림 (프리페치 제어용)
 }
 
 /**
@@ -21,6 +22,7 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
         onScroll,
         densityBins,
         onTrackHeightChange,
+        onDraggingChange,
     }) => {
         const trackRef = useRef<HTMLDivElement>(null);
         const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -144,6 +146,7 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
             e.preventDefault();
             e.stopPropagation();
             setIsDragging(true);
+            onDraggingChange?.(true);
             dragStartRef.current = {
                 clientY: e.clientY,
                 startTopLine: topLine,
@@ -183,6 +186,7 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
 
             const handleMouseUp = () => {
                 setIsDragging(false);
+                onDraggingChange?.(false);
             };
 
             window.addEventListener("mousemove", handleMouseMove);
@@ -191,7 +195,18 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                 window.removeEventListener("mousemove", handleMouseMove);
                 window.removeEventListener("mouseup", handleMouseUp);
             };
-        }, [isDragging, availableTrack, maxTopLine, onScroll]);
+        }, [
+            isDragging,
+            availableTrack,
+            maxTopLine,
+            onScroll,
+            onDraggingChange,
+        ]);
+
+        // 언마운트 시 드래그 상태가 남지 않도록 해제
+        useEffect(() => {
+            return () => onDraggingChange?.(false);
+        }, [onDraggingChange]);
 
         const canScroll = maxTopLine > 0 && availableTrack > 0;
 

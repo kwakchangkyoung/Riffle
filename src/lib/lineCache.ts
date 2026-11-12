@@ -8,10 +8,19 @@ import {
 export const BLOCK_SIZE = 512;
 export const MAX_BLOCKS = 64;
 
+/** 동시에 진행할 수 있는 블록 요청 수 상한 (빠른 스크롤/드래그 시 IPC 폭주 방지) */
+const MAX_INFLIGHT = 6;
+/** 블록 요청 실패 시 재시도 횟수 (최초 요청 포함 최대 3회) */
+const MAX_ATTEMPTS = 2;
+/** 재시도 기본 지연 시간. 시도 횟수만큼 배수가 붙는다 */
+const RETRY_DELAY_MS = 200;
+
 interface CachedBlock {
     blockIndex: number;
     lines: Line[];
     isIncomplete: boolean;
+    /** 블록을 가져온 시점의 fetchSeq. 현재 seq와 다르면 stale(이전 쿼리 결과) */
+    seq: number;
 }
 
 /**
@@ -26,7 +35,14 @@ export class LineCache {
     private lineCount = 0;
     private isDone = false;
     private blocks = new Map<number, CachedBlock>();
-    private pending = new Set<number>();
+    // blockIndex -> 요청 토큰. 토큰이 바뀌면 진행 중이던 이전 요청 결과는 폐기한다
+    private pending = new Map<number, number>();
+    private requestToken = 0;
+    private attempts = new Map<number, number>();
+    private failedBlocks = new Set<number>();
+    private dragging = false;
+    // 요청 상한 때문에 미뤄둔 블록이 있으면 true. 요청 완료 시 재개에 사용
+    private deferredFetch = false;
     private visibleMinBlock = 0;
     private visibleMaxBlock = 0;
     private listeners = new Set<() => void>();
@@ -61,6 +77,10 @@ export class LineCache {
      * 새 파일 설정 시 기존 캐시와 요청 큐를 초기화합니다.
      */
     public setFile(fileId: number | null): void {
+        // 이미 분리된 상태에서 다시 분리 요청이 오면 아무것도 하지 않는다
+        if (fileId === null && this.fileId === null && !this.isFiltered) {
+            return;
+        }
         this.fileId = fileId;
         this.searchId = null;
         this.isFiltered = false;
@@ -68,6 +88,8 @@ export class LineCache {
         this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
+        this.attempts.clear();
+        this.failedBlocks.clear();
         if (fileId === null) {
             this.lineCount = 0;
             this.isDone = false;
@@ -81,19 +103,24 @@ export class LineCache {
     }
 
     /**
-     * 검색어를 변경하고 캐시를 초기화한 뒤 가시 범위를 즉시 재요청합니다.
+     * 검색어를 변경합니다. 캐시된 블록은 즉시 비우지 않고 stale로만 표시하여
+     * 화면의 기존 텍스트가 유지되게 하고, 응답이 도착한 블록부터 교체합니다.
      */
     public setQuery(query: QueryOptions | null): void {
+        if (this.query === query) {
+            return;
+        }
         this.query = query;
         this.fetchSeq++;
-        this.blocks.clear();
-        this.pending.clear();
+        this.attempts.clear();
+        this.failedBlocks.clear();
         this.refetchLastRange();
         this.notify();
     }
 
     /**
      * 필터 모드 데이터 소스를 설정하고 가시 범위를 즉시 재요청합니다.
+     * 필터 결과 인덱스 기준의 줄 매핑이 바뀌므로 캐시는 전부 비웁니다.
      */
     public setFilteredSource(
         fileId: number | null,
@@ -107,6 +134,8 @@ export class LineCache {
         this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
+        this.attempts.clear();
+        this.failedBlocks.clear();
         this.refetchLastRange();
         this.notify();
     }
@@ -118,6 +147,8 @@ export class LineCache {
         this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
+        this.attempts.clear();
+        this.failedBlocks.clear();
         this.refetchLastRange();
         this.notify();
     }
@@ -173,7 +204,29 @@ export class LineCache {
     }
 
     /**
+     * 해당 줄이 속한 블록의 요청이 최종 실패했는지 확인합니다.
+     */
+    public isLineFailed(lineNo: number): boolean {
+        return this.failedBlocks.has(Math.floor(lineNo / BLOCK_SIZE));
+    }
+
+    /**
+     * 스크롤바 드래그 상태를 설정합니다.
+     * 드래그 중에는 프리페치를 생략하고, 종료 시 미뤄둔 요청을 재개합니다.
+     */
+    public setDragging(dragging: boolean): void {
+        if (this.dragging === dragging) {
+            return;
+        }
+        this.dragging = dragging;
+        if (!dragging) {
+            this.refetchLastRange();
+        }
+    }
+
+    /**
      * 현재 보이는 범위 및 앞뒤 1블록의 데이터를 프리페치 요청합니다.
+     * 진행 중 요청 수가 상한에 도달하면 나머지는 요청 완료 시 이어서 처리됩니다.
      */
     public requestRange(startLine: number, endLine: number): void {
         this.lastRequestedRange = [startLine, endLine];
@@ -191,24 +244,51 @@ export class LineCache {
         this.visibleMinBlock = minBlock;
         this.visibleMaxBlock = maxBlock;
 
-        // 현재 보이는 블록 + 앞뒤 1블록 프리페치
-        const targetMin = Math.max(0, minBlock - 1);
         const maxPossibleBlock =
             this.lineCount > 0
                 ? Math.floor((this.lineCount - 1) / BLOCK_SIZE)
                 : 0;
+        const targetMin = Math.max(0, minBlock - 1);
         const targetMax = Math.min(maxPossibleBlock, maxBlock + 1);
 
-        for (let b = targetMin; b <= targetMax; b++) {
-            const block = this.blocks.get(b);
-            if (block && !block.isIncomplete) {
-                continue;
+        // 보이는 블록부터 요청 (진행 중 요청 수 상한까지)
+        for (let b = minBlock; b <= maxBlock; b++) {
+            if (this.pending.size >= MAX_INFLIGHT) {
+                this.deferredFetch = true;
+                break;
             }
-            if (this.pending.has(b)) {
-                continue;
-            }
-            this.fetchBlock(b);
+            this.fetchBlockIfNeeded(b);
         }
+
+        // 프리페치(앞뒤 1블록): 스크롤바 드래그 중에는 생략
+        if (this.dragging) {
+            return;
+        }
+        for (let b = targetMin; b <= targetMax; b++) {
+            if (b >= minBlock && b <= maxBlock) {
+                continue;
+            }
+            if (this.pending.size >= MAX_INFLIGHT) {
+                this.deferredFetch = true;
+                break;
+            }
+            this.fetchBlockIfNeeded(b);
+        }
+    }
+
+    /**
+     * 블록이 최신 상태가 아니면 요청합니다.
+     * 실패 확정 블록은 다음 세대(쿼리/파일 변경)까지 재요청하지 않습니다.
+     */
+    private fetchBlockIfNeeded(blockIndex: number): void {
+        if (this.pending.has(blockIndex) || this.failedBlocks.has(blockIndex)) {
+            return;
+        }
+        const block = this.blocks.get(blockIndex);
+        if (block && !block.isIncomplete && block.seq === this.fetchSeq) {
+            return;
+        }
+        this.fetchBlock(blockIndex);
     }
 
     private fetchBlock(blockIndex: number): void {
@@ -220,10 +300,16 @@ export class LineCache {
         if (this.isFiltered && currentSearchId === null) {
             return;
         }
+        if (this.pending.has(blockIndex)) {
+            return;
+        }
 
-        this.pending.add(blockIndex);
-        const start = blockIndex * BLOCK_SIZE;
+        this.failedBlocks.delete(blockIndex);
+        const token = ++this.requestToken;
+        this.pending.set(blockIndex, token);
         const seq = this.fetchSeq;
+        const attempt = this.attempts.get(blockIndex) ?? 0;
+        const start = blockIndex * BLOCK_SIZE;
 
         const request =
             this.isFiltered && currentSearchId !== null
@@ -238,42 +324,83 @@ export class LineCache {
 
         request
             .then((lines) => {
+                // 이후 재요청/무효화로 토큰이 바뀐 경우 이전 결과는 폐기
+                if (this.pending.get(blockIndex) !== token) {
+                    return;
+                }
                 this.pending.delete(blockIndex);
+                this.attempts.delete(blockIndex);
 
-                // 요청 도중 쿼리나 파일이 변경되었으면 무시
                 if (this.fetchSeq !== seq) {
+                    // 요청 중 쿼리/파일 세대가 바뀜: 결과를 버리고 최신 범위를 재요청
+                    this.refetchLastRange();
                     return;
                 }
 
                 // 빠른 스크롤 중 화면에서 멀어진(현재 블록에서 ±4블록 밖) 결과는 버림
-                if (
+                const isFar =
                     blockIndex < this.visibleMinBlock - 4 ||
-                    blockIndex > this.visibleMaxBlock + 4
-                ) {
+                    blockIndex > this.visibleMaxBlock + 4;
+                if (!isFar) {
+                    const isIncomplete =
+                        lines.length < BLOCK_SIZE && !this.isDone;
+
+                    this.blocks.set(blockIndex, {
+                        blockIndex,
+                        lines,
+                        isIncomplete,
+                        seq,
+                    });
+
+                    // LRU 용량(최대 64개) 초과 시 가장 오래된 블록 제거
+                    if (this.blocks.size > MAX_BLOCKS) {
+                        const oldestKey = this.blocks.keys().next().value;
+                        if (oldestKey !== undefined) {
+                            this.blocks.delete(oldestKey);
+                        }
+                    }
+
+                    this.notify();
+                }
+                // 상한 때문에 미뤄둔 요청이 있으면 이어서 처리
+                if (this.deferredFetch) {
+                    this.deferredFetch = false;
+                    this.refetchLastRange();
+                }
+            })
+            .catch((err) => {
+                if (this.pending.get(blockIndex) !== token) {
+                    return;
+                }
+                this.pending.delete(blockIndex);
+                console.error(`블록 ${blockIndex} 로드 실패:`, err);
+
+                // 요청 슬롯이 비었으므로 미뤄둔 요청을 이어서 처리
+                if (this.deferredFetch) {
+                    this.deferredFetch = false;
+                    this.refetchLastRange();
+                }
+
+                // 짧은 지연 후 제한적으로 재시도한다
+                if (attempt < MAX_ATTEMPTS) {
+                    this.attempts.set(blockIndex, attempt + 1);
+                    setTimeout(
+                        () => {
+                            if (this.fetchSeq !== seq) {
+                                this.attempts.delete(blockIndex);
+                                return;
+                            }
+                            this.fetchBlock(blockIndex);
+                        },
+                        RETRY_DELAY_MS * (attempt + 1),
+                    );
                     return;
                 }
 
-                const isIncomplete = lines.length < BLOCK_SIZE && !this.isDone;
-
-                this.blocks.set(blockIndex, {
-                    blockIndex,
-                    lines,
-                    isIncomplete,
-                });
-
-                // LRU 용량(최대 64개) 초과 시 가장 오래된 블록 제거
-                if (this.blocks.size > MAX_BLOCKS) {
-                    const oldestKey = this.blocks.keys().next().value;
-                    if (oldestKey !== undefined) {
-                        this.blocks.delete(oldestKey);
-                    }
-                }
-
+                // 최종 실패: 해당 블록은 "불러오기 실패" 플레이스홀더로 표시
+                this.attempts.delete(blockIndex);
+                this.failedBlocks.add(blockIndex);
                 this.notify();
-            })
-            .catch((err) => {
-                this.pending.delete(blockIndex);
-                console.error(`블록 ${blockIndex} 로드 실패:`, err);
             });
     }
 
@@ -287,18 +414,21 @@ export class LineCache {
             return;
         }
         const blockIndex = Math.floor(lineNo / BLOCK_SIZE);
-        const existed = this.blocks.delete(blockIndex);
+        const hadBlock = this.blocks.delete(blockIndex);
+        // 진행 중 요청은 토큰 불일치로 결과가 폐기되도록 pending에서 제거
         this.pending.delete(blockIndex);
-        if (!existed) {
-            return;
-        }
-        if (
+        this.attempts.delete(blockIndex);
+        this.failedBlocks.delete(blockIndex);
+        const inVisibleRange =
             blockIndex >= this.visibleMinBlock - 1 &&
-            blockIndex <= this.visibleMaxBlock + 1
-        ) {
+            blockIndex <= this.visibleMaxBlock + 1;
+        if (inVisibleRange) {
             this.fetchBlock(blockIndex);
         }
-        this.notify();
+        // 캐시된 블록이 실제로 사라진 경우에만 리렌더가 필요하다
+        if (hadBlock) {
+            this.notify();
+        }
     }
 
     /**

@@ -6,10 +6,14 @@ use std::thread::JoinHandle;
 
 use riffle_core::LogFile;
 
+use crate::tail::TailLoopMsg;
+
 /// tail 모드 감시 스레드 핸들
 pub struct TailHandle {
     /// 감시 중지 플래그
     pub stop: Arc<AtomicBool>,
+    /// 감시 루프 깨우기 채널 (Stop 전송 시 대기 없이 즉시 종료)
+    pub wake: std::sync::mpsc::Sender<TailLoopMsg>,
     /// 감시 스레드
     pub thread: JoinHandle<()>,
 }
@@ -57,6 +61,8 @@ pub struct AppState {
     pub recent_files: Mutex<Vec<String>>,
     /// Finder 파일 연결로 열린 경로 (콜드 스타트 시 프론트 리스너 등록 전 도착분)
     pub pending_open: Mutex<Option<String>>,
+    /// 프론트가 take_pending_open을 호출했는지 여부 (호출 = 프론트 준비 완료)
+    pub front_ready: AtomicBool,
 }
 
 impl Default for AppState {
@@ -68,6 +74,7 @@ impl Default for AppState {
             next_search_id: AtomicU32::new(1),
             recent_files: Mutex::new(Vec::new()),
             pending_open: Mutex::new(None),
+            front_ready: AtomicBool::new(false),
         }
     }
 }
@@ -113,6 +120,7 @@ impl AppState {
         };
         if let Some(handle) = tail_handle {
             handle.stop.store(true, Ordering::Relaxed);
+            let _ = handle.wake.send(TailLoopMsg::Stop);
             let _ = handle.thread.join();
         }
 
@@ -135,7 +143,8 @@ impl AppState {
     }
 
     /// 새 검색 상태를 등록한다.
-    /// 같은 file_id를 가진 이전 검색 세션은 취소하고 맵에서 제거한다.
+    /// 대상 파일이 아직 열려 있어야 하며, 같은 file_id를 가진 이전 검색 세션은
+    /// 취소하고 맵에서 제거한다. 파일이 없으면 Err를 반환하고 아무것도 등록하지 않는다.
     pub fn insert_search(
         &self,
         file_id: u32,
@@ -143,7 +152,18 @@ impl AppState {
         results: Arc<RwLock<Vec<u64>>>,
         done: Arc<AtomicBool>,
         capped: Arc<AtomicBool>,
-    ) -> Arc<SearchState> {
+    ) -> Result<Arc<SearchState>, String> {
+        // files를 먼저 확인해 파일이 닫힌 뒤의 검색 등록(스레드 누수)을 막는다.
+        // 락은 중첩하지 않고 순차 획득하므로 데드락이 없다.
+        {
+            let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+            if !files.contains_key(&file_id) {
+                return Err(format!(
+                    "ID {file_id}에 해당하는 열린 파일을 찾을 수 없습니다."
+                ));
+            }
+        }
+
         let mut searches = self.searches.lock().unwrap_or_else(|p| p.into_inner());
 
         // 동일 파일의 기존 검색 자동 취소 및 제거
@@ -167,7 +187,7 @@ impl AppState {
         });
 
         searches.insert(id, search_state.clone());
-        search_state
+        Ok(search_state)
     }
 
     /// ID에 해당하는 검색 상태를 조회한다.
@@ -212,21 +232,53 @@ impl AppState {
     }
 
     /// 보관된 대기 경로를 꺼내고 비운다. 한 번만 값을 반환한다.
+    /// 호출 시점에 프론트 준비가 완료된 것으로 표시한다.
     pub fn take_pending_open(&self) -> Option<String> {
+        self.front_ready.store(true, Ordering::Relaxed);
         self.pending_open
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+    }
+
+    /// 프론트가 준비 완료(take_pending_open 호출)했는지 반환한다.
+    pub fn is_front_ready(&self) -> bool {
+        self.front_ready.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// insert_search의 파일 존재 확인을 통과시키기 위해 임시 LogFile을 등록한다.
+    /// 반환된 경로는 테스트 끝에서 삭제해야 한다.
+    fn insert_test_file(state: &AppState, id: u32) -> PathBuf {
+        let path = crate::testutil::temp_log_path("state_test");
+        std::fs::write(&path, b"x\n").expect("임시 파일 생성 실패");
+        let log = Arc::new(LogFile::open(&path).expect("LogFile::open 실패"));
+        state.files.lock().unwrap().insert(
+            id,
+            OpenFile {
+                file: log,
+                cancel: Arc::new(AtomicBool::new(false)),
+                path: path.clone(),
+                tail: None,
+            },
+        );
+        path
+    }
+
+    fn remove_test_file(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn test_new_search_cancels_and_removes_previous_search() {
         let state = AppState::default();
+        let p1 = insert_test_file(&state, 1);
+        let p2 = insert_test_file(&state, 2);
 
         let cancel1 = Arc::new(AtomicBool::new(false));
         let results1 = Arc::new(RwLock::new(Vec::new()));
@@ -234,13 +286,15 @@ mod tests {
         let capped1 = Arc::new(AtomicBool::new(false));
 
         // 파일 1번에 대한 검색 1 등록
-        let s1 = state.insert_search(
-            1,
-            cancel1.clone(),
-            results1.clone(),
-            done1.clone(),
-            capped1.clone(),
-        );
+        let s1 = state
+            .insert_search(
+                1,
+                cancel1.clone(),
+                results1.clone(),
+                done1.clone(),
+                capped1.clone(),
+            )
+            .unwrap();
         assert_eq!(s1.id, 1);
         assert!(!cancel1.load(Ordering::Relaxed));
         assert!(state.get_search(1).is_ok());
@@ -251,13 +305,15 @@ mod tests {
         let done2 = Arc::new(AtomicBool::new(false));
         let capped2 = Arc::new(AtomicBool::new(false));
 
-        let s2 = state.insert_search(
-            1,
-            cancel2.clone(),
-            results2.clone(),
-            done2.clone(),
-            capped2.clone(),
-        );
+        let s2 = state
+            .insert_search(
+                1,
+                cancel2.clone(),
+                results2.clone(),
+                done2.clone(),
+                capped2.clone(),
+            )
+            .unwrap();
         assert_eq!(s2.id, 2);
         assert!(cancel1.load(Ordering::Relaxed)); // 이전 검색 1 취소됨!
         assert!(!cancel2.load(Ordering::Relaxed));
@@ -270,43 +326,53 @@ mod tests {
         let done3 = Arc::new(AtomicBool::new(false));
         let capped3 = Arc::new(AtomicBool::new(false));
 
-        let s3 = state.insert_search(
-            2,
-            cancel3.clone(),
-            results3.clone(),
-            done3.clone(),
-            capped3.clone(),
-        );
+        let s3 = state
+            .insert_search(
+                2,
+                cancel3.clone(),
+                results3.clone(),
+                done3.clone(),
+                capped3.clone(),
+            )
+            .unwrap();
         assert_eq!(s3.id, 3);
         assert!(!cancel2.load(Ordering::Relaxed));
         assert!(!cancel3.load(Ordering::Relaxed));
         assert_eq!(state.search_count(), 2);
+        remove_test_file(&p1);
+        remove_test_file(&p2);
     }
 
     #[test]
     fn test_close_file_cleans_up_searches() {
         let state = AppState::default();
+        let p10 = insert_test_file(&state, 10);
+        let p20 = insert_test_file(&state, 20);
 
         let cancel1 = Arc::new(AtomicBool::new(false));
         let cancel2 = Arc::new(AtomicBool::new(false));
 
         // 파일 10번에 검색 1 등록
-        let s1 = state.insert_search(
-            10,
-            cancel1.clone(),
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let s1 = state
+            .insert_search(
+                10,
+                cancel1.clone(),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
 
         // 파일 20번에 검색 2 등록
-        let s2 = state.insert_search(
-            20,
-            cancel2.clone(),
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let s2 = state
+            .insert_search(
+                20,
+                cancel2.clone(),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
 
         assert_eq!(state.search_count(), 2);
 
@@ -318,11 +384,30 @@ mod tests {
         assert!(state.get_search(s1.id).is_err());
         assert!(state.get_search(s2.id).is_ok());
         assert_eq!(state.search_count(), 1);
+        remove_test_file(&p10);
+        remove_test_file(&p20);
+    }
+
+    #[test]
+    fn test_insert_search_rejects_closed_file() {
+        let state = AppState::default();
+        // 파일이 등록되지 않은 ID로는 검색을 등록할 수 없다
+        let result = state.insert_search(
+            999,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(result.is_err());
+        assert_eq!(state.search_count(), 0);
     }
 
     #[test]
     fn test_search_state_lifecycle() {
         let state = AppState::default();
+        let p1 = insert_test_file(&state, 1);
+        let p2 = insert_test_file(&state, 2);
 
         let cancel1 = Arc::new(AtomicBool::new(false));
         let results1 = Arc::new(RwLock::new(Vec::new()));
@@ -330,13 +415,15 @@ mod tests {
         let capped1 = Arc::new(AtomicBool::new(false));
 
         // 1. 파일 1번에 대한 검색 1 등록
-        let s1 = state.insert_search(
-            1,
-            cancel1.clone(),
-            results1.clone(),
-            done1.clone(),
-            capped1.clone(),
-        );
+        let s1 = state
+            .insert_search(
+                1,
+                cancel1.clone(),
+                results1.clone(),
+                done1.clone(),
+                capped1.clone(),
+            )
+            .unwrap();
         assert_eq!(s1.id, 1);
         assert_eq!(s1.file_id, 1);
         assert_eq!(state.search_count(), 1);
@@ -348,13 +435,15 @@ mod tests {
         let done2 = Arc::new(AtomicBool::new(false));
         let capped2 = Arc::new(AtomicBool::new(false));
 
-        let s2 = state.insert_search(
-            2,
-            cancel2.clone(),
-            results2.clone(),
-            done2.clone(),
-            capped2.clone(),
-        );
+        let s2 = state
+            .insert_search(
+                2,
+                cancel2.clone(),
+                results2.clone(),
+                done2.clone(),
+                capped2.clone(),
+            )
+            .unwrap();
         assert_eq!(s2.id, 2);
         assert_eq!(state.search_count(), 2);
         assert!(!cancel1.load(Ordering::Relaxed));
@@ -366,13 +455,15 @@ mod tests {
         let done3 = Arc::new(AtomicBool::new(false));
         let capped3 = Arc::new(AtomicBool::new(false));
 
-        let s3 = state.insert_search(
-            1,
-            cancel3.clone(),
-            results3.clone(),
-            done3.clone(),
-            capped3.clone(),
-        );
+        let s3 = state
+            .insert_search(
+                1,
+                cancel3.clone(),
+                results3.clone(),
+                done3.clone(),
+                capped3.clone(),
+            )
+            .unwrap();
         assert_eq!(s3.id, 3);
         assert_eq!(state.search_count(), 2); // s1 제거, s2와 s3 존재
         assert!(cancel1.load(Ordering::Relaxed)); // s1 취소됨!
@@ -393,6 +484,8 @@ mod tests {
         assert!(cancel3.load(Ordering::Relaxed)); // s3 취소됨!
         assert_eq!(state.search_count(), 1); // s2만 남음
         assert!(state.get_search(s3.id).is_err());
+        remove_test_file(&p1);
+        remove_test_file(&p2);
     }
 
     #[test]

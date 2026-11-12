@@ -81,6 +81,11 @@ export default function App() {
     const [findSignal, setFindSignal] = useState(0);
 
     const rowHeight = rowHeightFor(fontSize);
+    // 최신 rowHeight를 ref로 유지해 안정적인 콜백(tail 핸들러 등)에서 참조한다
+    const rowHeightRef = useRef(rowHeight);
+    useEffect(() => {
+        rowHeightRef.current = rowHeight;
+    }, [rowHeight]);
 
     const normalLineCache = useMemo(() => new LineCache(), []);
     const filteredLineCache = useMemo(() => new LineCache(), []);
@@ -111,6 +116,13 @@ export default function App() {
     const lastDensityTimeRef = useRef(0);
     const densityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const activeSearchIdRef = useRef<number | null>(null);
+    // Done 이벤트가 Started보다 먼저 도착한 경우를 대비한 임시 보관
+    const searchDoneRef = useRef<{
+        searchId: number;
+        total: number;
+        capped: boolean;
+    } | null>(null);
+    const topLineRef = useRef(0);
 
     // tail 모드 관련 ref
     const tailEnabledRef = useRef(false);
@@ -148,22 +160,30 @@ export default function App() {
         displayCountRef.current = displayLineCount;
     }, [displayLineCount]);
 
-    // 뷰포트 topLine 변경 래퍼: 맨 아래 여부를 즉시 갱신하고 도달 시 새 줄 카운터를 리셋한다
-    const handleTopLineChange = useCallback(
-        (v: number) => {
-            setTopLine(v);
-            const maxTop = Math.max(
-                0,
-                displayCountRef.current - viewportHeightRef.current / rowHeight,
-            );
-            const atBottom = v >= maxTop - 0.5;
-            atBottomRef.current = atBottom;
-            if (atBottom) {
-                setNewLinesCount(0);
-            }
-        },
-        [rowHeight],
-    );
+    // 뷰포트 topLine 변경 래퍼: 맨 아래 여부를 즉시 갱신하고 도달 시 새 줄 카운터를 리셋한다.
+    // rowHeight 등은 ref로 읽어 콜백 identity가 바뀌지 않게 한다 (tail 재등록 방지)
+    const handleTopLineChange = useCallback((v: number) => {
+        topLineRef.current = v;
+        setTopLine(v);
+        const maxTop = Math.max(
+            0,
+            displayCountRef.current -
+                viewportHeightRef.current / rowHeightRef.current,
+        );
+        const atBottom = v >= maxTop - 0.5;
+        atBottomRef.current = atBottom;
+        if (atBottom) {
+            setNewLinesCount(0);
+        }
+    }, []);
+
+    // 최신 topLine 조회 (SearchBar 등 memoized 자식에 prop 대신 전달)
+    const getTopLine = useCallback(() => topLineRef.current, []);
+
+    // topLine 직접 변경(setTopLine) 경로에 대한 ref 동기화 백업
+    useEffect(() => {
+        topLineRef.current = topLine;
+    }, [topLine]);
 
     // 맨 아래 여부 추적 (줄 수/뷰포트 변화에 대한 백업 갱신)
     useEffect(() => {
@@ -187,6 +207,11 @@ export default function App() {
         },
         [],
     );
+
+    // 스크롤바 트랙 높이 변경 콜백 (인라인 함수면 memoized LogViewport이 무력화된다)
+    const handleTrackHeightChange = useCallback((h: number) => {
+        trackHeightRef.current = h;
+    }, []);
 
     // 파일 열기 처리 함수
     const handleOpenFileByPath = useCallback(
@@ -223,6 +248,7 @@ export default function App() {
             setCurrentHit(null);
             setDensityBins([]);
             activeSearchIdRef.current = null;
+            searchDoneRef.current = null;
             setNewLinesCount(0);
             setLineSelection(null);
             setFullLinePanel(null);
@@ -435,6 +461,21 @@ export default function App() {
                     queryDto,
                 );
             }
+            // Done 이벤트가 Started보다 먼저 도착했다면 완료 상태를 바로 반영
+            const pendingDone = searchDoneRef.current;
+            searchDoneRef.current = null;
+            if (pendingDone !== null && pendingDone.searchId === searchId) {
+                filteredLineCache.setLineCount(pendingDone.total, true);
+                setSearchStatus({
+                    currentHitIndex: null,
+                    matchCount: pendingDone.total,
+                    isSearching: false,
+                    isCapped: pendingDone.capped,
+                    query: queryDto.query,
+                });
+                requestDensityFetch(searchId);
+                return;
+            }
             setSearchStatus({
                 currentHitIndex: null,
                 matchCount: 0,
@@ -444,12 +485,19 @@ export default function App() {
             });
             handleSearchDensityRequest(searchId);
         },
-        [file, normalLineCache, filteredLineCache, handleSearchDensityRequest],
+        [
+            file,
+            normalLineCache,
+            filteredLineCache,
+            handleSearchDensityRequest,
+            requestDensityFetch,
+        ],
     );
 
     // 검색 진행률 업데이트 시 콜백
     const handleSearchProgress = useCallback(
-        (matchCount: number) => {
+        (searchId: number, matchCount: number) => {
+            if (activeSearchIdRef.current !== searchId) return;
             filteredLineCache.setLineCount(matchCount, false);
             setSearchStatus((prev) =>
                 prev
@@ -466,7 +514,12 @@ export default function App() {
 
     // 검색 완료 시 콜백
     const handleSearchDone = useCallback(
-        (total: number, capped: boolean) => {
+        (searchId: number, total: number, capped: boolean) => {
+            // Started보다 먼저 도착한 경우에 대비해 기록해 둔다
+            searchDoneRef.current = { searchId, total, capped };
+            if (activeSearchIdRef.current !== searchId) {
+                return;
+            }
             filteredLineCache.setLineCount(total, true);
             setSearchStatus((prev) =>
                 prev
@@ -478,9 +531,7 @@ export default function App() {
                       }
                     : null,
             );
-            if (activeSearchIdRef.current !== null) {
-                requestDensityFetch(activeSearchIdRef.current);
-            }
+            requestDensityFetch(searchId);
         },
         [filteredLineCache, requestDensityFetch],
     );
@@ -488,12 +539,14 @@ export default function App() {
     // 검색어 초기화/지우기 시 콜백
     const handleClearSearch = useCallback(() => {
         activeSearchIdRef.current = null;
+        searchDoneRef.current = null;
         if (densityTimerRef.current) {
             clearTimeout(densityTimerRef.current);
             densityTimerRef.current = null;
         }
         normalLineCache.setQuery(null);
-        filteredLineCache.clear();
+        // 필터 캐시는 searchId와 함께 분리해 취소된 searchId로 재요청하지 않게 한다
+        filteredLineCache.setFile(null);
         setIsFilterMode(false);
         setSearchStatus(null);
         setCurrentHit(null);
@@ -573,14 +626,14 @@ export default function App() {
             // 맨 아래에 있으면 새 끝으로 자동 스크롤
             const maxTop = Math.max(
                 0,
-                newLineCount - viewportHeightRef.current / rowHeight,
+                newLineCount - viewportHeightRef.current / rowHeightRef.current,
             );
             handleTopLineChange(maxTop);
         } else {
             const added = Math.max(0, newLineCount - oldLineCount);
             setNewLinesCount((prev) => prev + added);
         }
-    }, [normalLineCache, rowHeight, handleTopLineChange]);
+    }, [normalLineCache, handleTopLineChange]);
 
     // 로테이션 감지 시 같은 경로로 자동 재오픈 (tail 상태 유지)
     const handleTailRotated = useCallback(
@@ -630,7 +683,8 @@ export default function App() {
             scrollToBottomAfterReopenRef.current = false;
             const maxTop = Math.max(
                 0,
-                lineCountRef.current - viewportHeightRef.current / rowHeight,
+                lineCountRef.current -
+                    viewportHeightRef.current / rowHeightRef.current,
             );
             handleTopLineChange(maxTop);
         }
@@ -663,17 +717,17 @@ export default function App() {
         handleTailEvent,
         queueTailCommand,
         handleTopLineChange,
-        rowHeight,
     ]);
 
     // "새 줄 N개 ↓" 버튼: 맨 아래로 이동하고 자동 스크롤 재개
     const handleScrollToBottom = useCallback(() => {
         const maxTop = Math.max(
             0,
-            lineCountRef.current - viewportHeightRef.current / rowHeight,
+            lineCountRef.current -
+                viewportHeightRef.current / rowHeightRef.current,
         );
         handleTopLineChange(maxTop);
-    }, [rowHeight, handleTopLineChange]);
+    }, [handleTopLineChange]);
 
     // ===== Phase 5: 편의 기능 =====
 
@@ -930,7 +984,7 @@ export default function App() {
                     <div className="flex-1 flex justify-center max-w-2xl">
                         <SearchBar
                             fileId={file.id}
-                            topLine={topLine}
+                            getTopLine={getTopLine}
                             visibleRows={
                                 viewportHeight > 0
                                     ? viewportHeight / rowHeight
@@ -1040,9 +1094,7 @@ export default function App() {
                             onLineDoubleClick={handleLineDoubleClick}
                             densityBins={densityBins}
                             onViewportHeightChange={setViewportHeight}
-                            onTrackHeightChange={(h) => {
-                                trackHeightRef.current = h;
-                            }}
+                            onTrackHeightChange={handleTrackHeightChange}
                             fontSize={fontSize}
                             rowHeight={rowHeight}
                             selectedRange={selectedRange}

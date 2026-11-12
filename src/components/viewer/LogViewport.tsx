@@ -338,6 +338,12 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             [lineCache],
         );
 
+        // 스크롤바 드래그 상태를 LineCache에 전달 (드래그 중 프리페치 생략)
+        const handleScrollbarDragging = useCallback(
+            (dragging: boolean) => lineCache.setDragging(dragging),
+            [lineCache],
+        );
+
         // 잘린 줄 "전체 보기" 배지: 가로 스크롤 영역 밖 오버레이에 행 위치별로 표시
         const truncatedBadges: {
             index: number;
@@ -407,13 +413,19 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     }}
                 >
                     <span>
-                        {line
-                            ? renderLineContent(
-                                  line.text,
-                                  line.highlights,
-                                  isCurrentHit,
-                              )
-                            : ""}
+                        {line ? (
+                            renderLineContent(
+                                line.text,
+                                line.highlights,
+                                isCurrentHit,
+                            )
+                        ) : lineCache.isLineFailed(index) ? (
+                            <span className="text-zinc-400 dark:text-zinc-600 italic">
+                                불러오기 실패
+                            </span>
+                        ) : (
+                            ""
+                        )}
                     </span>
                     {line !== undefined && line.truncated && (
                         <button
@@ -476,6 +488,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     onScroll={onTopLineChange}
                     densityBins={isFilterMode ? undefined : densityBins}
                     onTrackHeightChange={onTrackHeightChange}
+                    onDraggingChange={handleScrollbarDragging}
                 />
 
                 {/* 잘린 줄 "전체 보기" 배지: 가로 스크롤과 무관하게

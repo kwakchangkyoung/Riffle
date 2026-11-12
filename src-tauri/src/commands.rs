@@ -300,14 +300,24 @@ pub fn run_indexing(
 
 /// 로그 파일을 열고 즉시 파일 정보를 반환하며, 백그라운드에서 인덱싱을 시작한다.
 /// 성공 시 최근 파일 목록을 갱신하고 네이티브 메뉴를 재구성한다.
+/// 파일 열기와 recent.json 읽기-수정-쓰기는 spawn_blocking에서 수행한다.
 #[tauri::command]
 pub async fn open_file(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     path: String,
     on_progress: Channel<IndexProgressDto>,
 ) -> Result<FileInfo, String> {
-    let (info, file, cancel) = open_file_internal(&state, &path)?;
+    // 파일 열기(무거운 IO)를 블로킹 스레드에서 수행.
+    // AppHandle을 통해 블로킹 스레드 안에서 AppState를 다시 얻는다.
+    let open_app = app.clone();
+    let open_path = path.clone();
+    let (info, file, cancel) = tauri::async_runtime::spawn_blocking(move || {
+        let st = open_app.state::<AppState>();
+        open_file_internal(st.inner(), &open_path)
+    })
+    .await
+    .map_err(|e| format!("파일 열기 비동기 태스크 실패: {e}"))??;
 
     std::thread::spawn(move || {
         run_indexing(file, cancel, on_progress);
@@ -315,15 +325,29 @@ pub async fn open_file(
 
     // 최근 파일 기록 + 메뉴의 "최근 파일" 서브메뉴 재구성.
     // 기록/메뉴 갱신 실패는 파일 열기 자체를 실패시키지 않는다.
-    match crate::recent::record_open(&app, &path) {
-        Ok(list) => {
-            app.state::<AppState>().set_recent_files(list.clone());
-            if let Err(e) = crate::menu::apply_menu(&app, &list) {
-                eprintln!("메뉴 갱신 실패: {e}");
+    let recent_app = app.clone();
+    let recent_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::recent::with_recent_lock(|| {
+            match crate::recent::record_open(&recent_app, &recent_path) {
+                Ok(list) => {
+                    // 목록이 이전과 같으면 메뉴 재구성을 생략한다
+                    let prev = recent_app.state::<AppState>().recent_files();
+                    recent_app
+                        .state::<AppState>()
+                        .set_recent_files(list.clone());
+                    if list != prev
+                        && let Err(e) = crate::menu::apply_menu(&recent_app, &list)
+                    {
+                        eprintln!("메뉴 갱신 실패: {e}");
+                    }
+                }
+                Err(e) => eprintln!("최근 파일 기록 실패: {e}"),
             }
-        }
-        Err(e) => eprintln!("최근 파일 기록 실패: {e}"),
-    }
+        })
+    })
+    .await
+    .map_err(|e| format!("최근 파일 기록 비동기 태스크 실패: {e}"))?;
 
     Ok(info)
 }
@@ -414,25 +438,29 @@ pub async fn copy_lines(
 ) -> Result<CopyResult, String> {
     let file = state.get_file(id)?;
 
-    let text = tauri::async_runtime::spawn_blocking(move || {
-        file.read_text_range(start, end, MAX_COPY_BYTES)
-            .map_err(|e| e.to_string())
+    // 100MB 범위 읽기와 클립보드 쓰기(무거운 IO)를 블로킹 스레드에서 수행
+    let clipboard_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let text = file
+            .read_text_range(start, end, MAX_COPY_BYTES)
+            .map_err(|e| e.to_string())?;
+        clipboard_app
+            .clipboard()
+            .write_text(text.clone())
+            .map_err(|e| format!("클립보드 기록 실패: {e}"))?;
+        Ok::<CopyResult, String>(CopyResult {
+            lines: if text.is_empty() {
+                0
+            } else {
+                text.bytes().filter(|&b| b == b'\n').count() as u64 + 1
+            },
+            bytes: text.len() as u64,
+        })
     })
     .await
     .map_err(|e| format!("범위 읽기 비동기 태스크 실패: {e}"))??;
 
-    let lines = if text.is_empty() {
-        0
-    } else {
-        text.bytes().filter(|&b| b == b'\n').count() as u64 + 1
-    };
-    let bytes = text.len() as u64;
-
-    app.clipboard()
-        .write_text(text)
-        .map_err(|e| format!("클립보드 기록 실패: {e}"))?;
-
-    Ok(CopyResult { lines, bytes })
+    Ok(result)
 }
 
 /// no 번째 줄의 원문 전체를 반환한다 (16KB 표시용 잘림 없이, 최대 MAX_FULL_LINE_BYTES).
@@ -478,9 +506,12 @@ pub async fn get_full_line(
 }
 
 /// 최근 파일 목록을 반환한다 (존재하지 않는 경로는 제외).
+/// 경로별 try_exists 확인이 있으므로 블로킹 스레드에서 수행한다.
 #[tauri::command]
 pub async fn get_recent_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    crate::recent::load_recent(&app)
+    tauri::async_runtime::spawn_blocking(move || crate::recent::load_recent(&app))
+        .await
+        .map_err(|e| format!("최근 파일 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
 /// Finder 파일 연결로 보관된 대기 경로를 한 번만 반환한다 (콜드 스타트 대응).
@@ -516,13 +547,14 @@ pub async fn search(
     let done = Arc::new(AtomicBool::new(false));
     let capped = Arc::new(AtomicBool::new(false));
 
+    // 파일이 이미 닫혔으면 Err — 검색 스레드를 띄우지 않는다
     let search_state = state.insert_search(
         id,
         cancel.clone(),
         results.clone(),
         done.clone(),
         capped.clone(),
-    );
+    )?;
     let search_id = search_state.id;
 
     let thread_cancel = cancel;
@@ -670,15 +702,7 @@ mod tests {
 
     impl TempFile {
         fn create(content: &[u8]) -> Self {
-            let unique_name = format!(
-                "riffle_test_{}_{}.log",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let path = std::env::temp_dir().join(unique_name);
+            let path = crate::testutil::temp_log_path("test");
             let mut file = std::fs::File::create(&path).expect("임시 파일 생성 실패");
             file.write_all(content).expect("임시 파일 쓰기 실패");
             file.sync_all().expect("임시 파일 플러시 실패");

@@ -25,9 +25,19 @@ pub fn handle_run_event(app: &AppHandle, event: RunEvent) {
         let Some(path) = urls.iter().rev().find_map(file_url_to_path) else {
             return;
         };
-        app.state::<AppState>().set_pending_open(path.clone());
-        if let Err(e) = app.emit("open-file", path) {
-            eprintln!("open-file 이벤트 전송 실패: {e}");
+        let state = app.state::<AppState>();
+        if state.is_front_ready() {
+            // 프론트 준비 완료: 리스너가 살아 있으므로 emit만 한다.
+            // pending_open에 저장하면 이후 take_pending_open과 중복 열기가 생긴다.
+            if let Err(e) = app.emit("open-file", path) {
+                eprintln!("open-file 이벤트 전송 실패: {e}");
+            }
+        } else {
+            // 콜드 스타트: 프론트 리스너 등록 전일 수 있으므로 저장 + emit 둘 다 한다.
+            state.set_pending_open(path.clone());
+            if let Err(e) = app.emit("open-file", path) {
+                eprintln!("open-file 이벤트 전송 실패: {e}");
+            }
         }
     }
 }

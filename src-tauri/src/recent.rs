@@ -1,8 +1,18 @@
 // 최근 파일 목록 관리 (app_data_dir/recent.json)
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager};
+
+/// recent.json 읽기-수정-쓰기와 메뉴 재구성을 직렬화하는 전역 락
+static RECENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// recent 관련 읽기-수정-쓰기(와 메뉴 재구성)를 하나의 락으로 직렬화한다.
+pub(crate) fn with_recent_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = RECENT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f()
+}
 
 /// 최근 파일 목록 최대 개수
 pub const MAX_RECENT_FILES: usize = 10;
@@ -36,15 +46,23 @@ fn read_recent_file(path: &Path) -> Vec<String> {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
-/// 목록을 recent.json에 저장한다.
+/// 목록을 recent.json에 원자적으로 저장한다.
+/// 임시 파일에 쓴 뒤 rename으로 교체해 중간에 죽어도 파일이 깨지지 않게 한다.
 fn write_recent_file(path: &Path, list: &[String]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("최근 파일 디렉터리 생성 실패 ('{}'): {e}", dir.display()))?;
     }
     let json = serde_json::to_string(list).map_err(|e| e.to_string())?;
-    std::fs::write(path, json)
-        .map_err(|e| format!("최근 파일 저장 실패 ('{}'): {e}", path.display()))
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    std::fs::write(&tmp_path, json)
+        .map_err(|e| format!("최근 파일 임시 저장 실패 ('{}'): {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("최근 파일 저장 실패 ('{}'): {e}", path.display())
+    })
 }
 
 /// 파일 존재 여부 확인 클로저 (없는 경로는 목록에서 제외하기 위해 사용)
@@ -60,6 +78,7 @@ pub fn load_recent(app: &AppHandle) -> Result<Vec<String>, String> {
 
 /// path를 최근 파일 목록 맨 앞에 추가(중복 제거, 최대 10개)하고 저장한다.
 /// 반환값은 갱신된 목록 (메뉴 재구성용).
+/// 읽기-수정-쓰기는 with_recent_lock 안에서 호출해야 직렬화가 보장된다.
 pub fn record_open(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
     let file = recent_file_path(app)?;
     let mut list = read_recent_file(&file);

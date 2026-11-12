@@ -87,8 +87,8 @@ export const FullLinePanel: React.FC<FullLinePanelProps> = ({
                 </button>
             </div>
 
-            {/* 본문 */}
-            <div className="flex-1 min-h-0 overflow-auto">
+            {/* 본문 (select-text: Cmd+C 시 DOM 선택 내용을 복사할 수 있게) */}
+            <div className="flex-1 min-h-0 overflow-auto select-text">
                 {state.status === "loading" && (
                     <div className="p-4 text-xs text-zinc-500 dark:text-zinc-400">
                         불러오는 중…
