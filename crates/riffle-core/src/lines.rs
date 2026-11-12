@@ -24,6 +24,26 @@ pub struct Line {
     pub highlights: Vec<(u32, u32)>,
 }
 
+/// LogFile::refresh()의 판정 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// 파일 상태에 변화가 없음
+    Unchanged,
+    /// 최초 인덱싱이 미완료라 아직 추가분을 반영하지 않음 (나중에 다시 호출)
+    Pending,
+    /// 추가분 반영 완료. old_line_count는 반영 전 줄 수.
+    /// 반영 전 마지막 줄이 개행 없이 끝나 있었다면 그 줄의 내용이 바뀌었을 수 있다.
+    Appended {
+        old_line_count: u64,
+        new_line_count: u64,
+        new_len: u64,
+    },
+    /// 열린 파일 핸들의 크기가 줄어듦 (truncate)
+    Truncated,
+    /// 경로가 가리키는 파일이 다른 inode/dev로 바뀜(rename 로테이션) 또는 경로의 파일이 사라짐
+    Replaced,
+}
+
 /// UTF-8 문자 경계를 깨지 않도록 최대 max_bytes 이하의 유효한 경계까지 후퇴하여 슬라이스를 반환한다.
 pub(crate) fn truncate_utf8_boundary(bytes: &[u8]) -> &[u8] {
     if bytes.is_empty() {
@@ -66,32 +86,36 @@ pub(crate) fn truncate_utf8_boundary(bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// 지정된 오프셋에서 한 줄을 디코딩하고 (Line, 다음 줄 시작 오프셋)을 반환한다.
-fn decode_line_at(
-    source: &Source,
-    offset: u64,
-    line_no: u64,
-    matcher: Option<&Matcher>,
-) -> (Line, u64) {
-    let remaining_bytes = source.bytes(offset, source.len());
-    let (raw_line, next_offset) = match memchr::memchr(b'\n', remaining_bytes) {
-        Some(nl_pos) => (&remaining_bytes[..nl_pos], offset + nl_pos as u64 + 1),
-        None => (remaining_bytes, source.len()),
-    };
+/// 표시용 앞부분 읽기 크기 (16KB + UTF-8 문자 경계 여유)
+const HEAD_READ_BYTES: usize = MAX_DISPLAY_BYTES + 8;
 
-    let byte_len = raw_line.len() as u64;
-    let (text, truncated) = if raw_line.len() > MAX_DISPLAY_BYTES {
-        let display_slice = truncate_utf8_boundary(&raw_line[..MAX_DISPLAY_BYTES]);
-        let text = String::from_utf8_lossy(display_slice).into_owned();
-        (text, true)
+/// 매치가 없는 빈 줄을 만든다 (확인된 길이 밖 오프셋 등 예외 상황용)
+fn empty_line(line_no: u64) -> Line {
+    Line {
+        no: line_no,
+        text: String::new(),
+        byte_len: 0,
+        truncated: false,
+        highlights: Vec::new(),
+    }
+}
+
+/// raw_prefix(줄의 앞부분 바이트, 개행 제외)와 실제 줄 바이트 길이(byte_len)로 Line을 만든다.
+/// raw_prefix가 byte_len보다 짧으면(긴 줄의 표시분만 읽은 경우) 읽은 범위만 사용한다.
+fn make_line(raw_prefix: &[u8], byte_len: u64, line_no: u64, matcher: Option<&Matcher>) -> Line {
+    let take = (byte_len as usize).min(raw_prefix.len());
+    let raw_line = &raw_prefix[..take];
+    let (text, truncated) = if byte_len > MAX_DISPLAY_BYTES as u64 {
+        let display_slice =
+            truncate_utf8_boundary(&raw_line[..MAX_DISPLAY_BYTES.min(raw_line.len())]);
+        (String::from_utf8_lossy(display_slice).into_owned(), true)
     } else {
         let display_slice = if raw_line.ends_with(b"\r") {
             &raw_line[..raw_line.len() - 1]
         } else {
             raw_line
         };
-        let text = String::from_utf8_lossy(display_slice).into_owned();
-        (text, false)
+        (String::from_utf8_lossy(display_slice).into_owned(), false)
     };
 
     let highlights = match matcher {
@@ -102,20 +126,53 @@ fn decode_line_at(
         None => Vec::new(),
     };
 
-    (
-        Line {
-            no: line_no,
-            text,
-            byte_len,
-            truncated,
-            highlights,
+    Line {
+        no: line_no,
+        text,
+        byte_len,
+        truncated,
+        highlights,
+    }
+}
+
+/// 지정된 오프셋에서 한 줄을 읽어 (Line, 다음 줄 시작 오프셋)을 반환한다.
+/// 표시 텍스트는 앞 MAX_DISPLAY_BYTES(+경계 여유)만 읽고, 16KB를 넘는 줄은
+/// 개행 위치만 찾기 위해 64KB 청크로 훑는다. 파일이 외부에서 잘려 짧게 읽혀도
+/// 패닉 없이 가능한 범위의 결과를 반환한다.
+fn decode_line_at(
+    source: &Source,
+    offset: u64,
+    line_no: u64,
+    matcher: Option<&Matcher>,
+) -> Result<(Line, u64)> {
+    let remaining = source.len().saturating_sub(offset);
+    if remaining == 0 {
+        return Ok((empty_line(line_no), source.len()));
+    }
+
+    let head_want = remaining.min(HEAD_READ_BYTES as u64) as usize;
+    let mut head_buf = [0u8; HEAD_READ_BYTES];
+    let head_len = source.read_into(&mut head_buf[..head_want], offset)?;
+    if head_len == 0 {
+        return Ok((empty_line(line_no), source.len()));
+    }
+    let head = &head_buf[..head_len];
+
+    // head 안에서 개행을 찾는다. 없으면 16KB가 넘는 긴 줄이므로
+    // head 이후를 64KB 청크로 훑어 개행 또는 파일 끝을 찾는다.
+    let (byte_len, next_offset) = match memchr::memchr(b'\n', head) {
+        Some(nl_pos) => (nl_pos as u64, offset + nl_pos as u64 + 1),
+        None => match source.nth_newline(offset + head_len as u64, 0)? {
+            Some(nl_pos) => (nl_pos - offset, nl_pos + 1),
+            None => (source.len() - offset, source.len()),
         },
-        next_offset,
-    )
+    };
+
+    Ok((make_line(head, byte_len, line_no, matcher), next_offset))
 }
 
 /// 로그 파일 핸들.
-/// Source(mmap 파일)와 LineIndex(희소 줄 인덱스)를 소유하며,
+/// Source(read_at 파일)와 LineIndex(희소 줄 인덱스)를 소유하며,
 /// Send + Sync를 만족하여 Arc<LogFile> 형태로 여러 스레드에서 공유할 수 있다.
 pub struct LogFile {
     source: Source,
@@ -175,11 +232,37 @@ impl LogFile {
             None => return Ok(Vec::new()),
         };
 
+        // 파일을 한 번에 크게 읽어 여러 줄을 버퍼에서 디코딩한다 (pread syscall 절감).
+        // 청크 크기는 요청 줄 수에 비례시켜 64KB~1MB로 잡는다.
+        let chunk_size = (actual_count * 512).clamp(64 * 1024, 1024 * 1024);
+        let mut buf = vec![0u8; chunk_size];
+        let mut buf_start = 0u64; // buf[0]에 해당하는 파일 오프셋
+        let mut buf_len = 0usize; // buf의 유효 바이트 수
+
         for line_no in start..end_line {
-            let (line, next_offset) =
-                decode_line_at(&self.source, current_offset, line_no, matcher);
-            lines.push(line);
-            current_offset = next_offset;
+            // 현재 줄 시작 위치가 버퍼 범위 밖이면 다음 청크를 읽는다
+            if current_offset < buf_start || current_offset >= buf_start + buf_len as u64 {
+                buf_start = current_offset;
+                buf_len = self.source.read_into(&mut buf, current_offset)?;
+            }
+
+            let rel = (current_offset - buf_start) as usize;
+            let chunk = &buf[rel..buf_len];
+
+            match memchr::memchr(b'\n', chunk) {
+                Some(nl_pos) => {
+                    // 개행이 청크 안에 있으면 버퍼에서 바로 디코딩
+                    lines.push(make_line(&chunk[..nl_pos], nl_pos as u64, line_no, matcher));
+                    current_offset += nl_pos as u64 + 1;
+                }
+                None => {
+                    // 개행이 청크에 없음: 청크 경계에 걸친 긴 줄이므로 개별 디코딩
+                    let (line, next_offset) =
+                        decode_line_at(&self.source, current_offset, line_no, matcher)?;
+                    lines.push(line);
+                    current_offset = next_offset;
+                }
+            }
         }
 
         Ok(lines)
@@ -216,13 +299,11 @@ impl LogFile {
                     current_offset
                 }
                 Some(prev) if line_no > prev + 1 && line_no <= prev + 16 => {
-                    // 소량(16줄 이하) 전진인 경우 순차 개행 스캔
-                    let remaining = self.source.bytes(current_offset, self.source.len());
+                    // 소량(16줄 이하) 전진인 경우 순차 개행 스캔 (64KB 청크)
                     let lines_to_skip = (line_no - prev - 1) as usize;
-                    let mut iter = memchr::memchr_iter(b'\n', remaining);
-                    match iter.nth(lines_to_skip - 1) {
-                        Some(nl_pos) => current_offset + nl_pos as u64 + 1,
-                        None => match self.index.line_start(&self.source, line_no) {
+                    match self.source.nth_newline(current_offset, lines_to_skip - 1) {
+                        Ok(Some(nl_pos)) => nl_pos + 1,
+                        _ => match self.index.line_start(&self.source, line_no) {
                             Some(off) => off,
                             None => continue,
                         },
@@ -234,12 +315,61 @@ impl LogFile {
                 },
             };
 
-            let (line, next_offset) = decode_line_at(&self.source, target_offset, line_no, matcher);
+            let (line, next_offset) =
+                decode_line_at(&self.source, target_offset, line_no, matcher)?;
             lines.push(line);
             prev_line_no = Some(line_no);
             current_offset = next_offset;
         }
 
         Ok(lines)
+    }
+
+    /// 파일 상태를 확인하고 끝에 추가된 부분만 인덱스에 반영한다 (tail 모드용).
+    ///
+    /// 판정 순서: Replaced → Truncated → (인덱싱 미완료면 Pending) →
+    /// 길이 증가면 Appended → Unchanged.
+    /// 파일이 외부에서 잘렸거나 교체된 경우 인덱스는 건드리지 않고 해당 결과만 반환한다.
+    pub fn refresh(&self) -> Result<RefreshOutcome> {
+        // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
+        if !self.source.path_matches()? {
+            return Ok(RefreshOutcome::Replaced);
+        }
+
+        // 열린 파일 핸들의 현재 크기가 확인된 길이보다 작으면 truncate
+        let file_len = self.source.file_len()?;
+        let known_len = self.source.len();
+        if file_len < known_len {
+            return Ok(RefreshOutcome::Truncated);
+        }
+
+        // 최초 인덱싱이 끝나기 전에는 추가분을 반영할 수 없다
+        if !self.index.progress().done {
+            return Ok(RefreshOutcome::Pending);
+        }
+
+        if file_len == known_len {
+            return Ok(RefreshOutcome::Unchanged);
+        }
+
+        // 추가분 인덱싱: extend가 new_len까지 읽을 수 있도록 길이를 먼저 갱신한다.
+        // 이 시점의 인덱스는 여전히 이전 범위만 공개하므로 일반 읽기에는 영향이 없다.
+        self.source.set_len(file_len);
+        let old_line_count = self.index.line_count();
+        if let Err(e) = self.index.extend(&self.source, file_len) {
+            // 인덱스가 따라가지 못했으므로 확인된 길이를 되돌려 다음 refresh가 재시도하게 한다
+            self.source.set_len(known_len);
+            return Err(e);
+        }
+
+        // 실제로 커버된 길이까지만 확인된 길이로 확정한다.
+        // (읽는 도중 파일이 잘려 일부만 반영됐으면 다음 refresh가 나머지를 이어서 처리)
+        let covered_len = self.index.progress().total_bytes;
+        self.source.set_len(covered_len);
+        Ok(RefreshOutcome::Appended {
+            old_line_count,
+            new_line_count: self.index.line_count(),
+            new_len: covered_len,
+        })
     }
 }

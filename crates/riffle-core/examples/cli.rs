@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use riffle_core::{LogFile, Matcher, SearchOptions};
+use riffle_core::{LogFile, Matcher, RefreshOutcome, SearchOptions};
 
 fn print_usage() {
     eprintln!("Riffle CLI - 파일 인덱싱 및 읽기/검색 검증 도구\n");
@@ -14,12 +15,16 @@ fn print_usage() {
     eprintln!("    cli <파일경로> stats");
     eprintln!("    cli <파일경로> lines <start> <count>");
     eprintln!("    cli <파일경로> open");
-    eprintln!("    cli <파일경로> search <query> [--regex] [--ignore-case]\n");
+    eprintln!("    cli <파일경로> search <query> [--regex] [--ignore-case]");
+    eprintln!("    cli <파일경로> tail\n");
     eprintln!("서브커맨드:");
     eprintln!("    stats                인덱싱 실행 후 파일 크기, 줄 수, 소요 시간 출력");
     eprintln!("    lines <start> <cnt>  지정 범위 줄 텍스트를 원문 그대로 출력 (0-based)");
     eprintln!("    open                 열기 후 첫 20줄 읽기까지의 소요 시간 및 내용 출력");
     eprintln!("    search <query> [opt] 파일 전체 검색 (매치 수, 첫 매치/전체 시간, 첫 5줄 출력)");
+    eprintln!(
+        "    tail                 인덱싱 후 200ms마다 refresh하여 추가분/로테이션 출력 (Ctrl+C까지)"
+    );
 }
 
 fn main() {
@@ -77,6 +82,7 @@ fn main() {
             };
             run_search(file_path, query, options);
         }
+        "tail" => run_tail(file_path),
         _ => {
             eprintln!("오류: 알 수 없는 서브커맨드 '{}'", command);
             print_usage();
@@ -269,6 +275,54 @@ fn run_search(path: &Path, query: &str, options: SearchOptions) {
     }
 }
 
+/// tail 서브커맨드: 백그라운드 인덱싱 후 200ms마다 refresh()를 호출하여
+/// 추가된 줄 수 또는 truncate/파일 교체를 출력한다. Ctrl+C로 종료.
+fn run_tail(path: &Path) {
+    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    }));
+
+    // 백그라운드에서 최초 인덱싱 (완료 전 refresh는 Pending을 반환)
+    let cancel = Arc::new(AtomicBool::new(false));
+    let lf = Arc::clone(&log_file);
+    let cancel_clone = Arc::clone(&cancel);
+    thread::spawn(move || lf.build_index(&cancel_clone, &mut |_| {}));
+
+    eprintln!("tail 시작: {} (인덱싱 중...)", path.display());
+    let mut rotation_notified = false;
+    loop {
+        match log_file.refresh() {
+            Ok(RefreshOutcome::Appended {
+                old_line_count,
+                new_line_count,
+                new_len,
+            }) => {
+                println!(
+                    "[tail] appended: +{}줄 (총 {}줄, {:.1} KiB)",
+                    new_line_count - old_line_count,
+                    new_line_count,
+                    new_len as f64 / 1024.0
+                );
+                let _ = std::io::stdout().flush();
+            }
+            Ok(RefreshOutcome::Truncated) if !rotation_notified => {
+                rotation_notified = true;
+                println!("[tail] truncated: 파일이 잘렸습니다 (재오픈 필요)");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(RefreshOutcome::Replaced) if !rotation_notified => {
+                rotation_notified = true;
+                println!("[tail] replaced: 파일이 다른 inode로 교체되었습니다 (재오픈 필요)");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[tail] 오류: {}", e),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// 인덱스 유무와 무관하게 매치된 줄 번호들의 원문 텍스트를 출력한다.
 fn print_matching_lines(log_file: &LogFile, line_nos: &[u64]) {
     if log_file.index().line_count() > 0
@@ -280,37 +334,66 @@ fn print_matching_lines(log_file: &LogFile, line_nos: &[u64]) {
         return;
     }
 
+    // 인덱스가 없는 경우(인덱싱 전/취소) 64KB 청크로 순차 스캔하며 대상 줄만 출력
     let source = log_file.source();
-    let mut cur_line = 0u64;
-    let mut offset = 0u64;
     let total = source.len();
-    let mut target_idx = 0;
+    let mut cur_line = 0u64;
+    let mut target_idx = 0usize;
+    let mut offset = 0u64;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
 
     while offset < total && target_idx < line_nos.len() {
-        let target = line_nos[target_idx];
-        let remaining = source.bytes(offset, total);
-        let (raw_line, next_offset) = match memchr::memchr(b'\n', remaining) {
-            Some(nl) => (&remaining[..nl], offset + nl as u64 + 1),
-            None => (remaining, total),
+        let want = (total - offset).min(buf.len() as u64) as usize;
+        let n = match source.read_into(&mut buf[..want], offset) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+        carry.extend_from_slice(&buf[..n]);
+
+        // 마지막 개행까지는 완성된 줄이므로 처리하고, 나머지는 carry에 남긴다
+        let Some(complete_end) = memchr::memrchr(b'\n', &carry).map(|p| p + 1) else {
+            continue;
         };
 
-        if cur_line == target {
-            let clean = if raw_line.ends_with(b"\r") {
-                &raw_line[..raw_line.len() - 1]
-            } else {
-                raw_line
-            };
-            let display_slice = if clean.len() > riffle_core::MAX_DISPLAY_BYTES {
-                &clean[..riffle_core::MAX_DISPLAY_BYTES]
-            } else {
-                clean
-            };
-            let text = String::from_utf8_lossy(display_slice);
-            println!("{:>8}: {}", cur_line + 1, text);
-            target_idx += 1;
+        let mut seg_start = 0usize;
+        for nl_pos in memchr::memchr_iter(b'\n', &carry[..complete_end]) {
+            let raw_line = &carry[seg_start..nl_pos];
+            if cur_line == line_nos[target_idx] {
+                print_raw_line(cur_line, raw_line);
+                target_idx += 1;
+                if target_idx >= line_nos.len() {
+                    break;
+                }
+            }
+            cur_line += 1;
+            seg_start = nl_pos + 1;
         }
-
-        cur_line += 1;
-        offset = next_offset;
+        carry.drain(..seg_start);
     }
+
+    // 파일 끝: 개행 없이 끝난 마지막 줄 처리
+    if target_idx < line_nos.len() && !carry.is_empty() && cur_line == line_nos[target_idx] {
+        print_raw_line(cur_line, &carry);
+    }
+}
+
+/// 원시 줄 바이트(개행 제외, \r 포함 가능)를 표시용으로 정리해 출력한다.
+fn print_raw_line(line_no: u64, raw: &[u8]) {
+    let clean = if raw.ends_with(b"\r") {
+        &raw[..raw.len() - 1]
+    } else {
+        raw
+    };
+    let display = if clean.len() > riffle_core::MAX_DISPLAY_BYTES {
+        &clean[..riffle_core::MAX_DISPLAY_BYTES]
+    } else {
+        clean
+    };
+    let text = String::from_utf8_lossy(display);
+    println!("{:>8}: {}", line_no + 1, text);
 }

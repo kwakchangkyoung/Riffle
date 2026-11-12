@@ -12,12 +12,15 @@ export interface SearchStatusInfo {
 
 interface StatusBarProps {
     file: FileInfo | null;
+    fileSize?: number | null; // tail 모드 등으로 갱신된 파일 크기 (미지정 시 file.size)
     lineCount: number;
     indexProgress: IndexProgress | null;
     topLine: number;
     searchStatus?: SearchStatusInfo | null;
     isFilterMode?: boolean;
     actualTopLine?: number | null; // 필터 모드 시 화면 상단 행의 실제 원본 파일 줄 번호 (1-based)
+    tailOn?: boolean; // tail 모드 활성 여부
+    tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
 }
 
 /**
@@ -26,12 +29,15 @@ interface StatusBarProps {
 export const StatusBar: React.FC<StatusBarProps> = React.memo(
     ({
         file,
+        fileSize,
         lineCount,
         indexProgress,
         topLine,
         searchStatus,
         isFilterMode,
         actualTopLine,
+        tailOn,
+        tailPaused,
     }) => {
         if (!file) {
             return (
@@ -98,6 +104,27 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
                 {/* 우측: 검색 결과, 크기, 줄 수, 진행률, 현재 줄 위치 */}
                 <div className="flex items-center space-x-4 shrink-0">
+                    {tailOn && (
+                        <>
+                            <span
+                                className={
+                                    tailPaused
+                                        ? "text-amber-600 dark:text-amber-400 font-semibold"
+                                        : "text-emerald-600 dark:text-emerald-400 font-semibold"
+                                }
+                                title={
+                                    tailPaused
+                                        ? "tail 일시정지: 맨 아래로 스크롤하면 자동 추적이 재개됩니다"
+                                        : "tail 모드: 파일 끝을 실시간으로 따라가는 중 (검색 결과는 검색 시작 시점까지)"
+                                }
+                            >
+                                {tailPaused ? "TAIL 일시정지" : "● TAIL"}
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
                     {searchSummary && (
                         <>
                             <span
@@ -115,7 +142,9 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                             </span>
                         </>
                     )}
-                    <span title="파일 크기">{formatBytes(file.size)}</span>
+                    <span title="파일 크기">
+                        {formatBytes(fileSize ?? file.size)}
+                    </span>
                     <span className="text-zinc-300 dark:text-zinc-700">|</span>
                     <span title="전체 줄 수">
                         {lineCount.toLocaleString("ko-KR")} 줄

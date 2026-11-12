@@ -1,8 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use riffle_core::LogFile;
+
+/// tail 모드 감시 스레드 핸들
+pub struct TailHandle {
+    /// 감시 중지 플래그
+    pub stop: Arc<AtomicBool>,
+    /// 감시 스레드
+    pub thread: JoinHandle<()>,
+}
 
 /// 열려 있는 단일 로그 파일의 상태 정보
 pub struct OpenFile {
@@ -10,6 +20,10 @@ pub struct OpenFile {
     pub file: Arc<LogFile>,
     /// 인덱싱/작업 취소 플래그
     pub cancel: Arc<AtomicBool>,
+    /// 파일 경로 (tail 감시 대상 디렉터리 결정용)
+    pub path: PathBuf,
+    /// tail 모드 감시 핸들 (켜져 있을 때만 존재)
+    pub tail: Option<TailHandle>,
 }
 
 /// 단일 검색 세션의 상태 정보
@@ -54,10 +68,18 @@ impl Default for AppState {
 
 impl AppState {
     /// 새 열린 파일을 상태에 등록하고 고유 ID를 반환한다.
-    pub fn insert_file(&self, file: Arc<LogFile>, cancel: Arc<AtomicBool>) -> u32 {
+    pub fn insert_file(&self, file: Arc<LogFile>, cancel: Arc<AtomicBool>, path: PathBuf) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        files.insert(id, OpenFile { file, cancel });
+        files.insert(
+            id,
+            OpenFile {
+                file,
+                cancel,
+                path,
+                tail: None,
+            },
+        );
         id
     }
 
@@ -73,10 +95,19 @@ impl AppState {
     /// 파일을 닫고 취소 플래그를 설정한 뒤 맵에서 제거한다.
     /// 해당 파일에 연결된 모든 검색 세션도 취소하고 제거한다.
     pub fn close_file(&self, id: u32) {
-        // 1. 파일 닫기 및 인덱싱 취소
-        let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(open_file) = files.remove(&id) {
-            open_file.cancel.store(true, Ordering::Relaxed);
+        // 1. 파일 닫기, 인덱싱 취소, tail 핸들 회수 (join은 lock 밖에서 수행)
+        let tail_handle = {
+            let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+            let mut tail = None;
+            if let Some(open_file) = files.remove(&id) {
+                open_file.cancel.store(true, Ordering::Relaxed);
+                tail = open_file.tail;
+            }
+            tail
+        };
+        if let Some(handle) = tail_handle {
+            handle.stop.store(true, Ordering::Relaxed);
+            let _ = handle.thread.join();
         }
 
         // 2. 해당 파일의 활성 검색 세션 모두 취소 및 제거

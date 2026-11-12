@@ -9,7 +9,7 @@ mod tests;
 
 pub use error::{Error, Result};
 pub use index::{CHECKPOINT_INTERVAL, IndexProgress, LineIndex};
-pub use lines::{Line, LogFile, MAX_DISPLAY_BYTES};
+pub use lines::{Line, LogFile, MAX_DISPLAY_BYTES, RefreshOutcome};
 pub use search::{
     MAX_RESULTS, Matcher, SearchOptions, SearchOutcome, SearchProgress, search, utf16_ranges,
 };

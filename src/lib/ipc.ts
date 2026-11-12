@@ -158,6 +158,29 @@ export function getFilteredLines(
     });
 }
 
+export type TailEvent =
+    | {
+          type: "appended";
+          lineCount: number;
+          totalBytes: number;
+          oldLineCount: number;
+      }
+    | { type: "rotated"; reason: "truncated" | "replaced" }
+    | { type: "error"; message: string };
+
+/**
+ * tail 모드(실시간 추적) 감시를 켜거나 끄고 이벤트를 수신합니다.
+ */
+export function setTail(
+    id: number,
+    enabled: boolean,
+    onEvent: (event: TailEvent) => void,
+): Promise<void> {
+    const channel = new Channel<TailEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("set_tail", { id, enabled, onEvent: channel });
+}
+
 /**
  * 열린 파일을 닫고 자원을 해제합니다.
  */

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -191,7 +191,7 @@ pub fn open_file_internal(
     let file = Arc::new(log_file);
     let cancel = Arc::new(AtomicBool::new(false));
     let size = file.source().len();
-    let id = state.insert_file(file.clone(), cancel.clone());
+    let id = state.insert_file(file.clone(), cancel.clone(), PathBuf::from(path));
 
     Ok((
         FileInfo {

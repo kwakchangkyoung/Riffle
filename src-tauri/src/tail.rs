@@ -1,0 +1,484 @@
+// tail 모드(실시간 추적) IPC 커맨드와 파일 감시 루프
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
+
+use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
+use riffle_core::{LogFile, RefreshOutcome};
+use serde::Serialize;
+use tauri::ipc::Channel;
+
+use crate::state::{AppState, TailHandle};
+
+/// 파일 변경 이벤트 디바운스 시간
+const DEBOUNCE: Duration = Duration::from_millis(50);
+/// FSEvents 지연 등에 대비한 폴링 주기
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// tail 모드 이벤트 DTO (프론트엔드 ipc.ts의 TailEvent와 1:1)
+#[derive(Serialize, Clone)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TailEvent {
+    Appended {
+        line_count: u64,
+        total_bytes: u64,
+        old_line_count: u64,
+    },
+    Rotated {
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// refresh 1회 수행 후 결과를 이벤트로 전달한다.
+/// 감시를 계속할지 여부를 반환한다 (로테이션 감지 시 false).
+fn refresh_once(file: &LogFile, on_event: &mut impl FnMut(TailEvent)) -> bool {
+    match file.refresh() {
+        Ok(RefreshOutcome::Unchanged) | Ok(RefreshOutcome::Pending) => true,
+        Ok(RefreshOutcome::Appended {
+            old_line_count,
+            new_line_count,
+            new_len,
+        }) => {
+            on_event(TailEvent::Appended {
+                line_count: new_line_count,
+                total_bytes: new_len,
+                old_line_count,
+            });
+            true
+        }
+        Ok(RefreshOutcome::Truncated) => {
+            on_event(TailEvent::Rotated {
+                reason: "truncated".to_string(),
+            });
+            false
+        }
+        Ok(RefreshOutcome::Replaced) => {
+            on_event(TailEvent::Rotated {
+                reason: "replaced".to_string(),
+            });
+            false
+        }
+        Err(e) => {
+            on_event(TailEvent::Error {
+                message: e.to_string(),
+            });
+            true
+        }
+    }
+}
+
+/// tail 감시 루프 본체.
+/// 파일의 부모 디렉터리를 NonRecursive로 감시하고, 이벤트 수신 또는 1초 타임아웃마다
+/// 디바운스(50ms) 확인 후 refresh()를 호출한다.
+/// stop 플래그가 서거나 로테이션(Rotated)이 감지되면 반환한다.
+pub fn run_tail_loop(
+    file: Arc<LogFile>,
+    watch_dir: &Path,
+    stop: Arc<AtomicBool>,
+    mut on_event: impl FnMut(TailEvent),
+) {
+    // notify 이벤트를 std mpsc 채널로 전달
+    let (tx, rx) = std::sync::mpsc::channel::<NotifyEvent>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
+        if let Ok(event) = res {
+            let _ = tx.send(event);
+        }
+    })
+    .ok();
+
+    // 감시자 생성/등록 실패 시에도 1초 폴링으로 계속 동작한다
+    let mut watcher_gone = watcher.is_none();
+    let mut watch_failed = false;
+    if let Some(w) = watcher.as_mut()
+        && let Err(e) = w.watch(watch_dir, RecursiveMode::NonRecursive)
+    {
+        on_event(TailEvent::Error {
+            message: format!("디렉터리 감시 시작 실패 ('{}'): {e}", watch_dir.display()),
+        });
+        watch_failed = true;
+    }
+    if watch_failed {
+        watcher = None;
+        watcher_gone = true;
+    }
+    // 감시자는 이 함수가 반환할 때까지 살아 있어야 한다
+    let _watcher = watcher;
+
+    // 시작 시 한 번 즉시 확인 (열기 이후 변경분 반영)
+    if !refresh_once(&file, &mut on_event) {
+        return;
+    }
+    let mut last_refresh = Instant::now();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // 디바운스 잔여 시간 또는 폴링 주기만큼 대기 (이벤트 수신 시 즉시 깸)
+        let since = last_refresh.elapsed();
+        let wait = if since >= DEBOUNCE {
+            POLL_INTERVAL
+        } else {
+            DEBOUNCE - since
+        };
+
+        if watcher_gone {
+            std::thread::sleep(wait);
+        } else {
+            match rx.recv_timeout(wait) {
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => watcher_gone = true,
+            }
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if last_refresh.elapsed() >= DEBOUNCE {
+            if !refresh_once(&file, &mut on_event) {
+                break; // 로테이션 감지 → 감시 종료
+            }
+            last_refresh = Instant::now();
+        }
+    }
+}
+
+/// 파일 경로의 부모 디렉터리를 반환한다. 부모가 없으면 현재 디렉터리.
+fn watch_dir_of(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+/// tail 감시를 시작한다. 이미 감시 중이고 스레드가 살아 있으면 아무것도 하지 않는다.
+/// 스레드 spawn부터 핸들 저장까지 files lock을 유지해 disable과의 경쟁을 막는다.
+pub fn enable_tail<F>(state: &AppState, id: u32, on_event: F) -> Result<(), String>
+where
+    F: FnMut(TailEvent) + Send + 'static,
+{
+    let mut files = state.files.lock().unwrap_or_else(|p| p.into_inner());
+    let open_file = files
+        .get_mut(&id)
+        .ok_or_else(|| format!("ID {id}에 해당하는 열린 파일을 찾을 수 없습니다."))?;
+    // 이미 감시 중이고 스레드가 살아 있으면 재사용
+    if let Some(handle) = open_file.tail.as_ref()
+        && !handle.thread.is_finished()
+    {
+        return Ok(());
+    }
+    let file = open_file.file.clone();
+    let watch_dir = watch_dir_of(&open_file.path);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || {
+        run_tail_loop(file, &watch_dir, thread_stop, on_event);
+    });
+    open_file.tail = Some(TailHandle { stop, thread });
+    Ok(())
+}
+
+/// tail 감시를 중지하고 스레드를 정리한다.
+pub fn disable_tail(state: &AppState, id: u32) {
+    let handle = {
+        let mut files = state.files.lock().unwrap_or_else(|p| p.into_inner());
+        files.get_mut(&id).and_then(|f| f.tail.take())
+    };
+    if let Some(handle) = handle {
+        handle.stop.store(true, Ordering::Relaxed);
+        let _ = handle.thread.join();
+    }
+}
+
+/// tail 모드(실시간 추적) 감시를 켜거나 끈다.
+#[tauri::command]
+pub async fn set_tail(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    enabled: bool,
+    on_event: Channel<TailEvent>,
+) -> Result<(), String> {
+    if enabled {
+        enable_tail(&state, id, move |event| {
+            let _ = on_event.send(event);
+        })
+    } else {
+        disable_tail(&state, id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::open_file_internal;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn create(content: &[u8]) -> Self {
+            let unique_name = format!(
+                "riffle_tail_test_{}_{}.log",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique_name);
+            let mut file = std::fs::File::create(&path).expect("임시 파일 생성 실패");
+            file.write_all(content).expect("임시 파일 쓰기 실패");
+            file.sync_all().expect("임시 파일 플러시 실패");
+            Self { path }
+        }
+
+        fn path_str(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// 파일을 열고 인덱싱을 완료한다 (refresh가 Pending을 반환하지 않도록).
+    fn open_indexed(path: &Path) -> Arc<LogFile> {
+        let file = Arc::new(LogFile::open(path).expect("파일 열기 실패"));
+        let cancel = AtomicBool::new(false);
+        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+        file
+    }
+
+    /// 조건에 맞는 이벤트가 도착할 때까지 기다린다.
+    fn wait_for_event(
+        events: &Mutex<Vec<TailEvent>>,
+        timeout: Duration,
+        pred: impl Fn(&TailEvent) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if events.lock().unwrap().iter().any(&pred) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    fn append_line(path: &Path, line: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("append 열기 실패");
+        writeln!(file, "{line}").expect("append 쓰기 실패");
+        file.sync_all().expect("append 플러시 실패");
+    }
+
+    #[test]
+    fn test_tail_loop_appended() {
+        let temp = TempFile::create(b"line1\n");
+        let file = open_indexed(&temp.path);
+        let watch_dir = temp.path.parent().unwrap().to_path_buf();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events2 = events.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            run_tail_loop(file, &watch_dir, stop2, move |e| {
+                events2.lock().unwrap().push(e);
+            });
+        });
+
+        append_line(&temp.path, "line2");
+
+        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+            matches!(e, TailEvent::Appended { .. })
+        });
+        assert!(found, "Appended 이벤트가 도착해야 함");
+
+        let events = events.lock().unwrap();
+        let appended = events.iter().find_map(|e| match e {
+            TailEvent::Appended {
+                line_count,
+                old_line_count,
+                ..
+            } => Some((*old_line_count, *line_count)),
+            _ => None,
+        });
+        assert_eq!(appended, Some((1, 2)));
+        drop(events);
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("tail 스레드 join 실패");
+    }
+
+    #[test]
+    fn test_tail_loop_rotated_replaced() {
+        let temp = TempFile::create(b"line1\n");
+        let file = open_indexed(&temp.path);
+        let watch_dir = temp.path.parent().unwrap().to_path_buf();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events2 = events.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            run_tail_loop(file, &watch_dir, stop2, move |e| {
+                events2.lock().unwrap().push(e);
+            });
+        });
+
+        // 파일을 다른 이름으로 rename → 경로의 파일이 사라짐 (Replaced)
+        let moved = temp.path.with_extension("moved");
+        std::fs::rename(&temp.path, &moved).expect("rename 실패");
+
+        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+            matches!(e, TailEvent::Rotated { .. })
+        });
+        assert!(found, "Rotated 이벤트가 도착해야 함");
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TailEvent::Rotated { reason } if reason == "replaced"
+        )));
+        drop(events);
+
+        // 로테이션 감지 후 루프는 스스로 종료한다
+        handle.join().expect("tail 스레드 join 실패");
+        let _ = std::fs::remove_file(&moved);
+    }
+
+    #[test]
+    fn test_tail_loop_rotated_truncated() {
+        let temp = TempFile::create(b"line1\nline2\n");
+        let file = open_indexed(&temp.path);
+        let watch_dir = temp.path.parent().unwrap().to_path_buf();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events2 = events.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            run_tail_loop(file, &watch_dir, stop2, move |e| {
+                events2.lock().unwrap().push(e);
+            });
+        });
+
+        // 같은 inode에서 크기를 줄임 (Truncated)
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp.path)
+            .expect("truncate 열기 실패");
+        f.set_len(4).expect("truncate 실패"); // "line" 만 남김
+
+        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+            matches!(e, TailEvent::Rotated { .. })
+        });
+        assert!(found, "Rotated 이벤트가 도착해야 함");
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TailEvent::Rotated { reason } if reason == "truncated"
+        )));
+        drop(events);
+
+        handle.join().expect("tail 스레드 join 실패");
+    }
+
+    #[test]
+    fn test_enable_tail_single_watcher_and_disable() {
+        let state = AppState::default();
+        let temp = TempFile::create(b"a\nb\n");
+        let (info, file, _cancel) =
+            open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let cancel = AtomicBool::new(false);
+        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+
+        enable_tail(&state, info.id, |_| {}).expect("tail 활성화 실패");
+        let tid1 = {
+            let files = state.files.lock().unwrap();
+            files
+                .get(&info.id)
+                .and_then(|f| f.tail.as_ref())
+                .map(|t| t.thread.thread().id())
+        };
+        assert!(tid1.is_some());
+
+        // 두 번 켜도 감시는 하나
+        enable_tail(&state, info.id, |_| {}).expect("tail 재활성화 실패");
+        let tid2 = {
+            let files = state.files.lock().unwrap();
+            files
+                .get(&info.id)
+                .and_then(|f| f.tail.as_ref())
+                .map(|t| t.thread.thread().id())
+        };
+        assert_eq!(tid1, tid2);
+
+        // 끄면 핸들이 정리된다
+        disable_tail(&state, info.id);
+        let files = state.files.lock().unwrap();
+        assert!(files.get(&info.id).unwrap().tail.is_none());
+        drop(files);
+
+        state.close_file(info.id);
+    }
+
+    #[test]
+    fn test_close_file_stops_tail() {
+        let state = AppState::default();
+        let temp = TempFile::create(b"a\n");
+        let (info, file, _cancel) =
+            open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let cancel = AtomicBool::new(false);
+        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events2 = events.clone();
+        enable_tail(&state, info.id, move |e| {
+            events2.lock().unwrap().push(e);
+        })
+        .expect("tail 활성화 실패");
+
+        state.close_file(info.id);
+
+        // close_file은 감시 스레드를 join하므로 이후 append는 이벤트를 만들지 않는다
+        append_line(&temp.path, "b");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| !matches!(e, TailEvent::Appended { .. }))
+        );
+    }
+
+    #[test]
+    fn test_enable_tail_unknown_file() {
+        let state = AppState::default();
+        let result = enable_tail(&state, 9999, |_| {});
+        assert!(result.is_err());
+    }
+}

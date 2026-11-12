@@ -278,6 +278,30 @@ export class LineCache {
     }
 
     /**
+     * 특정 줄이 속한 캐시 블록을 제거하고, 보이는 범위이면 즉시 재요청합니다.
+     * tail 모드에서 개행 없이 끝나던 마지막 줄이 이어진 경우 내용이 바뀔 수 있어 사용합니다.
+     * 필터 모드(결과 인덱스 기준)에서는 지원하지 않습니다.
+     */
+    public invalidateLine(lineNo: number): void {
+        if (this.fileId === null || this.isFiltered) {
+            return;
+        }
+        const blockIndex = Math.floor(lineNo / BLOCK_SIZE);
+        const existed = this.blocks.delete(blockIndex);
+        this.pending.delete(blockIndex);
+        if (!existed) {
+            return;
+        }
+        if (
+            blockIndex >= this.visibleMinBlock - 1 &&
+            blockIndex <= this.visibleMaxBlock + 1
+        ) {
+            this.fetchBlock(blockIndex);
+        }
+        this.notify();
+    }
+
+    /**
      * 현재 캐시된 블록 수를 반환합니다.
      */
     public get size(): number {

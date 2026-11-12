@@ -5,10 +5,12 @@ import {
     closeFile,
     openFile,
     searchDensity,
+    setTail,
     type FileInfo,
     type IndexProgress,
     type QueryOptions,
     type SearchHit,
+    type TailEvent,
 } from "@/lib/ipc";
 import { LineCache } from "@/lib/lineCache";
 import { LogViewport } from "@/components/viewer/LogViewport";
@@ -22,6 +24,8 @@ const ROW_HEIGHT = 20;
  */
 export default function App() {
     const [file, setFile] = useState<FileInfo | null>(null);
+    // tail appended 이벤트의 totalBytes로 갱신되는 표시용 파일 크기 (null이면 file.size 사용)
+    const [liveFileSize, setLiveFileSize] = useState<number | null>(null);
     const [lineCount, setLineCount] = useState(0);
     const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(
         null,
@@ -38,6 +42,13 @@ export default function App() {
     const [currentHit, setCurrentHit] = useState<SearchHit | null>(null);
     const [densityBins, setDensityBins] = useState<number[]>([]);
     const [viewportHeight, setViewportHeight] = useState(0);
+
+    // tail 모드 상태: 사용자 의도, 일시정지 중 새 줄 수, 로테이션 안내
+    const [tailEnabled, setTailEnabled] = useState(false);
+    const [newLinesCount, setNewLinesCount] = useState(0);
+    const [rotationReason, setRotationReason] = useState<
+        "truncated" | "replaced" | null
+    >(null);
 
     const normalLineCache = useMemo(() => new LineCache(), []);
     const filteredLineCache = useMemo(() => new LineCache(), []);
@@ -69,18 +80,92 @@ export default function App() {
     const densityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const activeSearchIdRef = useRef<number | null>(null);
 
+    // tail 모드 관련 ref
+    const tailEnabledRef = useRef(false);
+    const pendingAppendedRef = useRef<{
+        oldLineCount: number;
+        lineCount: number;
+        totalBytes: number;
+    } | null>(null);
+    const tailRafRef = useRef<number | null>(null);
+    const atBottomRef = useRef(true);
+    const isFilterModeRef = useRef(false);
+    const viewportHeightRef = useRef(0);
+    const scrollToBottomAfterReopenRef = useRef(false);
+
+    useEffect(() => {
+        isFilterModeRef.current = isFilterMode;
+    }, [isFilterMode]);
+
+    useEffect(() => {
+        viewportHeightRef.current = viewportHeight;
+    }, [viewportHeight]);
+
     // 활성 라인 캐시 및 총 라인 수 (필터 모드 / 일반 모드 분기)
     const activeLineCache = isFilterMode ? filteredLineCache : normalLineCache;
     const activeLineCount = isFilterMode
         ? (searchStatus?.matchCount ?? 0)
         : lineCount;
 
+    // 표시 줄 수 (필터 모드: 매치 건수, 일반 모드: 파일 줄 수)
+    const displayLineCount = isFilterMode
+        ? (searchStatus?.matchCount ?? 0)
+        : lineCount;
+    const displayCountRef = useRef(0);
+    useEffect(() => {
+        displayCountRef.current = displayLineCount;
+    }, [displayLineCount]);
+
+    // 뷰포트 topLine 변경 래퍼: 맨 아래 여부를 즉시 갱신하고 도달 시 새 줄 카운터를 리셋한다
+    const handleTopLineChange = useCallback((v: number) => {
+        setTopLine(v);
+        const maxTop = Math.max(
+            0,
+            displayCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
+        );
+        const atBottom = v >= maxTop - 0.5;
+        atBottomRef.current = atBottom;
+        if (atBottom) {
+            setNewLinesCount(0);
+        }
+    }, []);
+
+    // 맨 아래 여부 추적 (줄 수/뷰포트 변화에 대한 백업 갱신)
+    useEffect(() => {
+        const maxTop = Math.max(
+            0,
+            displayLineCount - viewportHeight / ROW_HEIGHT,
+        );
+        atBottomRef.current = topLine >= maxTop - 0.5;
+    }, [topLine, displayLineCount, viewportHeight]);
+
+    // tail IPC 커맨드는 순차 실행해 enable/disable 순서가 뒤바뀌지 않게 한다
+    const tailQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const queueTailCommand = useCallback(
+        <T,>(cmd: () => Promise<T>): Promise<T> => {
+            const result = tailQueueRef.current.then(cmd, cmd);
+            tailQueueRef.current = result.then(
+                () => {},
+                () => {},
+            );
+            return result;
+        },
+        [],
+    );
+
     // 파일 열기 처리 함수
     const handleOpenFileByPath = useCallback(
-        async (path: string) => {
+        async (path: string, options?: { preserveTail?: boolean }) => {
             const seq = ++openSeqRef.current;
             setErrorMessage(null);
             latestProgressRef.current = null;
+
+            // 진행 중이던 tail appended 배치 취소 (이전 파일 기준 이벤트는 폐기)
+            pendingAppendedRef.current = null;
+            if (tailRafRef.current !== null) {
+                cancelAnimationFrame(tailRafRef.current);
+                tailRafRef.current = null;
+            }
 
             // 이전 파일이 열려있다면 닫기 요청
             if (currentFileRef.current) {
@@ -94,6 +179,7 @@ export default function App() {
             normalLineCache.setFile(null);
             filteredLineCache.setFile(null);
             setFile(null);
+            setLiveFileSize(null);
             setLineCount(0);
             setIndexProgress(null);
             setTopLine(0);
@@ -102,6 +188,14 @@ export default function App() {
             setCurrentHit(null);
             setDensityBins([]);
             activeSearchIdRef.current = null;
+            setNewLinesCount(0);
+
+            // 파일 전환 시 tail은 자동 해제 (로테이션 재오픈 시에만 유지)
+            if (!options?.preserveTail) {
+                tailEnabledRef.current = false;
+                setTailEnabled(false);
+                setRotationReason(null);
+            }
 
             try {
                 const info = await openFile(path, (progress) => {
@@ -165,17 +259,38 @@ export default function App() {
         }
     }, [handleOpenFileByPath]);
 
-    // Cmd+O 단축키 등록
+    // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
+    const handleToggleTail = useCallback(() => {
+        const current = currentFileRef.current;
+        if (!current) return;
+        const next = !tailEnabledRef.current;
+        tailEnabledRef.current = next;
+        setTailEnabled(next);
+        if (!next) {
+            setNewLinesCount(0);
+            pendingAppendedRef.current = null;
+            queueTailCommand(() => setTail(current.id, false, () => {})).catch(
+                (err) => {
+                    console.warn("tail 모드 해제 실패:", err);
+                },
+            );
+        }
+    }, [queueTailCommand]);
+
+    // Cmd+O / Cmd+T 단축키 등록
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.metaKey && e.key.toLowerCase() === "o") {
                 e.preventDefault();
                 handleOpenDialog();
+            } else if (e.metaKey && e.key.toLowerCase() === "t") {
+                e.preventDefault();
+                handleToggleTail();
             }
         };
         window.addEventListener("keydown", handleKeyDown);
         return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [handleOpenDialog]);
+    }, [handleOpenDialog, handleToggleTail]);
 
     // Tauri 윈도우 드래그 앤 드롭 이벤트 등록
     useEffect(() => {
@@ -347,19 +462,16 @@ export default function App() {
             const targetTop = targetIndex - Math.floor(visibleRows / 3);
             const maxTop = Math.max(0, activeLineCount - visibleRows);
             const clampedTop = Math.max(0, Math.min(maxTop, targetTop));
-            setTopLine(clampedTop);
+            handleTopLineChange(clampedTop);
         },
-        [isFilterMode, viewportHeight, activeLineCount],
+        [isFilterMode, viewportHeight, activeLineCount, handleTopLineChange],
     );
 
     // 필터 모드 토글
     const handleToggleFilterMode = useCallback(() => {
-        setIsFilterMode((prev) => {
-            const next = !prev;
-            setTopLine(0);
-            return next;
-        });
-    }, []);
+        setIsFilterMode((prev) => !prev);
+        handleTopLineChange(0);
+    }, [handleTopLineChange]);
 
     // 필터 모드에서 행 더블클릭 시 필터 해제 후 원본 줄로 이동
     const handleLineDoubleClick = useCallback(
@@ -370,10 +482,144 @@ export default function App() {
             const targetTop = originalLineNo - Math.floor(visibleRows / 3);
             const maxTop = Math.max(0, lineCount - visibleRows);
             const clampedTop = Math.max(0, Math.min(maxTop, targetTop));
-            setTopLine(clampedTop);
+            handleTopLineChange(clampedTop);
         },
-        [viewportHeight, lineCount],
+        [viewportHeight, lineCount, handleTopLineChange],
     );
+
+    // ===== tail 모드 =====
+
+    // rAF 단위로 묶인 appended 이벤트를 반영한다 (프레임당 마지막 배치만 처리)
+    const flushTailAppended = useCallback(() => {
+        tailRafRef.current = null;
+        const pending = pendingAppendedRef.current;
+        pendingAppendedRef.current = null;
+        if (!pending) return;
+
+        const { oldLineCount, lineCount: newLineCount, totalBytes } = pending;
+
+        // 줄 수/파일 크기 갱신 + 개행 없이 끝나던 마지막 줄이 속한 블록 무효화
+        normalLineCache.setLineCount(newLineCount, true);
+        setLineCount(newLineCount);
+        setLiveFileSize(totalBytes);
+        if (oldLineCount > 0) {
+            normalLineCache.invalidateLine(oldLineCount - 1);
+        }
+
+        // 필터 모드에서는 스크롤/버튼 처리 없이 캐시만 최신화한다
+        if (isFilterModeRef.current) return;
+
+        if (atBottomRef.current) {
+            // 맨 아래에 있으면 새 끝으로 자동 스크롤
+            const maxTop = Math.max(
+                0,
+                newLineCount - viewportHeightRef.current / ROW_HEIGHT,
+            );
+            handleTopLineChange(maxTop);
+        } else {
+            const added = Math.max(0, newLineCount - oldLineCount);
+            setNewLinesCount((prev) => prev + added);
+        }
+    }, [normalLineCache, handleTopLineChange]);
+
+    // 로테이션 감지 시 같은 경로로 자동 재오픈 (tail 상태 유지)
+    const handleTailRotated = useCallback(
+        (reason: "truncated" | "replaced") => {
+            setRotationReason(reason);
+            const current = currentFileRef.current;
+            if (current) {
+                scrollToBottomAfterReopenRef.current = true;
+                handleOpenFileByPath(current.path, { preserveTail: true });
+            }
+        },
+        [handleOpenFileByPath],
+    );
+
+    // 백엔드 tail 이벤트 수신 핸들러 (Channel 콜백)
+    const handleTailEvent = useCallback(
+        (event: TailEvent) => {
+            if (event.type === "appended") {
+                // 프레임 내 이벤트는 첫 oldLineCount ~ 마지막 lineCount로 합침
+                const prev = pendingAppendedRef.current;
+                pendingAppendedRef.current = {
+                    oldLineCount: prev ? prev.oldLineCount : event.oldLineCount,
+                    lineCount: event.lineCount,
+                    totalBytes: event.totalBytes,
+                };
+                if (tailRafRef.current === null) {
+                    tailRafRef.current = requestAnimationFrame(() => {
+                        flushTailAppended();
+                    });
+                }
+            } else if (event.type === "rotated") {
+                handleTailRotated(event.reason);
+            } else {
+                setErrorMessage(event.message);
+            }
+        },
+        [flushTailAppended, handleTailRotated],
+    );
+
+    // tail 활성화: 인덱싱 완료 후 set_tail 호출 (로테이션 재오픈 시 재호출 포함)
+    useEffect(() => {
+        if (!file || !tailEnabled || !indexProgress?.done) {
+            return;
+        }
+        // 로테이션 재오픈 직후라면 인덱싱 완료 시점에 맨 아래로 이동
+        if (scrollToBottomAfterReopenRef.current) {
+            scrollToBottomAfterReopenRef.current = false;
+            const maxTop = Math.max(
+                0,
+                lineCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
+            );
+            handleTopLineChange(maxTop);
+        }
+        let cancelled = false;
+        queueTailCommand(() => setTail(file.id, true, handleTailEvent))
+            .then(() => {
+                if (cancelled) {
+                    queueTailCommand(() =>
+                        setTail(file.id, false, () => {}),
+                    ).catch(() => {});
+                }
+            })
+            .catch((err) => {
+                if (cancelled) return;
+                const msg =
+                    typeof err === "string"
+                        ? err
+                        : "tail 모드를 켤 수 없습니다.";
+                setErrorMessage(msg);
+                tailEnabledRef.current = false;
+                setTailEnabled(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        file,
+        tailEnabled,
+        indexProgress?.done,
+        handleTailEvent,
+        queueTailCommand,
+        handleTopLineChange,
+    ]);
+
+    // "새 줄 N개 ↓" 버튼: 맨 아래로 이동하고 자동 스크롤 재개
+    const handleScrollToBottom = useCallback(() => {
+        const maxTop = Math.max(
+            0,
+            lineCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
+        );
+        handleTopLineChange(maxTop);
+    }, [handleTopLineChange]);
+
+    // 로테이션 배너는 5초 후 자동으로 사라진다
+    useEffect(() => {
+        if (!rotationReason) return;
+        const timer = setTimeout(() => setRotationReason(null), 5000);
+        return () => clearTimeout(timer);
+    }, [rotationReason]);
 
     const fileName = file ? file.path.split("/").pop() || file.path : null;
     const currentHitLine = currentHit !== null ? currentHit.line : null;
@@ -383,6 +629,13 @@ export default function App() {
         ? filteredLineCache.getLine(Math.floor(topLine))
         : undefined;
     const actualTopLine = topFilteredRow ? topFilteredRow.no + 1 : null;
+
+    // 현재 렌더 기준 맨 아래 여부 (상태바 tail 일시정지 표시용)
+    const maxTopNow = Math.max(
+        0,
+        displayLineCount - viewportHeight / ROW_HEIGHT,
+    );
+    const isAtBottomNow = topLine >= maxTopNow - 0.5;
 
     return (
         <div className="flex flex-col h-screen w-screen overflow-hidden bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 select-none">
@@ -432,8 +685,34 @@ export default function App() {
                     </div>
                 )}
 
-                {/* 우측: 파일 열기 버튼 */}
+                {/* 우측: tail 토글 + 파일 열기 버튼 */}
                 <div className="flex items-center space-x-2 shrink-0">
+                    <button
+                        type="button"
+                        onClick={handleToggleTail}
+                        disabled={!file}
+                        title="tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                        className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 ${
+                            tailEnabled
+                                ? "bg-emerald-600 text-white hover:bg-emerald-500 shadow-xs"
+                                : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                        } ${
+                            file
+                                ? "cursor-pointer"
+                                : "opacity-40 cursor-not-allowed"
+                        }`}
+                    >
+                        <span>Tail</span>
+                        <kbd
+                            className={`text-[10px] px-1 py-0.5 rounded font-mono ${
+                                tailEnabled
+                                    ? "bg-emerald-700 text-emerald-100"
+                                    : "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400"
+                            }`}
+                        >
+                            ⌘T
+                        </kbd>
+                    </button>
                     <button
                         type="button"
                         onClick={handleOpenDialog}
@@ -446,6 +725,24 @@ export default function App() {
                     </button>
                 </div>
             </header>
+
+            {/* 로테이션 안내 배너 (5초 후 자동 숨김) */}
+            {rotationReason && (
+                <div className="px-4 py-2 bg-sky-50 text-sky-700 dark:bg-sky-950/50 dark:text-sky-300 text-xs flex items-center justify-between border-b border-sky-200 dark:border-sky-900">
+                    <span>
+                        {rotationReason === "truncated"
+                            ? "파일이 잘렸습니다(로테이션). 다시 엽니다."
+                            : "파일이 교체됐습니다(로테이션). 다시 엽니다."}
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => setRotationReason(null)}
+                        className="font-bold hover:underline cursor-pointer ml-4"
+                    >
+                        닫기
+                    </button>
+                </div>
+            )}
 
             {/* 에러 메시지 알림 바 */}
             {errorMessage && (
@@ -470,7 +767,7 @@ export default function App() {
                         totalFileLines={lineCount}
                         lineCache={activeLineCache}
                         topLine={topLine}
-                        onTopLineChange={setTopLine}
+                        onTopLineChange={handleTopLineChange}
                         currentHitLine={currentHitLine}
                         isFilterMode={isFilterMode}
                         onLineDoubleClick={handleLineDoubleClick}
@@ -515,6 +812,20 @@ export default function App() {
                     </div>
                 )}
 
+                {/* tail 모드: 위로 스크롤 중 새 줄이 있으면 하단 이동 버튼 표시 */}
+                {tailEnabled &&
+                    !isFilterMode &&
+                    !isAtBottomNow &&
+                    newLinesCount > 0 && (
+                        <button
+                            type="button"
+                            onClick={handleScrollToBottom}
+                            className="absolute bottom-3 right-16 z-30 px-3 py-1.5 rounded-full bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-medium shadow-lg hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors cursor-pointer"
+                        >
+                            새 줄 {newLinesCount.toLocaleString("ko-KR")}개 ↓
+                        </button>
+                    )}
+
                 {/* 창 드래그 오버 안내 오버레이 */}
                 {isDragOver && (
                     <div className="absolute inset-0 bg-blue-500/10 dark:bg-blue-500/20 backdrop-blur-xs border-2 border-dashed border-blue-500 flex items-center justify-center z-50 pointer-events-none">
@@ -528,12 +839,15 @@ export default function App() {
             {/* 하단 상태바 */}
             <StatusBar
                 file={file}
+                fileSize={liveFileSize}
                 lineCount={lineCount}
                 indexProgress={indexProgress}
                 topLine={topLine}
                 searchStatus={searchStatus}
                 isFilterMode={isFilterMode}
                 actualTopLine={actualTopLine}
+                tailOn={tailEnabled && file !== null}
+                tailPaused={tailEnabled && !isAtBottomNow}
             />
         </div>
     );

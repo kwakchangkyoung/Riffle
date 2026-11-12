@@ -304,7 +304,7 @@ pub(crate) fn search_with_config(
                     buf.resize(to_read, 0);
                 }
 
-                match source.read_at_or_mmap(&mut buf[..to_read], offset) {
+                match source.read_into(&mut buf[..to_read], offset) {
                     Ok(n) => {
                         if n == 0 {
                             break;

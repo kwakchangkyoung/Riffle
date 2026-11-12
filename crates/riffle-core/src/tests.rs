@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::search::{
     Matcher, SearchConfig, SearchOptions, SearchOutcome, search, search_with_config, utf16_ranges,
 };
-use crate::{Error, LogFile, MAX_DISPLAY_BYTES};
+use crate::{Error, LogFile, MAX_DISPLAY_BYTES, RefreshOutcome};
 
 /// 테스트용 RAII 임시 파일 도우미. 스코프를 벗어나면 파일이 자동 삭제된다.
 struct TempTestFile {
@@ -47,7 +47,7 @@ fn test_empty_file() {
 
     assert_eq!(log_file.source().len(), 0);
     assert!(log_file.source().is_empty());
-    assert_eq!(log_file.source().bytes(0, 10), &[]);
+    assert!(log_file.source().read_range(0, 10).unwrap().is_empty());
 
     let cancel = AtomicBool::new(false);
     let mut progress_called = false;
@@ -988,4 +988,269 @@ fn test_read_lines_at_arbitrary_and_filter() {
 
     assert_eq!(lines[4].no, 1024);
     assert_eq!(lines[4].text, "line 1024 text message");
+}
+
+// =========================================================================
+// Phase 4 tail 모드 (refresh / 추가분 인덱싱) 테스트
+// =========================================================================
+
+/// 파일 끝에 바이트를 추가한다 (append 모드)
+fn append_bytes(path: &Path, data: &[u8]) {
+    let mut f = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("append open 실패");
+    f.write_all(data).expect("append 쓰기 실패");
+    f.flush().expect("append flush 실패");
+}
+
+/// 인덱싱을 동기적으로 완료한다
+fn build_index(log_file: &LogFile) {
+    let cancel = AtomicBool::new(false);
+    log_file
+        .build_index(&cancel, &mut |_| {})
+        .expect("build_index 실패");
+}
+
+#[test]
+fn test_refresh_appended_lines() {
+    let tmp = TempTestFile::new("refresh_append", b"line 0\nline 1\nline 2\n");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    assert_eq!(log_file.index().line_count(), 3);
+
+    // 변경 없음 → Unchanged
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Unchanged);
+
+    // append 후 refresh → Appended, 새 줄 내용이 정확해야 한다
+    append_bytes(tmp.path(), b"line 3\nline 4\nline 5\n");
+    let outcome = log_file.refresh().unwrap();
+    match outcome {
+        RefreshOutcome::Appended {
+            old_line_count,
+            new_line_count,
+            new_len,
+        } => {
+            assert_eq!(old_line_count, 3);
+            assert_eq!(new_line_count, 6);
+            assert_eq!(new_len, log_file.source().len());
+        }
+        other => panic!("Appended 기대, 실제 {:?}", other),
+    }
+    assert_eq!(log_file.index().line_count(), 6);
+
+    let lines = log_file.read_lines(3, 3, None).unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].text, "line 3");
+    assert_eq!(lines[1].text, "line 4");
+    assert_eq!(lines[2].text, "line 5");
+
+    // 두 번째 append도 이어서 정확해야 한다 (extend 반복)
+    append_bytes(tmp.path(), b"line 6\n");
+    let outcome2 = log_file.refresh().unwrap();
+    assert!(matches!(
+        outcome2,
+        RefreshOutcome::Appended {
+            old_line_count: 6,
+            new_line_count: 7,
+            ..
+        }
+    ));
+    let last = log_file.read_lines(6, 1, None).unwrap();
+    assert_eq!(last[0].text, "line 6");
+}
+
+#[test]
+fn test_refresh_continues_partial_last_line() {
+    // 개행 없이 끝난 파일: "a\nb" → 2줄("a", "b")
+    let tmp = TempTestFile::new("refresh_partial", b"a\nb");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    assert_eq!(log_file.index().line_count(), 2);
+
+    // "c\nd\n" 추가 → "a\nbc\nd\n" → 3줄("a", "bc", "d")
+    append_bytes(tmp.path(), b"c\nd\n");
+    let outcome = log_file.refresh().unwrap();
+    assert!(matches!(
+        outcome,
+        RefreshOutcome::Appended {
+            old_line_count: 2,
+            new_line_count: 3,
+            ..
+        }
+    ));
+
+    let lines = log_file.read_lines(0, 10, None).unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].text, "a");
+    assert_eq!(lines[1].text, "bc");
+    assert_eq!(lines[2].text, "d");
+}
+
+#[test]
+fn test_refresh_checkpoint_boundary_and_bulk_append() {
+    // K(1024) 배수 경계를 넘는 append 검증
+    // 초기: 1023개 완결 줄 + 개행 없는 마지막 조각 → line_count = 1024
+    let mut content = String::new();
+    for i in 0..1023 {
+        content.push_str(&format!("base line {:04}\n", i));
+    }
+    content.push_str("partial-tail");
+    let tmp = TempTestFile::new("refresh_k_boundary", content.as_bytes());
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    assert_eq!(log_file.index().line_count(), 1024);
+
+    // 개행으로 partial-tail을 닫고 새 줄 추가 → 1024번 줄("rest-line")이 K 배수 체크포인트 대상
+    append_bytes(tmp.path(), b"\nrest-line\n");
+    let outcome = log_file.refresh().unwrap();
+    assert!(matches!(
+        outcome,
+        RefreshOutcome::Appended {
+            old_line_count: 1024,
+            new_line_count: 1025,
+            ..
+        }
+    ));
+
+    // 1024번 줄은 체크포인트에서 바로 시작 오프셋을 얻어야 한다
+    let line1024 = log_file.read_lines(1024, 1, None).unwrap();
+    assert_eq!(line1024.len(), 1);
+    assert_eq!(line1024[0].no, 1024);
+    assert_eq!(line1024[0].text, "rest-line");
+
+    // 수천 줄 + 4MB 청크 경계를 넘는 분량을 한꺼번에 추가
+    // (줄당 약 900바이트 × 5000줄 ≈ 4.5MB)
+    let mut bulk = String::new();
+    for i in 0..5000u64 {
+        bulk.push_str(&format!(
+            "bulk line {:05} {}\n",
+            i,
+            "x".repeat(880 + (i % 50) as usize)
+        ));
+    }
+    append_bytes(tmp.path(), bulk.as_bytes());
+    let outcome2 = log_file.refresh().unwrap();
+    assert!(matches!(outcome2, RefreshOutcome::Appended { .. }));
+    assert_eq!(log_file.index().line_count(), 1025 + 5000);
+
+    // 임의 줄들을 순진한 기대값과 비교
+    let total = log_file.index().line_count();
+    for &idx in &[0u64, 1, 1022, 1023, 1024, 1025, 2000, 3000, 6024] {
+        if idx >= total {
+            continue;
+        }
+        let lines = log_file.read_lines(idx, 1, None).unwrap();
+        assert_eq!(lines.len(), 1, "줄 {} 읽기 실패", idx);
+        assert_eq!(lines[0].no, idx);
+        let expected = if idx < 1023 {
+            format!("base line {:04}", idx)
+        } else if idx == 1023 {
+            "partial-tail".to_string()
+        } else if idx == 1024 {
+            "rest-line".to_string()
+        } else {
+            let b = idx - 1025;
+            format!("bulk line {:05} {}", b, "x".repeat(880 + (b % 50) as usize))
+        };
+        assert_eq!(lines[0].text, expected, "줄 {} 내용 불일치", idx);
+    }
+}
+
+#[test]
+fn test_refresh_pending_while_indexing() {
+    let tmp = TempTestFile::new("refresh_pending", b"initial\n");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+
+    // 인덱싱 미완료(done=false) 상태에서는 변경 여부와 무관하게 Pending
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Pending);
+
+    // 파일이 커진 상태에서도 인덱싱 미완료면 Pending
+    append_bytes(tmp.path(), b"appended\n");
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Pending);
+
+    // 인덱싱 완료 후에는 추가분이 Appended로 반영된다
+    // (빌드는 open 시점 길이만 인덱싱하므로 append분은 여전히 미반영)
+    build_index(&log_file);
+    let outcome = log_file.refresh().unwrap();
+    assert!(matches!(outcome, RefreshOutcome::Appended { .. }));
+    assert_eq!(log_file.index().line_count(), 2);
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Unchanged);
+}
+
+#[test]
+fn test_refresh_truncated_and_safe_reads() {
+    let tmp = TempTestFile::new("refresh_trunc", b"line 0\nline 1\nline 2\nline 3\n");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    assert_eq!(log_file.index().line_count(), 4);
+
+    // 외부에서 truncate (set_len(0))
+    let f = OpenOptions::new()
+        .write(true)
+        .open(tmp.path())
+        .expect("쓰기 핸들 열기 실패");
+    f.set_len(0).expect("set_len 실패");
+    drop(f);
+
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Truncated);
+
+    // truncate 이후 모든 읽기 API가 패닉 없이 반환해야 한다
+    let lines = log_file.read_lines(0, 10, None).unwrap();
+    assert_eq!(lines.len(), 4); // 인덱스는 이전 줄 수를 유지
+    assert!(lines.iter().all(|l| l.text.is_empty()));
+
+    let at_lines = log_file.read_lines_at(&[0, 1, 2, 3], None).unwrap();
+    assert_eq!(at_lines.len(), 4);
+
+    // 인덱스 조회 함수들도 패닉 없어야 한다
+    let _ = log_file.index().line_start(log_file.source(), 0);
+    let _ = log_file.index().line_of_offset(log_file.source(), 0);
+}
+
+#[test]
+fn test_refresh_replaced_and_deleted() {
+    let tmp = TempTestFile::new("refresh_rotate", b"old content\n");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+
+    // rename 로테이션: path를 path.1로 옮기고 같은 경로에 새 파일 생성 → Replaced
+    let rotated = PathBuf::from(format!("{}.1", tmp.path().display()));
+    std::fs::rename(tmp.path(), &rotated).expect("rename 실패");
+    let mut nf = File::create(tmp.path()).expect("새 파일 생성 실패");
+    nf.write_all(b"new file content\n").expect("쓰기 실패");
+    drop(nf);
+
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Replaced);
+
+    // 경로의 파일이 사라지면 → Replaced
+    std::fs::remove_file(tmp.path()).expect("삭제 실패");
+    assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Replaced);
+
+    let _ = std::fs::remove_file(&rotated);
+}
+
+#[test]
+fn test_refresh_on_initially_empty_file() {
+    let tmp = TempTestFile::new("refresh_empty", b"");
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    assert_eq!(log_file.index().line_count(), 0);
+
+    // 빈 파일에 append → Appended (체크포인트 정렬 검증)
+    append_bytes(tmp.path(), b"first\nsecond\n");
+    let outcome = log_file.refresh().unwrap();
+    assert!(matches!(
+        outcome,
+        RefreshOutcome::Appended {
+            old_line_count: 0,
+            new_line_count: 2,
+            ..
+        }
+    ));
+
+    let lines = log_file.read_lines(0, 10, None).unwrap();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].text, "first");
+    assert_eq!(lines[1].text, "second");
 }

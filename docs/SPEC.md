@@ -68,8 +68,10 @@ riffle/
 
 ### 3.1 파일 읽기
 
-- 기본 읽기는 `memmap2`를 사용한 mmap.
-- **주의:** mmap 중인 파일이 외부에서 잘리면(truncate, 로그 로테이션) 해당 영역 접근 시 SIGBUS로 앱이 죽는다. 따라서 tail 모드(Phase 4)가 켜진 파일은 `std::os::unix::fs::FileExt::read_at` 기반으로 읽는다. 읽기 방식은 내부 `Source` 추상화 뒤에 숨겨 상위 코드가 신경 쓰지 않게 한다.
+- (Phase 4 결정) 모든 읽기는 `std::os::unix::fs::FileExt::read_at` 기반으로 한다. mmap은 사용하지 않는다.
+  - mmap 중인 파일이 외부에서 잘리면(truncate, 로그 로테이션) 해당 영역 접근 시 SIGBUS로 앱이 죽는다. read_at은 짧게 읽힐 뿐이므로 tail 여부와 무관하게 안전하다.
+  - 측정 결과 인덱싱·검색은 read_at 더블 버퍼링이 mmap 페이지 폴트 방식보다 빨랐고(외장 SSD 238MB/s → 680MB/s), 줄 읽기는 블록당 수십~수백 KB라 pread로 충분하다(100줄 읽기 ≈23µs).
+  - 읽기 방식은 `Source` 뒤에 숨겨 상위 코드가 신경 쓰지 않게 한다. 파일 길이는 tail로 증가할 수 있다.
 - 인코딩: UTF-8을 가정하고, 잘못된 바이트는 `String::from_utf8_lossy`로 대체 문자 처리한다.
 - 줄바꿈: `\n` 기준으로 나누고, 줄 끝의 `\r`은 표시 시 제거한다 (CRLF 지원).
 - 마지막 줄에 개행이 없어도 한 줄로 인정한다.
