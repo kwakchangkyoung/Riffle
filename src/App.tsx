@@ -1,23 +1,36 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
+import { listen, type Event as TauriEvent } from "@tauri-apps/api/event";
 import {
     closeFile,
+    copyLines,
+    getRecentFiles,
     openFile,
     searchDensity,
     setTail,
     type FileInfo,
     type IndexProgress,
+    type MenuEvent,
     type QueryOptions,
     type SearchHit,
     type TailEvent,
 } from "@/lib/ipc";
 import { LineCache } from "@/lib/lineCache";
+import { useTauriListener } from "@/lib/useTauriListener";
+import {
+    clampFontSize,
+    DEFAULT_FONT_SIZE,
+    loadFontSize,
+    rowHeightFor,
+    saveFontSize,
+} from "@/lib/fontSize";
+import { formatBytes } from "@/lib/format";
 import { LogViewport } from "@/components/viewer/LogViewport";
+import { FullLinePanel } from "@/components/viewer/FullLinePanel";
+import { GotoLineDialog } from "@/components/GotoLineDialog";
 import { SearchBar } from "@/components/search/SearchBar";
 import { StatusBar, type SearchStatusInfo } from "@/components/StatusBar";
-
-const ROW_HEIGHT = 20;
 
 /**
  * Riffle 메인 애플리케이션 컴포넌트
@@ -49,6 +62,24 @@ export default function App() {
     const [rotationReason, setRotationReason] = useState<
         "truncated" | "replaced" | null
     >(null);
+
+    // Phase 5 상태: 폰트 크기, 줄 단위 선택, 복사, 줄 이동, 전체 줄 패널, 최근 파일
+    const [fontSize, setFontSize] = useState<number>(loadFontSize);
+    const [lineSelection, setLineSelection] = useState<{
+        anchor: number;
+        focus: number;
+    } | null>(null);
+    const [copying, setCopying] = useState(false);
+    const [toast, setToast] = useState<string | null>(null);
+    const [gotoLineOpen, setGotoLineOpen] = useState(false);
+    const [fullLinePanel, setFullLinePanel] = useState<{
+        fileId: number;
+        no: number;
+    } | null>(null);
+    const [recentFiles, setRecentFiles] = useState<string[]>([]);
+    const [findSignal, setFindSignal] = useState(0);
+
+    const rowHeight = rowHeightFor(fontSize);
 
     const normalLineCache = useMemo(() => new LineCache(), []);
     const filteredLineCache = useMemo(() => new LineCache(), []);
@@ -117,27 +148,30 @@ export default function App() {
     }, [displayLineCount]);
 
     // 뷰포트 topLine 변경 래퍼: 맨 아래 여부를 즉시 갱신하고 도달 시 새 줄 카운터를 리셋한다
-    const handleTopLineChange = useCallback((v: number) => {
-        setTopLine(v);
-        const maxTop = Math.max(
-            0,
-            displayCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
-        );
-        const atBottom = v >= maxTop - 0.5;
-        atBottomRef.current = atBottom;
-        if (atBottom) {
-            setNewLinesCount(0);
-        }
-    }, []);
+    const handleTopLineChange = useCallback(
+        (v: number) => {
+            setTopLine(v);
+            const maxTop = Math.max(
+                0,
+                displayCountRef.current - viewportHeightRef.current / rowHeight,
+            );
+            const atBottom = v >= maxTop - 0.5;
+            atBottomRef.current = atBottom;
+            if (atBottom) {
+                setNewLinesCount(0);
+            }
+        },
+        [rowHeight],
+    );
 
     // 맨 아래 여부 추적 (줄 수/뷰포트 변화에 대한 백업 갱신)
     useEffect(() => {
         const maxTop = Math.max(
             0,
-            displayLineCount - viewportHeight / ROW_HEIGHT,
+            displayLineCount - viewportHeight / rowHeight,
         );
         atBottomRef.current = topLine >= maxTop - 0.5;
-    }, [topLine, displayLineCount, viewportHeight]);
+    }, [topLine, displayLineCount, viewportHeight, rowHeight]);
 
     // tail IPC 커맨드는 순차 실행해 enable/disable 순서가 뒤바뀌지 않게 한다
     const tailQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -189,6 +223,9 @@ export default function App() {
             setDensityBins([]);
             activeSearchIdRef.current = null;
             setNewLinesCount(0);
+            setLineSelection(null);
+            setFullLinePanel(null);
+            setGotoLineOpen(false);
 
             // 파일 전환 시 tail은 자동 해제 (로테이션 재오픈 시에만 유지)
             if (!options?.preserveTail) {
@@ -277,55 +314,30 @@ export default function App() {
         }
     }, [queueTailCommand]);
 
-    // Cmd+O / Cmd+T 단축키 등록
-    useEffect(() => {
-        const handleKeyDown = (e: KeyboardEvent) => {
-            if (e.metaKey && e.key.toLowerCase() === "o") {
-                e.preventDefault();
-                handleOpenDialog();
-            } else if (e.metaKey && e.key.toLowerCase() === "t") {
-                e.preventDefault();
-                handleToggleTail();
-            }
-        };
-        window.addEventListener("keydown", handleKeyDown);
-        return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [handleOpenDialog, handleToggleTail]);
-
     // Tauri 윈도우 드래그 앤 드롭 이벤트 등록
-    useEffect(() => {
-        let unlistenFn: (() => void) | undefined;
-
-        try {
-            const webview = getCurrentWebview();
-            webview
-                .onDragDropEvent((event) => {
-                    const payload = event.payload;
-                    if (payload.type === "enter" || payload.type === "over") {
-                        setIsDragOver(true);
-                    } else if (payload.type === "leave") {
-                        setIsDragOver(false);
-                    } else if (payload.type === "drop") {
-                        setIsDragOver(false);
-                        if (payload.paths && payload.paths.length > 0) {
-                            handleOpenFileByPath(payload.paths[0]);
-                        }
-                    }
-                })
-                .then((unlisten) => {
-                    unlistenFn = unlisten;
-                })
-                .catch((err) => {
-                    console.warn("드래그 앤 드롭 리스너 등록 실패:", err);
-                });
-        } catch (err) {
-            console.warn("getCurrentWebview 호출 실패:", err);
-        }
-
-        return () => {
-            if (unlistenFn) unlistenFn();
-        };
-    }, [handleOpenFileByPath]);
+    useTauriListener(
+        (handler) => {
+            try {
+                return getCurrentWebview().onDragDropEvent(handler);
+            } catch (err) {
+                console.warn("getCurrentWebview 호출 실패:", err);
+                return Promise.resolve(() => {});
+            }
+        },
+        (event: TauriEvent<DragDropEvent>) => {
+            const payload = event.payload;
+            if (payload.type === "enter" || payload.type === "over") {
+                setIsDragOver(true);
+            } else if (payload.type === "leave") {
+                setIsDragOver(false);
+            } else if (payload.type === "drop") {
+                setIsDragOver(false);
+                if (payload.paths && payload.paths.length > 0) {
+                    handleOpenFileByPath(payload.paths[0]);
+                }
+            }
+        },
+    );
 
     // 검색 밀도 요청 (최대 4회/초 스로틀)
     const requestDensityFetch = useCallback(
@@ -458,18 +470,25 @@ export default function App() {
             // 해당 줄이 화면 위에서 1/3 지점에 오도록 topLine 설정
             const targetIndex = isFilterMode ? hit.index : hit.line;
             const visibleRows =
-                viewportHeight > 0 ? viewportHeight / ROW_HEIGHT : 30;
+                viewportHeight > 0 ? viewportHeight / rowHeight : 30;
             const targetTop = targetIndex - Math.floor(visibleRows / 3);
             const maxTop = Math.max(0, activeLineCount - visibleRows);
             const clampedTop = Math.max(0, Math.min(maxTop, targetTop));
             handleTopLineChange(clampedTop);
         },
-        [isFilterMode, viewportHeight, activeLineCount, handleTopLineChange],
+        [
+            isFilterMode,
+            viewportHeight,
+            rowHeight,
+            activeLineCount,
+            handleTopLineChange,
+        ],
     );
 
-    // 필터 모드 토글
+    // 필터 모드 토글 (필터 모드에서는 실제 줄 번호 기준 줄 선택을 지원하지 않으므로 해제)
     const handleToggleFilterMode = useCallback(() => {
         setIsFilterMode((prev) => !prev);
+        setLineSelection(null);
         handleTopLineChange(0);
     }, [handleTopLineChange]);
 
@@ -478,13 +497,13 @@ export default function App() {
         (originalLineNo: number) => {
             setIsFilterMode(false);
             const visibleRows =
-                viewportHeight > 0 ? viewportHeight / ROW_HEIGHT : 30;
+                viewportHeight > 0 ? viewportHeight / rowHeight : 30;
             const targetTop = originalLineNo - Math.floor(visibleRows / 3);
             const maxTop = Math.max(0, lineCount - visibleRows);
             const clampedTop = Math.max(0, Math.min(maxTop, targetTop));
             handleTopLineChange(clampedTop);
         },
-        [viewportHeight, lineCount, handleTopLineChange],
+        [viewportHeight, rowHeight, lineCount, handleTopLineChange],
     );
 
     // ===== tail 모드 =====
@@ -513,14 +532,14 @@ export default function App() {
             // 맨 아래에 있으면 새 끝으로 자동 스크롤
             const maxTop = Math.max(
                 0,
-                newLineCount - viewportHeightRef.current / ROW_HEIGHT,
+                newLineCount - viewportHeightRef.current / rowHeight,
             );
             handleTopLineChange(maxTop);
         } else {
             const added = Math.max(0, newLineCount - oldLineCount);
             setNewLinesCount((prev) => prev + added);
         }
-    }, [normalLineCache, handleTopLineChange]);
+    }, [normalLineCache, rowHeight, handleTopLineChange]);
 
     // 로테이션 감지 시 같은 경로로 자동 재오픈 (tail 상태 유지)
     const handleTailRotated = useCallback(
@@ -570,7 +589,7 @@ export default function App() {
             scrollToBottomAfterReopenRef.current = false;
             const maxTop = Math.max(
                 0,
-                lineCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
+                lineCountRef.current - viewportHeightRef.current / rowHeight,
             );
             handleTopLineChange(maxTop);
         }
@@ -603,16 +622,221 @@ export default function App() {
         handleTailEvent,
         queueTailCommand,
         handleTopLineChange,
+        rowHeight,
     ]);
 
     // "새 줄 N개 ↓" 버튼: 맨 아래로 이동하고 자동 스크롤 재개
     const handleScrollToBottom = useCallback(() => {
         const maxTop = Math.max(
             0,
-            lineCountRef.current - viewportHeightRef.current / ROW_HEIGHT,
+            lineCountRef.current - viewportHeightRef.current / rowHeight,
         );
         handleTopLineChange(maxTop);
-    }, [handleTopLineChange]);
+    }, [rowHeight, handleTopLineChange]);
+
+    // ===== Phase 5: 편의 기능 =====
+
+    // 비동기 핸들러에서 최신 줄 선택을 읽기 위한 ref
+    const lineSelectionRef = useRef(lineSelection);
+    useEffect(() => {
+        lineSelectionRef.current = lineSelection;
+    }, [lineSelection]);
+
+    // 폰트 크기 조절 (localStorage에 저장)
+    const adjustFontSize = useCallback((delta: number) => {
+        setFontSize((prev) => {
+            const next = clampFontSize(prev + delta);
+            saveFontSize(next);
+            return next;
+        });
+    }, []);
+
+    const handleFontReset = useCallback(() => {
+        setFontSize(DEFAULT_FONT_SIZE);
+        saveFontSize(DEFAULT_FONT_SIZE);
+    }, []);
+
+    // 거터 줄 번호 클릭: 일반 클릭은 해당 줄 선택, Shift+클릭은 anchor~클릭 범위
+    const handleGutterLineClick = useCallback(
+        (index: number, shiftKey: boolean) => {
+            if (isFilterModeRef.current) return;
+            setLineSelection((prev) => {
+                if (shiftKey && prev !== null) {
+                    return { anchor: prev.anchor, focus: index };
+                }
+                return { anchor: index, focus: index };
+            });
+        },
+        [],
+    );
+
+    // Cmd+C (메뉴 copy 이벤트): 입력창/DOM 선택이 있으면 기본 복사,
+    // 아니면 줄 단위 선택 범위를 Rust에서 읽어 클립보드에 기록한다.
+    const handleCopyMenu = useCallback(async () => {
+        const active = document.activeElement;
+        if (
+            active instanceof HTMLInputElement ||
+            active instanceof HTMLTextAreaElement
+        ) {
+            document.execCommand("copy");
+            return;
+        }
+        const domSelection = window.getSelection();
+        if (
+            domSelection !== null &&
+            !domSelection.isCollapsed &&
+            domSelection.toString().length > 0
+        ) {
+            document.execCommand("copy");
+            return;
+        }
+
+        const current = currentFileRef.current;
+        const selection = lineSelectionRef.current;
+        if (current === null || selection === null) return;
+
+        const start = Math.min(selection.anchor, selection.focus);
+        const end = Math.max(selection.anchor, selection.focus);
+        setCopying(true);
+        try {
+            const result = await copyLines(current.id, start, end);
+            setToast(
+                `${result.lines.toLocaleString("ko-KR")}줄 복사됨 (${formatBytes(result.bytes)})`,
+            );
+        } catch (err) {
+            const msg = typeof err === "string" ? err : "복사에 실패했습니다.";
+            setErrorMessage(msg);
+        } finally {
+            setCopying(false);
+        }
+    }, []);
+
+    // Cmd+L: 필터 모드에서는 실제 줄 번호 기준 이동을 위해 먼저 필터 해제
+    const handleOpenGotoLine = useCallback(() => {
+        if (currentFileRef.current === null) return;
+        if (isFilterModeRef.current) {
+            setIsFilterMode(false);
+        }
+        setGotoLineOpen(true);
+    }, []);
+
+    // 줄 이동 모달에서 확정: 해당 줄이 화면 위 1/3 지점에 오도록 스크롤
+    const handleGotoNavigate = useCallback(
+        (lineNo: number) => {
+            setGotoLineOpen(false);
+            const visibleRows =
+                viewportHeightRef.current > 0
+                    ? viewportHeightRef.current / rowHeight
+                    : 30;
+            const targetIndex = lineNo - 1; // 1-based → 0-based
+            const targetTop = targetIndex - Math.floor(visibleRows / 3);
+            const maxTop = Math.max(0, lineCountRef.current - visibleRows);
+            handleTopLineChange(Math.max(0, Math.min(maxTop, targetTop)));
+        },
+        [rowHeight, handleTopLineChange],
+    );
+
+    // 잘린 줄의 "…" 클릭: 원문 전체 패널 열기/교체
+    const handleTruncatedLineClick = useCallback((lineNo: number) => {
+        const current = currentFileRef.current;
+        if (!current) return;
+        setFullLinePanel({ fileId: current.id, no: lineNo });
+    }, []);
+
+    const handleCloseFullLinePanel = useCallback(() => {
+        setFullLinePanel(null);
+    }, []);
+
+    // 뷰포트에 전달할 정규화된 선택 범위 (일반 모드에서만)
+    const selectedRange = useMemo(() => {
+        if (isFilterMode || lineSelection === null) return null;
+        return {
+            start: Math.min(lineSelection.anchor, lineSelection.focus),
+            end: Math.max(lineSelection.anchor, lineSelection.focus),
+        };
+    }, [isFilterMode, lineSelection]);
+
+    // 네이티브 메뉴 이벤트 수신 (메뉴 accelerator가 키를 먼저 가로채므로
+    // 해당 단축키는 프론트 keydown이 아니라 이 이벤트로만 처리한다)
+    useTauriListener(
+        (handler) => listen<MenuEvent>("menu", handler),
+        (event: TauriEvent<MenuEvent>) => {
+            const { id, path } = event.payload;
+            switch (id) {
+                case "open":
+                    handleOpenDialog();
+                    break;
+                case "open_recent":
+                    if (path) handleOpenFileByPath(path);
+                    break;
+                case "copy":
+                    void handleCopyMenu();
+                    break;
+                case "find":
+                    setFindSignal((s) => s + 1);
+                    break;
+                case "goto_line":
+                    handleOpenGotoLine();
+                    break;
+                case "go_top":
+                    handleTopLineChange(0);
+                    break;
+                case "go_bottom":
+                    handleScrollToBottom();
+                    break;
+                case "toggle_tail":
+                    handleToggleTail();
+                    break;
+                case "font_inc":
+                    adjustFontSize(1);
+                    break;
+                case "font_dec":
+                    adjustFontSize(-1);
+                    break;
+                case "font_reset":
+                    handleFontReset();
+                    break;
+                default:
+                    break;
+            }
+        },
+    );
+
+    // Esc: 줄 선택 해제 (모달/패널/입력창에서는 각 컴포넌트가 우선 처리)
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key !== "Escape") return;
+            const active = document.activeElement;
+            if (
+                active instanceof HTMLInputElement ||
+                active instanceof HTMLTextAreaElement
+            ) {
+                return;
+            }
+            if (gotoLineOpen || fullLinePanel !== null) return;
+            setLineSelection(null);
+        };
+        window.addEventListener("keydown", handleKeyDown);
+        return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [gotoLineOpen, fullLinePanel]);
+
+    // 토스트 메시지는 2초 후 자동으로 사라진다
+    useEffect(() => {
+        if (toast === null) return;
+        const timer = setTimeout(() => setToast(null), 2000);
+        return () => clearTimeout(timer);
+    }, [toast]);
+
+    // 파일이 닫혀 있으면 최근 파일 목록을 불러와 빈 화면에 표시한다
+    useEffect(() => {
+        if (file !== null) return;
+        getRecentFiles()
+            .then(setRecentFiles)
+            .catch((err) => {
+                console.warn("최근 파일 목록 조회 실패:", err);
+                setRecentFiles([]);
+            });
+    }, [file]);
 
     // 로테이션 배너는 5초 후 자동으로 사라진다
     useEffect(() => {
@@ -633,7 +857,7 @@ export default function App() {
     // 현재 렌더 기준 맨 아래 여부 (상태바 tail 일시정지 표시용)
     const maxTopNow = Math.max(
         0,
-        displayLineCount - viewportHeight / ROW_HEIGHT,
+        displayLineCount - viewportHeight / rowHeight,
     );
     const isAtBottomNow = topLine >= maxTopNow - 0.5;
 
@@ -668,9 +892,10 @@ export default function App() {
                             topLine={topLine}
                             visibleRows={
                                 viewportHeight > 0
-                                    ? viewportHeight / ROW_HEIGHT
+                                    ? viewportHeight / rowHeight
                                     : 30
                             }
+                            findSignal={findSignal}
                             isFilterMode={isFilterMode}
                             onToggleFilterMode={handleToggleFilterMode}
                             onNavigateToHit={handleNavigateToHit}
@@ -761,22 +986,38 @@ export default function App() {
             {/* 메인 영역: 가상 스크롤 뷰포트 또는 빈 상태 안내 */}
             <main className="relative flex-1 min-h-0 min-w-0 overflow-hidden flex">
                 {file ? (
-                    <LogViewport
-                        file={file}
-                        lineCount={activeLineCount}
-                        totalFileLines={lineCount}
-                        lineCache={activeLineCache}
-                        topLine={topLine}
-                        onTopLineChange={handleTopLineChange}
-                        currentHitLine={currentHitLine}
-                        isFilterMode={isFilterMode}
-                        onLineDoubleClick={handleLineDoubleClick}
-                        densityBins={densityBins}
-                        onViewportHeightChange={setViewportHeight}
-                        onTrackHeightChange={(h) => {
-                            trackHeightRef.current = h;
-                        }}
-                    />
+                    <>
+                        <LogViewport
+                            file={file}
+                            lineCount={activeLineCount}
+                            totalFileLines={lineCount}
+                            lineCache={activeLineCache}
+                            topLine={topLine}
+                            onTopLineChange={handleTopLineChange}
+                            currentHitLine={currentHitLine}
+                            isFilterMode={isFilterMode}
+                            onLineDoubleClick={handleLineDoubleClick}
+                            densityBins={densityBins}
+                            onViewportHeightChange={setViewportHeight}
+                            onTrackHeightChange={(h) => {
+                                trackHeightRef.current = h;
+                            }}
+                            fontSize={fontSize}
+                            rowHeight={rowHeight}
+                            selectedRange={selectedRange}
+                            onGutterLineClick={handleGutterLineClick}
+                            onTruncatedLineClick={handleTruncatedLineClick}
+                        />
+                        {fullLinePanel !== null &&
+                            fullLinePanel.fileId === file.id && (
+                                <FullLinePanel
+                                    key={fullLinePanel.no}
+                                    fileId={fullLinePanel.fileId}
+                                    lineNo={fullLinePanel.no}
+                                    onClose={handleCloseFullLinePanel}
+                                />
+                            )}
+                    </>
                 ) : (
                     <div
                         onClick={handleOpenDialog}
@@ -809,6 +1050,33 @@ export default function App() {
                                 </p>
                             </div>
                         </div>
+
+                        {/* 최근 파일 목록 */}
+                        {recentFiles.length > 0 && (
+                            <div
+                                className="mt-6 w-full max-w-md"
+                                onClick={(e) => e.stopPropagation()}
+                            >
+                                <div className="text-xs text-zinc-500 dark:text-zinc-400 mb-2 text-center">
+                                    최근 파일
+                                </div>
+                                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white/70 dark:bg-zinc-900/70 divide-y divide-zinc-100 dark:divide-zinc-800 overflow-hidden">
+                                    {recentFiles.slice(0, 10).map((path) => (
+                                        <button
+                                            key={path}
+                                            type="button"
+                                            onClick={() =>
+                                                handleOpenFileByPath(path)
+                                            }
+                                            className="w-full px-3 py-1.5 text-left text-xs font-mono text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 truncate cursor-pointer"
+                                            title={path}
+                                        >
+                                            {path}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -848,7 +1116,24 @@ export default function App() {
                 actualTopLine={actualTopLine}
                 tailOn={tailEnabled && file !== null}
                 tailPaused={tailEnabled && !isAtBottomNow}
+                copying={copying}
             />
+
+            {/* 줄 번호 이동 모달 (Cmd+L) */}
+            {gotoLineOpen && file && (
+                <GotoLineDialog
+                    totalLines={lineCount}
+                    onClose={() => setGotoLineOpen(false)}
+                    onNavigate={handleGotoNavigate}
+                />
+            )}
+
+            {/* 복사 완료 토스트 */}
+            {toast && (
+                <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-md bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-medium shadow-lg pointer-events-none">
+                    {toast}
+                </div>
+            )}
         </div>
     );
 }

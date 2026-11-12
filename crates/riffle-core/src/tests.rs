@@ -1254,3 +1254,258 @@ fn test_refresh_on_initially_empty_file() {
     assert_eq!(lines[0].text, "first");
     assert_eq!(lines[1].text, "second");
 }
+
+// =========================================================================
+// Phase 5 원문 범위/전체 줄 읽기 (read_text_range / read_full_line) 테스트
+// =========================================================================
+
+/// 내용을 쓴 임시 파일을 열고 인덱싱까지 완료한다.
+/// 반환된 TempTestFile이 살아 있는 동안 파일이 유지된다.
+fn indexed_file(prefix: &str, content: &[u8]) -> (TempTestFile, LogFile) {
+    let tmp = TempTestFile::new(prefix, content);
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    build_index(&log_file);
+    (tmp, log_file)
+}
+
+/// 순진한 참조 구현: 파일 바이트를 '\n'으로 나누고 각 줄 끝 '\r'을 제거한 뒤 '\n'으로 join.
+/// read_text_range의 기대값 계산용 (전체 파일 기준 줄 목록 반환).
+fn naive_lines(content: &[u8]) -> Vec<String> {
+    let mut parts: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
+    // 파일이 '\n'으로 끝나면 split이 만든 마지막 빈 조각은 줄이 아니다
+    if content.last() == Some(&b'\n') {
+        parts.pop();
+    }
+    parts
+        .iter()
+        .map(|l| {
+            let l = if l.ends_with(b"\r") {
+                &l[..l.len() - 1]
+            } else {
+                *l
+            };
+            String::from_utf8_lossy(l).into_owned()
+        })
+        .collect()
+}
+
+fn naive_join(lines: &[String]) -> String {
+    lines.join("\n")
+}
+
+#[test]
+fn test_read_text_range_crlf_and_no_trailing_newline() {
+    let content = b"alpha\r\nbeta\r\ngamma\nlast-no-newline";
+    let (_tmp, f) = indexed_file("range_crlf", content);
+    assert_eq!(f.index().line_count(), 4);
+
+    // 전체 범위: '\r' 제거, 마지막 개행 없는 줄 포함, 끝에 '\n' 없음
+    let s = f.read_text_range(0, 3, 1_000_000).unwrap();
+    assert_eq!(s, "alpha\nbeta\ngamma\nlast-no-newline");
+
+    // 부분 범위
+    let s = f.read_text_range(1, 2, 1_000_000).unwrap();
+    assert_eq!(s, "beta\ngamma");
+
+    // 단일 줄
+    let s = f.read_text_range(3, 3, 1_000_000).unwrap();
+    assert_eq!(s, "last-no-newline");
+}
+
+#[test]
+fn test_read_text_range_end_clamp_and_inverted() {
+    let content = b"l0\nl1\nl2\nl3\n";
+    let (_tmp, f) = indexed_file("range_clamp", content);
+    assert_eq!(f.index().line_count(), 4);
+
+    // end가 확인된 줄 수를 넘어도 마지막 줄로 clamp
+    let s = f.read_text_range(1, 999, 1_000_000).unwrap();
+    assert_eq!(s, "l1\nl2\nl3");
+
+    // start > end → 빈 문자열
+    assert_eq!(f.read_text_range(2, 1, 1_000_000).unwrap(), "");
+    // 범위 밖 start → 빈 문자열
+    assert_eq!(f.read_text_range(4, 9, 1_000_000).unwrap(), "");
+    assert_eq!(f.read_text_range(100, 200, 1_000_000).unwrap(), "");
+}
+
+#[test]
+fn test_read_text_range_too_large() {
+    let content = b"aaaa\nbbbb\n";
+    let (_tmp, f) = indexed_file("range_toolarge", content);
+
+    // "aaaa\nbbbb" = 9바이트
+    let s = f.read_text_range(0, 1, 9).unwrap();
+    assert_eq!(s, "aaaa\nbbbb");
+
+    // 8바이트로는 부족 → TooLarge
+    match f.read_text_range(0, 1, 8) {
+        Err(Error::TooLarge { limit }) => assert_eq!(limit, 8),
+        other => panic!("TooLarge 기대, 실제 {:?}", other.map(|s| s.len())),
+    }
+
+    // 단일 줄도 예산 초과 시 Err
+    match f.read_text_range(1, 1, 3) {
+        Err(Error::TooLarge { limit }) => assert_eq!(limit, 3),
+        other => panic!("TooLarge 기대, 실제 {:?}", other),
+    }
+}
+
+#[test]
+fn test_read_text_range_long_line_over_16kb_preserved() {
+    // 16KB를 넘는 단일 줄도 잘리지 않고 원문 그대로 반환되어야 한다
+    let mut content = Vec::new();
+    content.extend_from_slice(&vec![b'x'; 20 * 1024]);
+    content.extend_from_slice(b"\nshort\n");
+    let (_tmp, f) = indexed_file("range_long", &content);
+    assert_eq!(f.index().line_count(), 2);
+
+    let s = f.read_text_range(0, 1, 100_000).unwrap();
+    assert_eq!(s.len(), 20 * 1024 + 1 + 5);
+    assert!(s.starts_with(&"x".repeat(100)));
+    assert!(s.ends_with("\nshort"));
+}
+
+#[test]
+fn test_read_text_range_line_spanning_chunk_boundary() {
+    // 1MB 청크 경계를 걸치는 1.5MB짜리 줄 (pending 경로 검증)
+    let mut content = Vec::new();
+    content.extend_from_slice(b"before\n");
+    content.extend_from_slice(&vec![b'y'; 1536 * 1024]);
+    content.extend_from_slice(b"\nafter\n");
+    let (_tmp, f) = indexed_file("range_straddle", &content);
+    assert_eq!(f.index().line_count(), 3);
+
+    let s = f.read_text_range(0, 2, 10_000_000).unwrap();
+    assert_eq!(s.len(), 6 + 1 + 1536 * 1024 + 1 + 5);
+    assert!(s.starts_with("before\n"));
+    assert!(s.ends_with("\nafter"));
+
+    // 긴 줄 단독 범위
+    let s = f.read_text_range(1, 1, 10_000_000).unwrap();
+    assert_eq!(s.len(), 1536 * 1024);
+    assert!(s.bytes().all(|b| b == b'y'));
+}
+
+#[test]
+fn test_read_full_line_basic_and_missing() {
+    let content = b"first\r\nsecond\nthird-no-newline";
+    let (_tmp, f) = indexed_file("fullline_basic", content);
+    assert_eq!(f.index().line_count(), 3);
+
+    // CRLF 줄: '\r' 제거된 원문
+    let (text, truncated) = f.read_full_line(0, 1024).unwrap().unwrap();
+    assert_eq!(text, "first");
+    assert!(!truncated);
+
+    let (text, truncated) = f.read_full_line(1, 1024).unwrap().unwrap();
+    assert_eq!(text, "second");
+    assert!(!truncated);
+
+    // 개행 없는 마지막 줄
+    let (text, truncated) = f.read_full_line(2, 1024).unwrap().unwrap();
+    assert_eq!(text, "third-no-newline");
+    assert!(!truncated);
+
+    // 없는 줄 → None
+    assert!(f.read_full_line(3, 1024).unwrap().is_none());
+    assert!(f.read_full_line(999, 1024).unwrap().is_none());
+}
+
+#[test]
+fn test_read_full_line_truncation_utf8_boundary() {
+    // 16KB 초과 줄: max_bytes 이내면 원문 전체, 초과면 UTF-8 경계에서 잘림
+    let mut content = Vec::new();
+    content.extend_from_slice(&vec![b'z'; 20 * 1024]);
+    content.extend_from_slice(b"\n");
+    let (_tmp, f) = indexed_file("fullline_trunc", &content);
+
+    // 충분히 큰 max_bytes → 잘림 없음
+    let (text, truncated) = f.read_full_line(0, 1024 * 1024).unwrap().unwrap();
+    assert_eq!(text.len(), 20 * 1024);
+    assert!(!truncated);
+
+    // 작은 max_bytes → truncated, 경계까지만
+    let (text, truncated) = f.read_full_line(0, 1000).unwrap().unwrap();
+    assert!(truncated);
+    assert_eq!(text.len(), 1000);
+}
+
+#[test]
+fn test_read_full_line_korean_utf8_boundary() {
+    // '가'는 3바이트. max_bytes=10이면 9바이트(3자)까지만 잘려야 한다
+    let mut content = Vec::new();
+    for _ in 0..100 {
+        content.extend_from_slice("가".as_bytes());
+    }
+    content.push(b'\n');
+    let (_tmp, f) = indexed_file("fullline_korean", &content);
+
+    let (text, truncated) = f.read_full_line(0, 10).unwrap().unwrap();
+    assert!(truncated);
+    assert_eq!(text, "가가가"); // 10바이트 경계의 미완성 문자는 제외
+    assert!(!text.contains('\u{FFFD}'));
+}
+
+#[test]
+fn test_read_text_range_100k_lines_matches_naive() {
+    // 10만 줄 규모: CRLF, 한글, 16KB 초과 줄, 개행 없는 마지막 줄이 섞인 파일
+    let mut content = Vec::new();
+    for i in 0..100_000u64 {
+        if i == 50_000 {
+            // 16KB 초과 줄
+            content.extend_from_slice(&vec![b'L'; 20 * 1024]);
+            content.push(b'\n');
+        } else if i % 977 == 0 {
+            content.extend_from_slice(format!("로그 줄 {:06} 한글 메시지\r\n", i).as_bytes());
+        } else if i % 13 == 0 {
+            content.extend_from_slice(format!("line {:06} plain ascii\n", i).as_bytes());
+        } else {
+            content.extend_from_slice(
+                format!(
+                    "2026-11-12T07:{:02}:{:02}.{:03}Z INFO [w-{}] msg={}\n",
+                    i % 60,
+                    i % 60,
+                    i % 1000,
+                    i % 8,
+                    i * 7
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    // 개행 없이 끝나는 마지막 줄
+    content.extend_from_slice(b"final line no newline");
+
+    let (_tmp, f) = indexed_file("range_100k", &content);
+    let total = f.index().line_count();
+    assert_eq!(total, 100_001);
+
+    let expected_parts = naive_lines(&content);
+    assert_eq!(expected_parts.len(), total as usize);
+
+    // 전체 범위
+    let t0 = std::time::Instant::now();
+    let s = f
+        .read_text_range(0, total - 1, u64::MAX / 2)
+        .expect("read_text_range 실패");
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "read_text_range 10만 줄: {:.2}ms, {} bytes",
+        elapsed.as_secs_f64() * 1000.0,
+        s.len()
+    );
+    assert_eq!(s, naive_join(&expected_parts));
+
+    // 임의 부분 범위도 순진한 구현과 일치해야 한다
+    for &(start, end) in &[
+        (1u64, 500u64),
+        (12345, 23456),
+        (99999, 100_000),
+        (77777, 77777),
+    ] {
+        let s = f.read_text_range(start, end, u64::MAX / 2).unwrap();
+        let expected = naive_join(&expected_parts[start as usize..=end as usize]);
+        assert_eq!(s, expected, "범위 ({}, {}) 불일치", start, end);
+    }
+}

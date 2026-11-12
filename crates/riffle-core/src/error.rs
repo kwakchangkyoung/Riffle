@@ -7,6 +7,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("잘못된 검색어: {0}")]
     InvalidQuery(String),
+    #[error("범위가 너무 큽니다 (최대 {limit} 바이트)")]
+    TooLarge { limit: u64 },
 }
 
 /// Riffle 코어 Result 타입 별칭

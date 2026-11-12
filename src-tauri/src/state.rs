@@ -53,6 +53,8 @@ pub struct AppState {
     pub next_id: AtomicU32,
     /// 다음에 발급할 검색 ID
     pub next_search_id: AtomicU32,
+    /// 최근 파일 목록 (최근 순, 네이티브 메뉴 표시용)
+    pub recent_files: Mutex<Vec<String>>,
 }
 
 impl Default for AppState {
@@ -62,6 +64,7 @@ impl Default for AppState {
             searches: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             next_search_id: AtomicU32::new(1),
+            recent_files: Mutex::new(Vec::new()),
         }
     }
 }
@@ -185,6 +188,19 @@ impl AppState {
     pub fn search_count(&self) -> usize {
         let searches = self.searches.lock().unwrap_or_else(|p| p.into_inner());
         searches.len()
+    }
+
+    /// 최근 파일 목록을 설정한다 (파일 열기 성공 시 갱신).
+    pub fn set_recent_files(&self, list: Vec<String>) {
+        *self.recent_files.lock().unwrap_or_else(|p| p.into_inner()) = list;
+    }
+
+    /// 최근 파일 목록을 반환한다 (최근 순).
+    pub fn recent_files(&self) -> Vec<String> {
+        self.recent_files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 

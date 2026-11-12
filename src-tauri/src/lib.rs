@@ -1,20 +1,24 @@
 // Riffle Tauri 애플리케이션 진입점
 
 pub mod commands;
+pub mod menu;
+pub mod recent;
 pub mod state;
 pub mod tail;
 
 use commands::{
-    cancel_search, close_file, get_filtered_lines, get_lines, open_file, search, search_density,
-    search_hit_at, search_nav, validate_query,
+    cancel_search, close_file, copy_lines, get_filtered_lines, get_full_line, get_lines,
+    get_recent_files, open_file, search, search_density, search_hit_at, search_nav, validate_query,
 };
 use state::AppState;
 use tail::set_tail;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -27,8 +31,20 @@ pub fn run() {
             search_nav,
             search_hit_at,
             search_density,
-            set_tail
+            set_tail,
+            copy_lines,
+            get_full_line,
+            get_recent_files
         ])
+        .setup(|app| {
+            // 최근 파일 목록을 상태에 로드하고 네이티브 메뉴를 구성한다
+            let handle = app.handle().clone();
+            let recent = recent::load_recent(&handle).unwrap_or_default();
+            app.state::<AppState>().set_recent_files(recent.clone());
+            menu::apply_menu(&handle, &recent)?;
+            Ok(())
+        })
+        .on_menu_event(menu::handle_menu_event)
         .run(tauri::generate_context!())
         .expect("Tauri 애플리케이션 실행 중 오류가 발생했습니다");
 }

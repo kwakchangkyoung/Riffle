@@ -21,6 +21,7 @@ interface StatusBarProps {
     actualTopLine?: number | null; // 필터 모드 시 화면 상단 행의 실제 원본 파일 줄 번호 (1-based)
     tailOn?: boolean; // tail 모드 활성 여부
     tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
+    copying?: boolean; // 줄 범위 복사 진행 중 여부
 }
 
 /**
@@ -38,6 +39,7 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         actualTopLine,
         tailOn,
         tailPaused,
+        copying,
     }) => {
         if (!file) {
             return (
@@ -104,6 +106,16 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
                 {/* 우측: 검색 결과, 크기, 줄 수, 진행률, 현재 줄 위치 */}
                 <div className="flex items-center space-x-4 shrink-0">
+                    {copying && (
+                        <>
+                            <span className="text-sky-600 dark:text-sky-400 font-medium">
+                                복사 중…
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
                     {tailOn && (
                         <>
                             <span

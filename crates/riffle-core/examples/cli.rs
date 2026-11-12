@@ -16,7 +16,8 @@ fn print_usage() {
     eprintln!("    cli <파일경로> lines <start> <count>");
     eprintln!("    cli <파일경로> open");
     eprintln!("    cli <파일경로> search <query> [--regex] [--ignore-case]");
-    eprintln!("    cli <파일경로> tail\n");
+    eprintln!("    cli <파일경로> tail");
+    eprintln!("    cli <파일경로> copy <start> <end>\n");
     eprintln!("서브커맨드:");
     eprintln!("    stats                인덱싱 실행 후 파일 크기, 줄 수, 소요 시간 출력");
     eprintln!("    lines <start> <cnt>  지정 범위 줄 텍스트를 원문 그대로 출력 (0-based)");
@@ -25,6 +26,7 @@ fn print_usage() {
     eprintln!(
         "    tail                 인덱싱 후 200ms마다 refresh하여 추가분/로테이션 출력 (Ctrl+C까지)"
     );
+    eprintln!("    copy <start> <end>   [start, end] 줄 범위 원문을 stdout으로 출력 (0-based)");
 }
 
 fn main() {
@@ -83,6 +85,22 @@ fn main() {
             run_search(file_path, query, options);
         }
         "tail" => run_tail(file_path),
+        "copy" => {
+            if args.len() < 5 {
+                eprintln!("오류: copy 커맨드에는 start와 end 인자가 필요합니다.");
+                print_usage();
+                process::exit(1);
+            }
+            let start: u64 = args[3].parse().unwrap_or_else(|_| {
+                eprintln!("오류: start는 0 이상의 정수여야 합니다: {}", args[3]);
+                process::exit(1);
+            });
+            let end: u64 = args[4].parse().unwrap_or_else(|_| {
+                eprintln!("오류: end는 0 이상의 정수여야 합니다: {}", args[4]);
+                process::exit(1);
+            });
+            run_copy(file_path, start, end);
+        }
         _ => {
             eprintln!("오류: 알 수 없는 서브커맨드 '{}'", command);
             print_usage();
@@ -321,6 +339,49 @@ fn run_tail(path: &Path) {
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// copy 서브커맨드: [start, end] 줄 범위 원문을 stdout으로 출력하고
+/// 읽기 소요 시간과 바이트 수를 stderr로 출력한다 (대량 복사 성능 검증용)
+fn run_copy(path: &Path, start: u64, end: u64) {
+    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    }));
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let lf = Arc::clone(&log_file);
+    let cancel_clone = Arc::clone(&cancel);
+    let handle = thread::spawn(move || lf.build_index(&cancel_clone, &mut |_| {}));
+
+    // 요청 범위가 확인되거나 인덱싱이 끝날 때까지 대기
+    let target = end.saturating_add(1);
+    while log_file.index().line_count() < target && !log_file.index().progress().done {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let t0 = Instant::now();
+    let text = log_file
+        .read_text_range(start, end, u64::MAX / 2)
+        .unwrap_or_else(|e| {
+            eprintln!("범위 읽기 실패: {}", e);
+            process::exit(1);
+        });
+    let elapsed = t0.elapsed();
+
+    // 인덱싱 스레드 정리
+    cancel.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+
+    eprintln!(
+        "copy {}..{}: {} bytes, {:.2}ms",
+        start,
+        end,
+        text.len(),
+        elapsed.as_secs_f64() * 1000.0
+    );
+    print!("{text}");
+    let _ = std::io::stdout().flush();
 }
 
 /// 인덱스 유무와 무관하게 매치된 줄 번호들의 원문 텍스트를 출력한다.

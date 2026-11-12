@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use riffle_core::{LogFile, Matcher, SearchOptions};
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use tauri::ipc::Channel;
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::state::AppState;
 
@@ -101,6 +103,35 @@ pub enum SearchEvent {
     Error {
         message: String,
     },
+}
+
+/// copy_lines로 복사할 수 있는 최대 범위 (100MB)
+pub const MAX_COPY_BYTES: u64 = 100 * 1024 * 1024;
+/// get_full_line이 읽는 최대 바이트 (10MB)
+pub const MAX_FULL_LINE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// copy_lines 결과 DTO
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyResult {
+    /// 실제로 클립보드에 기록된 줄 수
+    pub lines: u64,
+    /// 기록된 UTF-8 바이트 수
+    pub bytes: u64,
+}
+
+/// get_full_line 결과 DTO
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullLine {
+    /// 줄 번호 (0-based)
+    pub no: u64,
+    /// 원문 텍스트 (줄 끝 '\r' 제거, 최대 MAX_FULL_LINE_BYTES까지)
+    pub text: String,
+    /// max_bytes 초과로 잘렸는지 여부
+    pub truncated: bool,
+    /// 원본 줄의 바이트 길이 (\n 제외, \r 포함)
+    pub byte_len: u64,
 }
 
 /// 검색 결과 위치 DTO
@@ -268,8 +299,10 @@ pub fn run_indexing(
 }
 
 /// 로그 파일을 열고 즉시 파일 정보를 반환하며, 백그라운드에서 인덱싱을 시작한다.
+/// 성공 시 최근 파일 목록을 갱신하고 네이티브 메뉴를 재구성한다.
 #[tauri::command]
 pub async fn open_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     on_progress: Channel<IndexProgressDto>,
@@ -279,6 +312,18 @@ pub async fn open_file(
     std::thread::spawn(move || {
         run_indexing(file, cancel, on_progress);
     });
+
+    // 최근 파일 기록 + 메뉴의 "최근 파일" 서브메뉴 재구성.
+    // 기록/메뉴 갱신 실패는 파일 열기 자체를 실패시키지 않는다.
+    match crate::recent::record_open(&app, &path) {
+        Ok(list) => {
+            app.state::<AppState>().set_recent_files(list.clone());
+            if let Err(e) = crate::menu::apply_menu(&app, &list) {
+                eprintln!("메뉴 갱신 실패: {e}");
+            }
+        }
+        Err(e) => eprintln!("최근 파일 기록 실패: {e}"),
+    }
 
     Ok(info)
 }
@@ -355,6 +400,87 @@ pub async fn get_filtered_lines(
 pub async fn close_file(state: tauri::State<'_, AppState>, id: u32) -> Result<(), String> {
     state.close_file(id);
     Ok(())
+}
+
+/// [start, end] (양끝 포함) 줄 범위의 원문을 읽어 클립보드에 직접 기록한다.
+/// 누적 크기가 MAX_COPY_BYTES를 넘으면 에러를 반환한다.
+#[tauri::command]
+pub async fn copy_lines(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    start: u64,
+    end: u64,
+) -> Result<CopyResult, String> {
+    let file = state.get_file(id)?;
+
+    let text = tauri::async_runtime::spawn_blocking(move || {
+        file.read_text_range(start, end, MAX_COPY_BYTES)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("범위 읽기 비동기 태스크 실패: {e}"))??;
+
+    let lines = if text.is_empty() {
+        0
+    } else {
+        text.bytes().filter(|&b| b == b'\n').count() as u64 + 1
+    };
+    let bytes = text.len() as u64;
+
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("클립보드 기록 실패: {e}"))?;
+
+    Ok(CopyResult { lines, bytes })
+}
+
+/// no 번째 줄의 원문 전체를 반환한다 (16KB 표시용 잘림 없이, 최대 MAX_FULL_LINE_BYTES).
+/// 줄이 없으면 None.
+#[tauri::command]
+pub async fn get_full_line(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    no: u64,
+) -> Result<Option<FullLine>, String> {
+    let file = state.get_file(id)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // byte_len은 read_lines가 제공한다 (16KB 초과 줄도 개행까지 스캔해 정확한 길이를 계산).
+        // 16KB 이내 줄은 이미 전체 원문이므로 read_full_line 호출 없이 바로 반환한다.
+        let meta = read_lines_from_file(&file, no, 1, None)?;
+        let Some(line) = meta.into_iter().next() else {
+            return Ok(None);
+        };
+        if !line.truncated {
+            return Ok(Some(FullLine {
+                no: line.no,
+                text: line.text,
+                truncated: false,
+                byte_len: line.byte_len,
+            }));
+        }
+        let Some((text, truncated)) = file
+            .read_full_line(no, MAX_FULL_LINE_BYTES)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(FullLine {
+            no,
+            text,
+            truncated,
+            byte_len: line.byte_len,
+        }))
+    })
+    .await
+    .map_err(|e| format!("전체 줄 읽기 비동기 태스크 실패: {e}"))?
+}
+
+/// 최근 파일 목록을 반환한다 (존재하지 않는 경로는 제외).
+#[tauri::command]
+pub async fn get_recent_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    crate::recent::load_recent(&app)
 }
 
 /// 검색어 문법 유효성을 검사한다 (Matcher 컴파일 성공 여부).

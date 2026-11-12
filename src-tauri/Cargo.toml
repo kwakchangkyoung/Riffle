@@ -19,3 +19,4 @@ serde_json = "1"
 riffle-core = { path = "../crates/riffle-core" }
 tauri-plugin-dialog = "2"
 notify = "8.2.2"
+tauri-plugin-clipboard-manager = "2"

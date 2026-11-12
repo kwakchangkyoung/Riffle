@@ -14,6 +14,7 @@ interface SearchBarProps {
     fileId: number | null;
     topLine: number;
     visibleRows: number;
+    findSignal?: number; // 증가할 때마다 검색 입력창에 포커스 (메뉴 찾기 이벤트용)
     isFilterMode: boolean;
     onToggleFilterMode: () => void;
     onNavigateToHit: (hit: SearchHit) => void;
@@ -36,6 +37,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         fileId,
         topLine,
         isFilterMode,
+        findSignal = 0,
         onToggleFilterMode,
         onNavigateToHit,
         onSearchStarted,
@@ -69,20 +71,17 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         const topLineRef = useRef(topLine);
         topLineRef.current = topLine;
 
-        // Cmd+F 단축키 등록
+        // 메뉴 "찾기" 이벤트(findSignal 증가) 시 검색 입력창 포커스.
+        // 마운트 시점의 값은 초기값으로 간주해 무시한다.
+        const lastFindSignalRef = useRef(findSignal);
         useEffect(() => {
-            const handleKeyDown = (e: KeyboardEvent) => {
-                if (e.metaKey && e.key.toLowerCase() === "f") {
-                    e.preventDefault();
-                    if (inputRef.current) {
-                        inputRef.current.focus();
-                        inputRef.current.select();
-                    }
-                }
-            };
-            window.addEventListener("keydown", handleKeyDown);
-            return () => window.removeEventListener("keydown", handleKeyDown);
-        }, []);
+            if (findSignal === lastFindSignalRef.current) return;
+            lastFindSignalRef.current = findSignal;
+            if (inputRef.current) {
+                inputRef.current.focus();
+                inputRef.current.select();
+            }
+        }, [findSignal]);
 
         // 파일 변경 시 검색 상태 초기화
         useEffect(() => {

@@ -187,3 +187,49 @@ export function setTail(
 export function closeFile(id: number): Promise<void> {
     return invoke<void>("close_file", { id });
 }
+
+export interface CopyResult {
+    lines: number;
+    bytes: number;
+}
+
+/**
+ * 줄 범위 [start, end] (0-based, 양끝 포함)의 원문을 클립보드에 복사합니다.
+ */
+export function copyLines(
+    id: number,
+    start: number,
+    end: number,
+): Promise<CopyResult> {
+    return invoke<CopyResult>("copy_lines", { id, start, end });
+}
+
+export interface FullLine {
+    no: number;
+    text: string;
+    truncated: boolean;
+    byteLen: number;
+}
+
+/**
+ * 잘리지 않은 원문 전체 줄을 조회합니다. 너무 긴 줄은 잘려서 반환됩니다.
+ */
+export function getFullLine(id: number, no: number): Promise<FullLine | null> {
+    return invoke<FullLine | null>("get_full_line", { id, no });
+}
+
+/**
+ * 최근에 열었던 파일 경로 목록을 조회합니다.
+ */
+export function getRecentFiles(): Promise<string[]> {
+    return invoke<string[]>("get_recent_files");
+}
+
+/**
+ * 네이티브 메뉴에서 발생한 이벤트 페이로드.
+ * recent 항목은 id가 "open_recent"이고 path에 파일 경로가 담깁니다.
+ */
+export interface MenuEvent {
+    id: string;
+    path?: string;
+}

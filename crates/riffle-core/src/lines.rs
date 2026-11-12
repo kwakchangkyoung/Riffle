@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use crate::Result;
 use crate::index::{IndexProgress, LineIndex};
 use crate::search::{Matcher, utf16_ranges};
 use crate::source::Source;
+use crate::{Error, Result};
 
 /// 표시용 한 줄 최대 바이트 크기 (16KB)
 pub const MAX_DISPLAY_BYTES: usize = 16 * 1024;
@@ -88,6 +88,28 @@ pub(crate) fn truncate_utf8_boundary(bytes: &[u8]) -> &[u8] {
 
 /// 표시용 앞부분 읽기 크기 (16KB + UTF-8 문자 경계 여유)
 const HEAD_READ_BYTES: usize = MAX_DISPLAY_BYTES + 8;
+
+/// 원문 범위/전체 줄 읽기 시 한 번에 읽는 청크 크기 (1MB)
+const RANGE_READ_CHUNK: usize = 1024 * 1024;
+
+/// raw(개행 제외 원본 바이트) 한 줄을 out에 이어 붙인다. need_sep이면 앞에 '\n'을 넣는다.
+/// 줄 끝의 '\r' 하나를 제거하고 lossy UTF-8로 디코딩한다 (잘림 없음).
+/// 누적 바이트가 max_bytes를 넘으면 Err(Error::TooLarge)를 반환한다.
+fn push_raw_line(out: &mut String, raw: &[u8], need_sep: bool, max_bytes: u64) -> Result<()> {
+    let line = if raw.ends_with(b"\r") {
+        &raw[..raw.len() - 1]
+    } else {
+        raw
+    };
+    if need_sep {
+        out.push('\n');
+    }
+    out.push_str(&String::from_utf8_lossy(line));
+    if out.len() as u64 > max_bytes {
+        return Err(Error::TooLarge { limit: max_bytes });
+    }
+    Ok(())
+}
 
 /// 매치가 없는 빈 줄을 만든다 (확인된 길이 밖 오프셋 등 예외 상황용)
 fn empty_line(line_no: u64) -> Line {
@@ -323,6 +345,122 @@ impl LogFile {
         }
 
         Ok(lines)
+    }
+
+    /// [start, end] (양끝 포함, 0-based) 줄들의 원문을 '\n'으로 이어 붙인 문자열을 반환한다.
+    /// 각 줄 끝의 '\r'은 제거하고, 잘림 없이 원문 그대로 lossy UTF-8로 디코딩한다.
+    /// 확인된 줄 수를 넘는 end는 마지막 확인 줄로 clamp하며, start > end이면 빈 문자열.
+    /// 누적 바이트가 max_bytes를 넘으면 Err(Error::TooLarge)를 반환한다.
+    /// 시작 오프셋을 한 번 찾은 뒤 1MB 청크로 순차 전진하므로 줄 수가 많아도 빠르다.
+    pub fn read_text_range(&self, start: u64, end: u64, max_bytes: u64) -> Result<String> {
+        let total_lines = self.index.line_count();
+        if start >= total_lines {
+            return Ok(String::new());
+        }
+        let end = end.min(total_lines - 1);
+        if start > end {
+            return Ok(String::new());
+        }
+        let Some(mut offset) = self.index.line_start(&self.source, start) else {
+            return Ok(String::new());
+        };
+
+        let mut out = String::new();
+        // 청크 경계를 걸친 줄의 앞부분 원본 바이트 (개행 제외)
+        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; RANGE_READ_CHUNK];
+        let mut line_no = start;
+        let mut need_sep = false;
+
+        'outer: while line_no <= end {
+            let n = self.source.read_into(&mut buf, offset)?;
+            if n == 0 {
+                break; // 확인된 길이 끝 (외부 truncate 포함)
+            }
+            offset += n as u64;
+            let chunk = &buf[..n];
+            let mut seg = 0usize;
+            for nl in memchr::memchr_iter(b'\n', chunk) {
+                // 청크 안에서 완결된 줄: pending + chunk[seg..nl]
+                let raw = if pending.is_empty() {
+                    &chunk[seg..nl]
+                } else {
+                    pending.extend_from_slice(&chunk[seg..nl]);
+                    &pending[..]
+                };
+                push_raw_line(&mut out, raw, need_sep, max_bytes)?;
+                need_sep = true;
+                pending.clear();
+                line_no += 1;
+                seg = nl + 1;
+                if line_no > end {
+                    break 'outer;
+                }
+            }
+            // 개행 없이 남은 꼬리는 다음 청크와 이어지는 줄의 일부
+            pending.extend_from_slice(&chunk[seg..]);
+            // 디코딩 결과는 원본보다 작아지지 않으므로(줄 끝 '\r' 최대 1바이트 감소)
+            // 이 시점에 이미 예산 초과가 확실하면 큰 줄을 끝까지 읽지 않고 중단한다.
+            if out.len() as u64 + pending.len() as u64 > max_bytes.saturating_add(1) {
+                return Err(Error::TooLarge { limit: max_bytes });
+            }
+        }
+
+        // 개행 없이 파일 끝까지 읽은 경우 pending이 마지막 줄 원문이다.
+        if line_no <= end {
+            push_raw_line(&mut out, &pending, need_sep, max_bytes)?;
+        }
+
+        Ok(out)
+    }
+
+    /// no 번째 줄의 원문 전체를 반환한다 (잘림 없음, 끝의 '\r' 제거, lossy UTF-8).
+    /// 줄이 max_bytes보다 길면 앞 max_bytes까지만 UTF-8 경계에 맞춰 자르고 truncated=true.
+    /// 줄이 없으면 Ok(None).
+    pub fn read_full_line(&self, no: u64, max_bytes: u64) -> Result<Option<(String, bool)>> {
+        let total_lines = self.index.line_count();
+        if no >= total_lines {
+            return Ok(None);
+        }
+        let Some(mut offset) = self.index.line_start(&self.source, no) else {
+            return Ok(None);
+        };
+
+        // max_bytes + 1바이트까지만 읽어 잘림 여부를 판정한다.
+        // 개행을 만나면 그 앞까지가 줄 원문이고, 개행 없이 max_bytes를 넘으면 잘린 것으로 본다.
+        let mut raw: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; RANGE_READ_CHUNK];
+        while raw.len() as u64 <= max_bytes {
+            let want = max_bytes
+                .saturating_add(1)
+                .saturating_sub(raw.len() as u64)
+                .min(buf.len() as u64) as usize;
+            let n = self.source.read_into(&mut buf[..want], offset)?;
+            if n == 0 {
+                break; // 파일 끝: 개행 없이 끝난 마지막 줄
+            }
+            offset += n as u64;
+            if let Some(nl) = memchr::memchr(b'\n', &buf[..n]) {
+                raw.extend_from_slice(&buf[..nl]);
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+
+        let (text, truncated) = if raw.len() as u64 > max_bytes {
+            // 자르는 위치가 UTF-8 문자 중간이면 경계까지 후퇴한다
+            let cut = truncate_utf8_boundary(&raw[..max_bytes as usize]);
+            (String::from_utf8_lossy(cut).into_owned(), true)
+        } else {
+            let line = if raw.ends_with(b"\r") {
+                &raw[..raw.len() - 1]
+            } else {
+                &raw[..]
+            };
+            (String::from_utf8_lossy(line).into_owned(), false)
+        };
+
+        Ok(Some((text, truncated)))
     }
 
     /// 파일 상태를 확인하고 끝에 추가된 부분만 인덱스에 반영한다 (tail 모드용).
