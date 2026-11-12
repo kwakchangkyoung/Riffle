@@ -161,7 +161,9 @@ fn bench_read_lines(c: &mut Criterion) {
     group.bench_function("read_100_lines_random", |b| {
         b.iter(|| {
             let start = rng.gen_range(0, max_start.max(1));
-            let lines = log_file.read_lines(start, 100).expect("read_lines 실패");
+            let lines = log_file
+                .read_lines(start, 100, None)
+                .expect("read_lines 실패");
             black_box(lines);
         });
     });

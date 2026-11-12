@@ -5,14 +5,25 @@ interface ScrollbarProps {
     lineCount: number;
     visibleRows: number;
     onScroll: (topLine: number) => void;
+    densityBins?: number[];
+    onTrackHeightChange?: (height: number) => void;
 }
 
 /**
- * 대용량 줄 수에 대응하는 커스텀 수직 스크롤바 컴포넌트
+ * 대용량 줄 수에 대응하는 커스텀 수직 스크롤바 컴포넌트.
+ * 검색 결과 밀도를 트랙에 캔버스로 시각화합니다.
  */
 export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
-    ({ topLine, lineCount, visibleRows, onScroll }) => {
+    ({
+        topLine,
+        lineCount,
+        visibleRows,
+        onScroll,
+        densityBins,
+        onTrackHeightChange,
+    }) => {
         const trackRef = useRef<HTMLDivElement>(null);
+        const canvasRef = useRef<HTMLCanvasElement>(null);
         const [isDragging, setIsDragging] = useState(false);
         const dragStartRef = useRef<{ clientY: number; startTopLine: number }>({
             clientY: 0,
@@ -31,12 +42,63 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
 
             const observer = new ResizeObserver((entries) => {
                 for (const entry of entries) {
-                    setTrackHeight(entry.contentRect.height);
+                    const h = entry.contentRect.height;
+                    setTrackHeight(h);
+                    onTrackHeightChange?.(h);
                 }
             });
             observer.observe(track);
             return () => observer.disconnect();
-        }, []);
+        }, [onTrackHeightChange]);
+
+        // 검색 밀도 캔버스 렌더링
+        useEffect(() => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+
+            if (!densityBins || densityBins.length === 0 || trackHeight <= 0) {
+                const ctx = canvas.getContext("2d");
+                if (ctx) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                }
+                return;
+            }
+
+            const dpr = window.devicePixelRatio || 1;
+            const width = canvas.clientWidth || 14;
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(trackHeight * dpr);
+
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            let maxCount = 0;
+            for (let i = 0; i < densityBins.length; i++) {
+                if (densityBins[i] > maxCount) {
+                    maxCount = densityBins[i];
+                }
+            }
+            if (maxCount === 0) return;
+
+            const numBins = densityBins.length;
+            const binHeightPx = canvas.height / numBins;
+
+            for (let i = 0; i < numBins; i++) {
+                const count = densityBins[i];
+                if (count > 0) {
+                    // 밀도에 따른 불투명도 계산 (최소 0.25, 최대 1.0)
+                    const alpha = Math.min(
+                        1.0,
+                        0.25 + 0.75 * (count / maxCount),
+                    );
+                    ctx.fillStyle = `rgba(245, 158, 11, ${alpha.toFixed(3)})`;
+                    const y = Math.floor(i * binHeightPx);
+                    const h = Math.max(1, Math.ceil(binHeightPx));
+                    ctx.fillRect(0, y, canvas.width, h);
+                }
+            }
+        }, [densityBins, trackHeight]);
 
         // Thumb 높이: max(24px, track * visible / lineCount)
         const thumbHeight =
@@ -137,13 +199,20 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
             <div
                 ref={trackRef}
                 onMouseDown={handleTrackMouseDown}
-                className="relative w-3.5 shrink-0 select-none bg-zinc-100 dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800 cursor-pointer"
+                className="relative w-3.5 shrink-0 select-none bg-zinc-100 dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800 cursor-pointer overflow-hidden"
                 title="스크롤바"
             >
+                {/* 검색 밀도 캔버스 */}
+                <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 pointer-events-none w-full h-full"
+                />
+
+                {/* 스크롤바 Thumb */}
                 {canScroll && (
                     <div
                         onMouseDown={handleThumbMouseDown}
-                        className={`absolute left-0.5 w-2.5 rounded-full transition-colors cursor-grab active:cursor-grabbing ${
+                        className={`absolute left-0.5 w-2.5 rounded-full transition-colors cursor-grab active:cursor-grabbing z-10 ${
                             isDragging
                                 ? "bg-zinc-600 dark:bg-zinc-400"
                                 : "bg-zinc-400 hover:bg-zinc-500 dark:bg-zinc-600 dark:hover:bg-zinc-500"

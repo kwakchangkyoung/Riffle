@@ -128,7 +128,8 @@ pub struct Line {
 | `close_file`    | `id`                                                        | `()`                          | 인덱싱/검색 취소 및 자원 해제                  |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
-- `SearchEvent`는 `Batch { line_numbers }`, `Progress { scanned_bytes }`, `Done { total, capped }`, `Error { message }` 중 하나.
+- `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나.
+- (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(필터 모드), `validate_query`로 필요한 만큼만 조회한다.
 - 열린 파일은 `State<AppState>` 안의 `HashMap<FileId, Arc<LogFile>>`로 관리한다.
 - `capabilities/default.json`에는 실제로 쓰는 권한(dialog, clipboard 등)만 최소로 허용한다.
 - 프론트엔드 `lib/ipc.ts`의 타입은 Rust 타입과 1:1로 맞춘다. 가능하면 `specta`/`tauri-specta`로 TS 타입을 자동 생성하는 방안을 Phase 2에서 검토하고, 도입 여부는 승인받는다.

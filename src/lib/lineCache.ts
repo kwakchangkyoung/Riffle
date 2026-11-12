@@ -1,4 +1,9 @@
-import { getLines, type Line } from "./ipc";
+import {
+    getFilteredLines,
+    getLines,
+    type Line,
+    type QueryOptions,
+} from "./ipc";
 
 export const BLOCK_SIZE = 512;
 export const MAX_BLOCKS = 64;
@@ -10,10 +15,14 @@ interface CachedBlock {
 }
 
 /**
- * 줄 단위 LRU 캐시 및 프리페치 관리 클래스
+ * 줄 단위 LRU 캐시 및 프리페치 관리 클래스.
+ * 일반 모드와 필터 모드(검색 결과 매치 줄)를 모두 지원합니다.
  */
 export class LineCache {
     private fileId: number | null = null;
+    private searchId: number | null = null;
+    private isFiltered = false;
+    private query: QueryOptions | null = null;
     private lineCount = 0;
     private isDone = false;
     private blocks = new Map<number, CachedBlock>();
@@ -21,6 +30,8 @@ export class LineCache {
     private visibleMinBlock = 0;
     private visibleMaxBlock = 0;
     private listeners = new Set<() => void>();
+    private fetchSeq = 0;
+    private lastRequestedRange: [number, number] | null = null;
 
     /**
      * 캐시 상태 변경 리스너를 등록합니다.
@@ -39,11 +50,22 @@ export class LineCache {
     }
 
     /**
+     * 마지막으로 요청된 가시 범위를 즉시 다시 요청합니다.
+     */
+    private refetchLastRange(): void {
+        const range = this.lastRequestedRange ?? [0, 50];
+        this.requestRange(range[0], range[1]);
+    }
+
+    /**
      * 새 파일 설정 시 기존 캐시와 요청 큐를 초기화합니다.
-     * fileId가 null인 경우(파일 닫기/전환 시작 시)에만 줄 수와 완료 여부를 초기화합니다.
      */
     public setFile(fileId: number | null): void {
         this.fileId = fileId;
+        this.searchId = null;
+        this.isFiltered = false;
+        this.query = null;
+        this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
         if (fileId === null) {
@@ -51,12 +73,57 @@ export class LineCache {
             this.isDone = false;
             this.visibleMinBlock = 0;
             this.visibleMaxBlock = 0;
+            this.lastRequestedRange = null;
+        } else {
+            this.refetchLastRange();
         }
         this.notify();
     }
 
     /**
-     * 인덱싱 진행 상황에 맞춰 줄 수와 완료 여부를 갱신합니다.
+     * 검색어를 변경하고 캐시를 초기화한 뒤 가시 범위를 즉시 재요청합니다.
+     */
+    public setQuery(query: QueryOptions | null): void {
+        this.query = query;
+        this.fetchSeq++;
+        this.blocks.clear();
+        this.pending.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 필터 모드 데이터 소스를 설정하고 가시 범위를 즉시 재요청합니다.
+     */
+    public setFilteredSource(
+        fileId: number | null,
+        searchId: number | null,
+        query: QueryOptions | null,
+    ): void {
+        this.fileId = fileId;
+        this.searchId = searchId;
+        this.isFiltered = true;
+        this.query = query;
+        this.fetchSeq++;
+        this.blocks.clear();
+        this.pending.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 캐시된 블록을 모두 비우고 가시 범위를 즉시 재요청합니다.
+     */
+    public clear(): void {
+        this.fetchSeq++;
+        this.blocks.clear();
+        this.pending.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 인덱싱 또는 검색 진행 상황에 맞춰 줄 수와 완료 여부를 갱신합니다.
      */
     public setLineCount(lineCount: number, isDone = false): void {
         this.lineCount = lineCount;
@@ -68,7 +135,6 @@ export class LineCache {
             if (block.isIncomplete) {
                 const blockStart = blockIndex * BLOCK_SIZE;
                 if (lineCount > blockStart + block.lines.length) {
-                    // 현재 보이는 범위 또는 인접 프리페치 영역에 속하면 재요청
                     if (
                         blockIndex >= this.visibleMinBlock - 1 &&
                         blockIndex <= this.visibleMaxBlock + 1
@@ -110,7 +176,12 @@ export class LineCache {
      * 현재 보이는 범위 및 앞뒤 1블록의 데이터를 프리페치 요청합니다.
      */
     public requestRange(startLine: number, endLine: number): void {
+        this.lastRequestedRange = [startLine, endLine];
+
         if (this.fileId === null) {
+            return;
+        }
+        if (this.isFiltered && this.searchId === null) {
             return;
         }
 
@@ -145,16 +216,32 @@ export class LineCache {
         if (currentFileId === null) {
             return;
         }
+        const currentSearchId = this.searchId;
+        if (this.isFiltered && currentSearchId === null) {
+            return;
+        }
 
         this.pending.add(blockIndex);
         const start = blockIndex * BLOCK_SIZE;
+        const seq = this.fetchSeq;
 
-        getLines(currentFileId, start, BLOCK_SIZE)
+        const request =
+            this.isFiltered && currentSearchId !== null
+                ? getFilteredLines(
+                      currentFileId,
+                      currentSearchId,
+                      start,
+                      BLOCK_SIZE,
+                      this.query,
+                  )
+                : getLines(currentFileId, start, BLOCK_SIZE, this.query);
+
+        request
             .then((lines) => {
                 this.pending.delete(blockIndex);
 
-                // 응답 도착 시 파일 id가 달라졌으면 버림
-                if (this.fileId !== currentFileId) {
+                // 요청 도중 쿼리나 파일이 변경되었으면 무시
+                if (this.fetchSeq !== seq) {
                     return;
                 }
 

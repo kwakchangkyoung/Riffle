@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import type { FileInfo } from "@/lib/ipc";
+import type { FileInfo, Line } from "@/lib/ipc";
 import type { LineCache } from "@/lib/lineCache";
 import { Gutter } from "./Gutter";
 import { Scrollbar } from "./Scrollbar";
@@ -9,17 +9,81 @@ const OVERSCAN = 3; // 뷰포트 위아래 추가 렌더링 행 수
 
 interface LogViewportProps {
     file: FileInfo;
-    lineCount: number;
+    lineCount: number; // 현재 뷰포트가 표시하는 총 줄 수 (일반 모드: 파일 줄 수, 필터 모드: 매치 건수)
+    totalFileLines: number; // 원본 파일의 전체 줄 수 (거터 폭 계산용)
     lineCache: LineCache;
     topLine: number;
     onTopLineChange: (topLine: number) => void;
+    currentHitLine: number | null; // 현재 검색 결과 줄 번호 (0-based)
+    isFilterMode: boolean; // 필터 모드 여부
+    onLineDoubleClick?: (lineNo: number) => void; // 필터 모드에서 줄 더블클릭 시 호출
+    densityBins?: number[]; // 스크롤바 미니맵용 밀도 배열
+    onViewportHeightChange?: (height: number) => void;
+    onTrackHeightChange?: (height: number) => void;
+}
+
+/**
+ * 텍스트 내 매치 범위를 <mark> 태그로 감싸 렌더링합니다.
+ */
+function renderHighlightedText(
+    text: string,
+    highlights: [number, number][] | undefined,
+    isCurrentHit: boolean,
+): React.ReactNode {
+    if (!highlights || highlights.length === 0) {
+        return text;
+    }
+
+    const nodes: React.ReactNode[] = [];
+    let lastIndex = 0;
+
+    for (let i = 0; i < highlights.length; i++) {
+        const [start, end] = highlights[i];
+        if (start > lastIndex) {
+            nodes.push(text.slice(lastIndex, start));
+        }
+        if (end > start) {
+            nodes.push(
+                <mark
+                    key={i}
+                    className={
+                        isCurrentHit
+                            ? "bg-amber-400 text-zinc-950 dark:bg-amber-400 dark:text-zinc-950 font-semibold rounded-xs px-0.5"
+                            : "bg-amber-200/90 text-zinc-900 dark:bg-amber-500/40 dark:text-zinc-100 rounded-xs px-0.5"
+                    }
+                >
+                    {text.slice(start, end)}
+                </mark>,
+            );
+        }
+        lastIndex = Math.max(lastIndex, end);
+    }
+
+    if (lastIndex < text.length) {
+        nodes.push(text.slice(lastIndex));
+    }
+
+    return nodes;
 }
 
 /**
  * 가상 스크롤 로그 뷰포트 컴포넌트
  */
 export const LogViewport: React.FC<LogViewportProps> = React.memo(
-    ({ file, lineCount, lineCache, topLine, onTopLineChange }) => {
+    ({
+        file,
+        lineCount,
+        totalFileLines,
+        lineCache,
+        topLine,
+        onTopLineChange,
+        currentHitLine,
+        isFilterMode,
+        onLineDoubleClick,
+        densityBins,
+        onViewportHeightChange,
+        onTrackHeightChange,
+    }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyScrollRef = useRef<HTMLDivElement>(null);
 
@@ -32,12 +96,14 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
 
             const observer = new ResizeObserver((entries) => {
                 for (const entry of entries) {
-                    setViewportHeight(entry.contentRect.height);
+                    const h = entry.contentRect.height;
+                    setViewportHeight(h);
+                    onViewportHeightChange?.(h);
                 }
             });
             observer.observe(container);
             return () => observer.disconnect();
-        }, []);
+        }, [onViewportHeightChange]);
 
         // 화면에 완전히/부분적으로 들어오는 행 수
         const visibleRows =
@@ -53,7 +119,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         }, [lineCount, viewportHeight, topLine, onTopLineChange]);
 
         // 캐시 업데이트 시 리렌더링 트리거
-        const [, setCacheVersion] = useState(0);
+        const [cacheVersion, setCacheVersion] = useState(0);
         useEffect(() => {
             return lineCache.subscribe(() => {
                 setCacheVersion((v) => v + 1);
@@ -193,18 +259,48 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             return () => window.removeEventListener("keydown", handleKeyDown);
         }, [lineCount, viewportHeight, visibleRows, onTopLineChange]);
 
+        const getLineCallback = useCallback(
+            (idx: number): Line | undefined => lineCache.getLine(idx),
+            [lineCache],
+        );
+
         // 본문 행 렌더링
         const rows: React.ReactNode[] = [];
         for (let i = 0; i < rowCount; i++) {
-            const lineNo = renderStart + i;
-            const line = lineCache.getLine(lineNo);
+            const index = renderStart + i;
+            const line = lineCache.getLine(index);
+
+            // 현재 검색 결과 줄인지 확인
+            const isCurrentHit =
+                currentHitLine !== null &&
+                (isFilterMode
+                    ? line?.no === currentHitLine
+                    : index === currentHitLine);
+
             rows.push(
                 <div
-                    key={lineNo}
-                    className="flex items-center h-[20px] font-mono text-xs text-zinc-900 dark:text-zinc-100 whitespace-pre hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 select-text px-2"
+                    key={index}
+                    onDoubleClick={() => {
+                        if (isFilterMode && line && onLineDoubleClick) {
+                            onLineDoubleClick(line.no);
+                        }
+                    }}
+                    className={`flex items-center h-[20px] font-mono text-xs whitespace-pre select-text px-2 cursor-default ${
+                        isCurrentHit
+                            ? "bg-amber-100/80 dark:bg-amber-950/50 text-zinc-950 dark:text-zinc-50 border-l-2 border-amber-500"
+                            : "text-zinc-900 dark:text-zinc-100 hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40"
+                    }`}
                     style={{ height: 20, lineHeight: "20px" }}
                 >
-                    <span>{line ? line.text : ""}</span>
+                    <span>
+                        {line
+                            ? renderHighlightedText(
+                                  line.text,
+                                  line.highlights,
+                                  isCurrentHit,
+                              )
+                            : ""}
+                    </span>
                     {line?.truncated && (
                         <span
                             className="ml-1 text-zinc-400 dark:text-zinc-600 select-none font-bold"
@@ -226,8 +322,11 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 <Gutter
                     startLine={renderStart}
                     rowCount={rowCount}
-                    totalLines={lineCount}
+                    totalLines={totalFileLines}
                     translateY={translateY}
+                    isFilterMode={isFilterMode}
+                    getLine={getLineCallback}
+                    cacheVersion={cacheVersion}
                 />
 
                 {/* 본문 영역 (가로 스크롤 가능) */}
@@ -247,12 +346,14 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     </div>
                 </div>
 
-                {/* 커스텀 수직 스크롤바 */}
+                {/* 커스텀 수직 스크롤바 (필터 모드에서는 밀도 마커 숨김) */}
                 <Scrollbar
                     topLine={topLine}
                     lineCount={lineCount}
                     visibleRows={visibleRows}
                     onScroll={onTopLineChange}
+                    densityBins={isFilterMode ? undefined : densityBins}
+                    onTrackHeightChange={onTrackHeightChange}
                 />
             </div>
         );

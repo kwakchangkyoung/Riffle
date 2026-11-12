@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::Result;
 use crate::index::{IndexProgress, LineIndex};
+use crate::search::{Matcher, utf16_ranges};
 use crate::source::Source;
 
 /// 표시용 한 줄 최대 바이트 크기 (16KB)
@@ -19,6 +20,8 @@ pub struct Line {
     pub byte_len: u64,
     /// 16KB 초과로 인해 텍스트가 잘렸는지 여부
     pub truncated: bool,
+    /// UTF-16 [start, end) 하이라이트 범위 목록 (표시 text 기준, matcher 없으면 빈 Vec)
+    pub highlights: Vec<(u32, u32)>,
 }
 
 /// UTF-8 문자 경계를 깨지 않도록 최대 max_bytes 이하의 유효한 경계까지 후퇴하여 슬라이스를 반환한다.
@@ -63,6 +66,54 @@ pub(crate) fn truncate_utf8_boundary(bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// 지정된 오프셋에서 한 줄을 디코딩하고 (Line, 다음 줄 시작 오프셋)을 반환한다.
+fn decode_line_at(
+    source: &Source,
+    offset: u64,
+    line_no: u64,
+    matcher: Option<&Matcher>,
+) -> (Line, u64) {
+    let remaining_bytes = source.bytes(offset, source.len());
+    let (raw_line, next_offset) = match memchr::memchr(b'\n', remaining_bytes) {
+        Some(nl_pos) => (&remaining_bytes[..nl_pos], offset + nl_pos as u64 + 1),
+        None => (remaining_bytes, source.len()),
+    };
+
+    let byte_len = raw_line.len() as u64;
+    let (text, truncated) = if raw_line.len() > MAX_DISPLAY_BYTES {
+        let display_slice = truncate_utf8_boundary(&raw_line[..MAX_DISPLAY_BYTES]);
+        let text = String::from_utf8_lossy(display_slice).into_owned();
+        (text, true)
+    } else {
+        let display_slice = if raw_line.ends_with(b"\r") {
+            &raw_line[..raw_line.len() - 1]
+        } else {
+            raw_line
+        };
+        let text = String::from_utf8_lossy(display_slice).into_owned();
+        (text, false)
+    };
+
+    let highlights = match matcher {
+        Some(m) => {
+            let byte_ranges = m.find_ranges(text.as_bytes());
+            utf16_ranges(&text, &byte_ranges)
+        }
+        None => Vec::new(),
+    };
+
+    (
+        Line {
+            no: line_no,
+            text,
+            byte_len,
+            truncated,
+            highlights,
+        },
+        next_offset,
+    )
+}
+
 /// 로그 파일 핸들.
 /// Source(mmap 파일)와 LineIndex(희소 줄 인덱스)를 소유하며,
 /// Send + Sync를 만족하여 Arc<LogFile> 형태로 여러 스레드에서 공유할 수 있다.
@@ -103,7 +154,13 @@ impl LogFile {
 
     /// 지정된 범위의 줄들을 읽어온다.
     /// 현재까지 인덱싱이 완료되어 확인된 줄 범위까지만 반환한다.
-    pub fn read_lines(&self, start: u64, count: u64) -> Result<Vec<Line>> {
+    /// matcher가 제공되면 각 줄의 highlights(UTF-16 범위)를 계산하여 채운다.
+    pub fn read_lines(
+        &self,
+        start: u64,
+        count: u64,
+        matcher: Option<&Matcher>,
+    ) -> Result<Vec<Line>> {
         let total_lines = self.index.line_count();
         if start >= total_lines || count == 0 {
             return Ok(Vec::new());
@@ -119,38 +176,67 @@ impl LogFile {
         };
 
         for line_no in start..end_line {
-            let remaining_bytes = self.source.bytes(current_offset, self.source.len());
-            let (raw_line, next_offset) = match memchr::memchr(b'\n', remaining_bytes) {
-                Some(nl_pos) => (
-                    &remaining_bytes[..nl_pos],
-                    current_offset + nl_pos as u64 + 1,
-                ),
-                None => (remaining_bytes, self.source.len()),
+            let (line, next_offset) =
+                decode_line_at(&self.source, current_offset, line_no, matcher);
+            lines.push(line);
+            current_offset = next_offset;
+        }
+
+        Ok(lines)
+    }
+
+    /// 오름차순 정렬된 임의 줄 번호들을 읽는다 (필터 모드용).
+    /// 현재까지 확인되지 않은 줄 번호는 건너뛴다.
+    /// 연속한 줄 번호는 이전 위치에서 이어서 전진하고, 멀리 떨어지면 index.line_start를 사용한다.
+    pub fn read_lines_at(&self, line_nos: &[u64], matcher: Option<&Matcher>) -> Result<Vec<Line>> {
+        let total_lines = self.index.line_count();
+        let mut lines: Vec<Line> = Vec::with_capacity(line_nos.len());
+
+        let mut prev_line_no: Option<u64> = None;
+        let mut current_offset: u64 = 0;
+
+        for &line_no in line_nos {
+            if line_no >= total_lines {
+                // 확인 안 된 줄 번호는 건너뜀
+                continue;
+            }
+
+            let target_offset = match prev_line_no {
+                Some(prev) if line_no == prev => {
+                    // 동일 줄 번호 재요청 시 이전 줄 복제 후 계속
+                    if let Some(last_line) = lines.last() {
+                        lines.push(last_line.clone());
+                        continue;
+                    } else {
+                        current_offset
+                    }
+                }
+                Some(prev) if line_no == prev + 1 => {
+                    // 바로 다음 줄인 경우 current_offset이 이미 해당 줄 시작 위치
+                    current_offset
+                }
+                Some(prev) if line_no > prev + 1 && line_no <= prev + 16 => {
+                    // 소량(16줄 이하) 전진인 경우 순차 개행 스캔
+                    let remaining = self.source.bytes(current_offset, self.source.len());
+                    let lines_to_skip = (line_no - prev - 1) as usize;
+                    let mut iter = memchr::memchr_iter(b'\n', remaining);
+                    match iter.nth(lines_to_skip - 1) {
+                        Some(nl_pos) => current_offset + nl_pos as u64 + 1,
+                        None => match self.index.line_start(&self.source, line_no) {
+                            Some(off) => off,
+                            None => continue,
+                        },
+                    }
+                }
+                _ => match self.index.line_start(&self.source, line_no) {
+                    Some(off) => off,
+                    None => continue,
+                },
             };
 
-            let byte_len = raw_line.len() as u64;
-            let (text, truncated) = if raw_line.len() > MAX_DISPLAY_BYTES {
-                // 16KB 초과 줄: 줄 전체를 String으로 복사하지 않고 앞 16KB만 UTF-8 경계에 맞춰 디코딩
-                let display_slice = truncate_utf8_boundary(&raw_line[..MAX_DISPLAY_BYTES]);
-                let text = String::from_utf8_lossy(display_slice).into_owned();
-                (text, true)
-            } else {
-                let display_slice = if raw_line.ends_with(b"\r") {
-                    &raw_line[..raw_line.len() - 1]
-                } else {
-                    raw_line
-                };
-                let text = String::from_utf8_lossy(display_slice).into_owned();
-                (text, false)
-            };
-
-            lines.push(Line {
-                no: line_no,
-                text,
-                byte_len,
-                truncated,
-            });
-
+            let (line, next_offset) = decode_line_at(&self.source, target_offset, line_no, matcher);
+            lines.push(line);
+            prev_line_no = Some(line_no);
             current_offset = next_offset;
         }
 
