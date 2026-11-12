@@ -25,6 +25,7 @@ interface SearchBarProps {
     onClearSearch: () => void;
     currentHit: SearchHit | null;
     setCurrentHit: React.Dispatch<React.SetStateAction<SearchHit | null>>;
+    decompressing: boolean; // gzip 해제 진행 중 여부 (검색 시작 시점 판정용)
 }
 
 /**
@@ -47,6 +48,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         onClearSearch,
         currentHit,
         setCurrentHit,
+        decompressing,
     }) => {
         const inputRef = useRef<HTMLInputElement>(null);
 
@@ -63,11 +65,18 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         const [isCapped, setIsCapped] = useState(false);
         const [scannedBytes, setScannedBytes] = useState(0);
         const [totalBytes, setTotalBytes] = useState(0);
+        // 해제 완료 전에 시작한 검색은 부분 결과임을 표시하기 위한 플래그
+        const [partialSearch, setPartialSearch] = useState(false);
 
         const activeSearchIdRef = useRef<number | null>(null);
         const searchSeqRef = useRef(0);
         const userNavigatedRef = useRef(false);
         const hasAutoNavigatedRef = useRef(false);
+        // 디바운스 대기 중에도 최신 해제 상태를 읽기 위한 ref
+        const decompressingRef = useRef(decompressing);
+        useEffect(() => {
+            decompressingRef.current = decompressing;
+        }, [decompressing]);
 
         // 메뉴 "찾기" 이벤트(findSignal 증가) 시 검색 입력창 포커스.
         // 마운트 시점의 값은 초기값으로 간주해 무시한다.
@@ -97,6 +106,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             setTotalBytes(0);
             setCurrentHit(null);
             setValidationError(null);
+            setPartialSearch(false);
         }, [onClearSearch, setCurrentHit]);
 
         // 파일 변경 시 검색 상태 초기화
@@ -153,6 +163,8 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                 setScannedBytes(0);
                 setTotalBytes(0);
                 setCurrentHit(null);
+                // 검색 시작 시점에 gzip 해제가 끝나지 않았으면 부분 결과로 표시
+                setPartialSearch(decompressingRef.current);
                 userNavigatedRef.current = false;
                 hasAutoNavigatedRef.current = false;
 
@@ -515,6 +527,18 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                                 </span>
                             )}
                         </div>
+                    )}
+
+                    {/* gzip 해제 완료 전에 시작한 검색의 부분 결과 안내 */}
+                    {partialSearch && (isSearching || isSearchDone) && (
+                        <span
+                            className="text-[10px] font-medium text-amber-600 dark:text-amber-400 whitespace-nowrap"
+                            title="압축 해제가 끝나기 전에 시작한 검색입니다. 해제된 내용만 검색했습니다. 다시 검색하면 전체 결과가 나옵니다."
+                        >
+                            {decompressing
+                                ? "해제 중 — 부분 결과"
+                                : "부분 결과"}
+                        </span>
                     )}
 
                     {/* 이전/다음 이동 버튼 */}

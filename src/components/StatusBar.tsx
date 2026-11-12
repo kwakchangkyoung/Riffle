@@ -59,11 +59,24 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                 : "-"
             : normalCurrentLine.toLocaleString("ko-KR");
 
-        // 인덱싱 진행률 텍스트
+        // 인덱싱/압축 해제 진행률 텍스트
         let progressText = "";
+        let progressTitle = "인덱싱 진행률";
         if (indexProgress) {
             if (indexProgress.done) {
                 progressText = "인덱싱 완료 (100%)";
+            } else if (indexProgress.decompressing) {
+                progressTitle = "압축 해제 진행률";
+                if (indexProgress.totalBytes > 0) {
+                    const pct = (
+                        (indexProgress.indexedBytes /
+                            indexProgress.totalBytes) *
+                        100
+                    ).toFixed(1);
+                    progressText = `압축 해제 중 ${pct}%`;
+                } else {
+                    progressText = "압축 해제 중...";
+                }
             } else if (indexProgress.totalBytes > 0) {
                 const pct = (
                     (indexProgress.indexedBytes / indexProgress.totalBytes) *
@@ -154,8 +167,16 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                             </span>
                         </>
                     )}
-                    <span title="파일 크기">
-                        {formatBytes(fileSize ?? file.size)}
+                    <span
+                        title={
+                            file.compressed
+                                ? "임시 공간 사용 중(파일을 닫으면 해제됨)"
+                                : "파일 크기"
+                        }
+                    >
+                        {file.compressed && indexProgress
+                            ? `원본 ${formatBytes(file.size)} → 해제 ${formatBytes(indexProgress.contentBytes)}`
+                            : formatBytes(fileSize ?? file.size)}
                     </span>
                     <span className="text-zinc-300 dark:text-zinc-700">|</span>
                     <span title="전체 줄 수">
@@ -172,7 +193,7 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                                         ? "text-emerald-600 dark:text-emerald-400"
                                         : "text-amber-600 dark:text-amber-400"
                                 }
-                                title="인덱싱 진행률"
+                                title={progressTitle}
                             >
                                 {progressText}
                             </span>

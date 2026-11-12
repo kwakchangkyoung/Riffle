@@ -43,6 +43,8 @@ pub fn run() {
             take_pending_open
         ])
         .setup(|app| {
+            // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)
+            riffle_core::cleanup_temp_dir();
             // 최근 파일 목록을 상태에 로드하고 네이티브 메뉴를 구성한다
             let handle = app.handle().clone();
             let recent = recent::load_recent(&handle).unwrap_or_default();

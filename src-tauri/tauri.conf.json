@@ -45,6 +45,13 @@
                 "description": "텍스트 로그 파일",
                 "mimeType": "text/plain",
                 "role": "Viewer"
+            },
+            {
+                "ext": ["gz"],
+                "name": "Gzip Log",
+                "description": "gzip 압축 로그 파일",
+                "mimeType": "application/gzip",
+                "role": "Viewer"
             }
         ]
     }

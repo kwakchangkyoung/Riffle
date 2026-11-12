@@ -18,9 +18,11 @@ pub struct FileInfo {
     pub id: u32,
     pub path: String,
     pub size: u64,
+    /// gzip 압축 파일 여부
+    pub compressed: bool,
 }
 
-/// 인덱싱 진행률 DTO
+/// 인덱싱/해제 진행률 DTO
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexProgressDto {
@@ -28,6 +30,12 @@ pub struct IndexProgressDto {
     pub total_bytes: u64,
     pub line_count: u64,
     pub done: bool,
+    /// 현재 읽기 가능한 바이트 수 (일반 파일: 파일 크기, gz: 해제된 크기)
+    pub content_bytes: u64,
+    /// gz 해제 진행 중 여부
+    pub decompressing: bool,
+    /// gz 해제 실패/디스크 부족 등 오류 메시지 (그 전까지 내용은 유효)
+    pub error: Option<String>,
 }
 
 impl From<riffle_core::IndexProgress> for IndexProgressDto {
@@ -37,6 +45,9 @@ impl From<riffle_core::IndexProgress> for IndexProgressDto {
             total_bytes: progress.total_bytes,
             line_count: progress.line_count,
             done: progress.done,
+            content_bytes: progress.total_bytes,
+            decompressing: false,
+            error: None,
         }
     }
 }
@@ -212,27 +223,55 @@ pub fn compute_search_density(results: &[u64], bins: u32, total_lines: u64) -> V
     counts
 }
 
-/// 파일 열기 내부 로직: LogFile을 열고 AppState에 등록한다.
-pub fn open_file_internal(
-    state: &AppState,
-    path: &str,
-) -> Result<(FileInfo, Arc<LogFile>, Arc<AtomicBool>), String> {
-    let log_file = LogFile::open(Path::new(path))
+/// 파일 열기 결과. gzip 파일이면 gz_writer가 Some이며,
+/// 해제는 호출 측이 백그라운드 스레드에서 run_gz_decompression으로 실행한다.
+pub struct OpenedFile {
+    pub info: FileInfo,
+    pub file: Arc<LogFile>,
+    pub cancel: Arc<AtomicBool>,
+    pub gz_writer: Option<riffle_core::GzWriter>,
+}
+
+/// 파일 열기 내부 로직: 파일을 열고(필요시 gzip 해제 준비) AppState에 등록한다.
+pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, String> {
+    let file_path = Path::new(path);
+    let gz = riffle_core::is_gzip(file_path)
         .map_err(|e| format!("파일을 열 수 없습니다 ('{path}'): {e}"))?;
+
+    let (log_file, gz_writer, size) = if gz {
+        let (file, writer) = riffle_core::open_gzip(file_path)
+            .map_err(|e| format!("gzip 파일을 열 수 없습니다 ('{path}'): {e}"))?;
+        // FileInfo.size는 디스크 실제 파일 크기(압축 크기)를 표시한다
+        let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+        (file, Some(writer), size)
+    } else {
+        let file = LogFile::open(file_path)
+            .map_err(|e| format!("파일을 열 수 없습니다 ('{path}'): {e}"))?;
+        let size = file.source().len();
+        (file, None, size)
+    };
+
     let file = Arc::new(log_file);
     let cancel = Arc::new(AtomicBool::new(false));
-    let size = file.source().len();
-    let id = state.insert_file(file.clone(), cancel.clone(), PathBuf::from(path));
+    let compressed = gz_writer.is_some();
+    let id = state.insert_file(
+        file.clone(),
+        cancel.clone(),
+        PathBuf::from(path),
+        compressed,
+    );
 
-    Ok((
-        FileInfo {
+    Ok(OpenedFile {
+        info: FileInfo {
             id,
             path: path.to_string(),
             size,
+            compressed,
         },
         file,
         cancel,
-    ))
+        gz_writer,
+    })
 }
 
 /// LogFile 인스턴스에서 지정한 범위의 줄들을 읽어 LineDto 벡터로 변환한다.
@@ -298,6 +337,84 @@ pub fn run_indexing(
     }
 }
 
+/// gzip 해제 진행률을 IndexProgressDto로 변환해 전송한다.
+/// indexedBytes/totalBytes는 압축 원본 기준, contentBytes는 해제된 크기,
+/// decompressing은 해제 진행 중 true. 첫 이벤트와 마지막 이벤트는 반드시 전송한다.
+fn gz_progress_dto(p: riffle_core::DecompressProgress, decompressing: bool) -> IndexProgressDto {
+    IndexProgressDto {
+        indexed_bytes: p.compressed_read,
+        total_bytes: p.compressed_total,
+        line_count: p.line_count,
+        done: p.done,
+        content_bytes: p.decompressed,
+        decompressing,
+        error: None,
+    }
+}
+
+/// 백그라운드 gzip 해제 스레드 실행 로직.
+/// 해제와 인덱싱 확장은 GzWriter::run 안에서 함께 진행되며,
+/// 진행률은 50ms 스로틀로 전송한다 (첫/마지막 이벤트는 항상 전송).
+/// 종료 시 decompressing=false와 오류(있으면)를 담은 최종 이벤트를 한 번 더 보낸다.
+pub fn run_gz_decompression(
+    writer: riffle_core::GzWriter,
+    file: Arc<LogFile>,
+    cancel: Arc<AtomicBool>,
+    on_progress: Channel<IndexProgressDto>,
+) {
+    let mut last_prog = riffle_core::DecompressProgress {
+        compressed_read: 0,
+        compressed_total: 0,
+        decompressed: 0,
+        line_count: 0,
+        done: false,
+    };
+    let mut is_first = true;
+    let mut last_send = Instant::now();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        writer.run(&file, &cancel, &mut |progress| {
+            last_prog = progress;
+            let now = Instant::now();
+            let should_send = is_first
+                || progress.done
+                || now.duration_since(last_send) >= Duration::from_millis(50);
+
+            if should_send {
+                is_first = false;
+                last_send = now;
+                if let Err(e) = on_progress.send(gz_progress_dto(progress, true)) {
+                    eprintln!("gzip 해제 진행률 채널 전송 오류: {e}");
+                }
+            }
+        })
+    }));
+
+    // 최종 이벤트: decompressing=false. 오류는 error 필드로 알리고
+    // 그 전까지 해제·인덱싱된 내용은 그대로 유효하다.
+    let error = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(panic_payload) => {
+            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "gzip 해제 스레드 실행 중 알 수 없는 패닉이 발생했습니다.".to_string()
+            };
+            Some(msg)
+        }
+    };
+
+    let mut dto = gz_progress_dto(last_prog, false);
+    dto.done = last_prog.done && error.is_none();
+    dto.error = error;
+    if let Err(e) = on_progress.send(dto) {
+        eprintln!("gzip 해제 최종 진행률 채널 전송 오류: {e}");
+    }
+}
+
 /// 로그 파일을 열고 즉시 파일 정보를 반환하며, 백그라운드에서 인덱싱을 시작한다.
 /// 성공 시 최근 파일 목록을 갱신하고 네이티브 메뉴를 재구성한다.
 /// 파일 열기와 recent.json 읽기-수정-쓰기는 spawn_blocking에서 수행한다.
@@ -312,16 +429,29 @@ pub async fn open_file(
     // AppHandle을 통해 블로킹 스레드 안에서 AppState를 다시 얻는다.
     let open_app = app.clone();
     let open_path = path.clone();
-    let (info, file, cancel) = tauri::async_runtime::spawn_blocking(move || {
+    let opened = tauri::async_runtime::spawn_blocking(move || {
         let st = open_app.state::<AppState>();
         open_file_internal(st.inner(), &open_path)
     })
     .await
     .map_err(|e| format!("파일 열기 비동기 태스크 실패: {e}"))??;
 
-    std::thread::spawn(move || {
-        run_indexing(file, cancel, on_progress);
-    });
+    match opened.gz_writer {
+        Some(writer) => {
+            let file = opened.file;
+            let cancel = opened.cancel;
+            std::thread::spawn(move || {
+                run_gz_decompression(writer, file, cancel, on_progress);
+            });
+        }
+        None => {
+            let file = opened.file;
+            let cancel = opened.cancel;
+            std::thread::spawn(move || {
+                run_indexing(file, cancel, on_progress);
+            });
+        }
+    }
 
     // 최근 파일 기록 + 메뉴의 "최근 파일" 서브메뉴 재구성.
     // 기록/메뉴 갱신 실패는 파일 열기 자체를 실패시키지 않는다.
@@ -349,7 +479,7 @@ pub async fn open_file(
     .await
     .map_err(|e| format!("최근 파일 기록 비동기 태스크 실패: {e}"))?;
 
-    Ok(info)
+    Ok(opened.info)
 }
 
 /// 지정된 범위의 로그 줄들을 읽어 반환한다.
@@ -737,22 +867,25 @@ mod tests {
         let temp_file = TempFile::create(content);
         let state = AppState::default();
 
-        let (info, file, cancel) =
-            open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
-        assert_eq!(info.id, 1);
-        assert_eq!(info.path, temp_file.path_str());
-        assert_eq!(info.size, content.len() as u64);
+        let opened = open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
+        assert!(opened.gz_writer.is_none());
+        assert!(!opened.info.compressed);
+        assert_eq!(opened.info.id, 1);
+        assert_eq!(opened.info.path, temp_file.path_str());
+        assert_eq!(opened.info.size, content.len() as u64);
         assert_eq!(state.file_count(), 1);
 
-        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+        let file = &opened.file;
+        let cancel = &opened.cancel;
+        file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
 
-        let lines = read_lines_from_file(&file, 0, 3, None).expect("줄 읽기 실패");
+        let lines = read_lines_from_file(file, 0, 3, None).expect("줄 읽기 실패");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0");
         assert_eq!(lines[1].text, "line 1");
         assert_eq!(lines[2].text, "line 2");
 
-        state.close_file(info.id);
+        state.close_file(opened.info.id);
         assert_eq!(state.file_count(), 0);
     }
 
@@ -933,9 +1066,10 @@ mod tests {
         let temp_file = TempFile::create(content);
         let state = AppState::default();
 
-        let (_info, file, cancel) =
-            open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
-        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+        let opened = open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
+        let file = &opened.file;
+        let cancel = &opened.cancel;
+        file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
 
         // 잘못된 정규식 쿼리: 괄호가 닫히지 않음
         let invalid_query = QueryDto {
@@ -948,7 +1082,7 @@ mod tests {
         let matcher = Matcher::new(&invalid_query.query, (&invalid_query).into()).ok();
         assert!(matcher.is_none());
 
-        let lines = read_lines_from_file(&file, 0, 3, matcher.as_ref())
+        let lines = read_lines_from_file(file, 0, 3, matcher.as_ref())
             .expect("무효 쿼리 시에도 줄 읽기는 성공해야 함");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0: standard log message");
@@ -969,7 +1103,7 @@ mod tests {
         let valid_matcher = Matcher::new(&valid_query.query, (&valid_query).into()).ok();
         assert!(valid_matcher.is_some());
 
-        let lines_with_hl = read_lines_from_file(&file, 0, 3, valid_matcher.as_ref())
+        let lines_with_hl = read_lines_from_file(file, 0, 3, valid_matcher.as_ref())
             .expect("정상 쿼리 줄 읽기 성공");
         assert_eq!(lines_with_hl.len(), 3);
         assert!(lines_with_hl[0].highlights.is_empty());
@@ -978,14 +1112,51 @@ mod tests {
     }
 
     #[test]
+    fn test_close_file_cancels_gzip_decompression() {
+        // 해제가 충분히 오래 걸리는 크기의 gzip을 만든다
+        let mut content = Vec::new();
+        for i in 0..1_000_000 {
+            content.extend_from_slice(
+                format!("close decompress line {:06} with some payload text\n", i).as_bytes(),
+            );
+        }
+        let gz_path = crate::testutil::create_gzip_file("close_gz", &content);
+        let state = AppState::default();
+
+        let opened =
+            open_file_internal(&state, gz_path.to_str().unwrap()).expect("gzip 파일 열기 실패");
+        assert!(opened.info.compressed);
+        let writer = opened.gz_writer.expect("GzWriter가 반환되어야 함");
+        let file = opened.file.clone();
+        let cancel = opened.cancel.clone();
+
+        // 해제 스레드를 시작한 직후 파일을 닫는다 → cancel이 전파되어 스레드가 종료되어야 함
+        let lf = file.clone();
+        let cancel2 = cancel.clone();
+        let handle = std::thread::spawn(move || writer.run(&lf, &cancel2, &mut |_| {}));
+
+        state.close_file(opened.info.id);
+
+        let start = Instant::now();
+        let result = handle.join().expect("해제 스레드 join 실패");
+        assert!(start.elapsed() < Duration::from_secs(30));
+        // 취소에 의한 중단은 Ok(())이며 해제된 부분만 남는다
+        assert!(result.is_ok());
+        assert!(file.source().len() < content.len() as u64);
+
+        let _ = std::fs::remove_file(&gz_path);
+    }
+
+    #[test]
     fn test_get_filtered_lines_with_invalid_query() {
         let content = b"line 0: info\nline 1: err\nline 2: err again\n";
         let temp_file = TempFile::create(content);
         let state = AppState::default();
 
-        let (_info, file, cancel) =
-            open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
-        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+        let opened = open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
+        let file = &opened.file;
+        let cancel = &opened.cancel;
+        file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
 
         // 무효 정규식 쿼리
         let invalid_query = QueryDto {
@@ -997,7 +1168,7 @@ mod tests {
         assert!(matcher.is_none());
 
         let line_nos = [1, 2];
-        let lines = read_filtered_lines_from_file(&file, &line_nos, matcher.as_ref())
+        let lines = read_filtered_lines_from_file(file, &line_nos, matcher.as_ref())
             .expect("필터 줄 읽기 성공");
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].no, 1);

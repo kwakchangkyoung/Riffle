@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use riffle_core::{LogFile, Matcher, RefreshOutcome, SearchOptions};
 
 fn print_usage() {
-    eprintln!("Riffle CLI - 파일 인덱싱 및 읽기/검색 검증 도구\n");
+    eprintln!("Riffle CLI - 파일 인덱싱 및 읽기/검색 검증 도구 (.gz 자동 판별)\n");
     eprintln!("사용법:");
     eprintln!("    cli <파일경로> stats");
     eprintln!("    cli <파일경로> lines <start> <count>");
@@ -20,6 +20,7 @@ fn print_usage() {
     eprintln!("    cli <파일경로> copy <start> <end>\n");
     eprintln!("서브커맨드:");
     eprintln!("    stats                인덱싱 실행 후 파일 크기, 줄 수, 소요 시간 출력");
+    eprintln!("                          (.gz면 해제+인덱싱 시간, 첫 줄까지 시간, 최대 RSS 출력)");
     eprintln!("    lines <start> <cnt>  지정 범위 줄 텍스트를 원문 그대로 출력 (0-based)");
     eprintln!("    open                 열기 후 첫 20줄 읽기까지의 소요 시간 및 내용 출력");
     eprintln!("    search <query> [opt] 파일 전체 검색 (매치 수, 첫 매치/전체 시간, 첫 5줄 출력)");
@@ -114,6 +115,11 @@ fn main() {
 
 /// stats 서브커맨드: 인덱싱 실행 후 줄 수, 파일 크기, 인덱싱 시간, 첫 줄 읽기까지 걸린 시간 출력
 fn run_stats(path: &Path) {
+    if riffle_core::is_gzip(path).unwrap_or(false) {
+        run_stats_gz(path);
+        return;
+    }
+
     let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
         eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
         process::exit(1);
@@ -161,8 +167,108 @@ fn run_stats(path: &Path) {
     );
 }
 
+/// stats 서브커맨드 (.gz): 스트리밍 해제+인덱싱 시간, 첫 줄까지 시간,
+/// 해제 속도, 최대 RSS를 측정한다. 최대 RSS는 ps로 50ms마다 샘플링한 최댓값이다.
+fn run_stats_gz(path: &Path) {
+    let t0 = Instant::now();
+
+    let (log_file, writer) = riffle_core::open_gzip(path).unwrap_or_else(|e| {
+        eprintln!("gzip 파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    });
+    let log_file = Arc::new(log_file);
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // 최대 RSS 샘플러: 50ms마다 ps로 현재 RSS(KB)를 읽어 최댓값을 기록한다
+    let stop_sample = Arc::new(AtomicBool::new(false));
+    let rss_peak_kb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sampler = {
+        let stop = Arc::clone(&stop_sample);
+        let peak = Arc::clone(&rss_peak_kb);
+        thread::spawn(move || {
+            let pid = std::process::id().to_string();
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(out) = std::process::Command::new("ps")
+                    .args(["-o", "rss=", "-p", &pid])
+                    .output()
+                    && let Ok(text) = String::from_utf8(out.stdout)
+                    && let Ok(kb) = text.trim().parse::<u64>()
+                {
+                    peak.fetch_max(kb, Ordering::Relaxed);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    let lf = Arc::clone(&log_file);
+    let cancel_clone = Arc::clone(&cancel);
+    let worker = thread::spawn(move || writer.run(&lf, &cancel_clone, &mut |_| {}));
+
+    // 첫 줄이 확인될 때까지 대기하여 첫 줄 읽기 시간 측정
+    while log_file.index().line_count() == 0 && !worker.is_finished() {
+        thread::yield_now();
+    }
+    let _ = log_file.read_lines(0, 1, None);
+    let first_line_elapsed = t0.elapsed();
+
+    let run_result = worker.join().unwrap_or_else(|_| {
+        eprintln!("gzip 해제 스레드 패닉 발생");
+        process::exit(1);
+    });
+    if let Err(e) = run_result {
+        eprintln!("gzip 해제 오류: {}", e);
+        process::exit(1);
+    }
+    stop_sample.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+    let total_elapsed = t0.elapsed();
+
+    let total_lines = log_file.index().line_count();
+    let decompressed = log_file.source().len();
+    let compressed = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let secs = total_elapsed.as_secs_f64();
+
+    println!("파일: {}", path.display());
+    println!(
+        "압축 크기: {} 바이트 ({:.2} MB)",
+        compressed,
+        compressed as f64 / 1_048_576.0
+    );
+    println!(
+        "해제 후 크기: {} 바이트 ({:.2} MB)",
+        decompressed,
+        decompressed as f64 / 1_048_576.0
+    );
+    println!("줄 수: {}", total_lines);
+    println!(
+        "첫 줄 읽기까지 걸린 시간: {:.3}ms",
+        first_line_elapsed.as_secs_f64() * 1000.0
+    );
+    println!(
+        "해제+인덱싱 시간: {:.3}ms ({:.2} s)",
+        total_elapsed.as_secs_f64() * 1000.0,
+        secs
+    );
+    if secs > 0.0 {
+        println!(
+            "해제 속도: {:.1} MB/s",
+            decompressed as f64 / 1_048_576.0 / secs
+        );
+    }
+    println!(
+        "최대 RSS: {:.1} MB",
+        rss_peak_kb.load(Ordering::Relaxed) as f64 / 1024.0
+    );
+}
+
 /// lines 서브커맨드: 요청 범위가 확인될 때까지만 대기 후 원문 텍스트만 한 줄씩 출력 (sed 비교용)
 fn run_lines(path: &Path, start: u64, count: u64) {
+    if riffle_core::is_gzip(path).unwrap_or(false) {
+        run_lines_gz(path, start, count);
+        return;
+    }
+
     let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
         eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
         process::exit(1);
@@ -189,6 +295,40 @@ fn run_lines(path: &Path, start: u64, count: u64) {
     }
 
     // 작업 완료 후 백그라운드 인덱싱 취소 및 종료 대기
+    cancel.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+}
+
+/// lines 서브커맨드 (.gz): 요청 범위가 해제·인덱싱으로 확인될 때까지 기다린 후
+/// 원문 텍스트를 출력한다. 인덱스 done은 처음부터 true이므로 해제 스레드 종료 여부로 판정한다.
+fn run_lines_gz(path: &Path, start: u64, count: u64) {
+    let (log_file, writer) = riffle_core::open_gzip(path).unwrap_or_else(|e| {
+        eprintln!("gzip 파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    });
+    let log_file = Arc::new(log_file);
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let lf = Arc::clone(&log_file);
+    let cancel_clone = Arc::clone(&cancel);
+    let handle = thread::spawn(move || writer.run(&lf, &cancel_clone, &mut |_| {}));
+
+    let target = start.saturating_add(count);
+    // 요청 범위가 확인되거나 해제가 끝날 때까지 대기
+    while log_file.index().line_count() < target && !handle.is_finished() {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let lines = log_file.read_lines(start, count, None).unwrap_or_else(|e| {
+        eprintln!("줄 읽기 실패: {}", e);
+        process::exit(1);
+    });
+
+    for line in lines {
+        println!("{}", line.text);
+    }
+
+    // 작업 완료 후 해제 취소 및 종료 대기
     cancel.store(true, Ordering::Relaxed);
     let _ = handle.join();
 }

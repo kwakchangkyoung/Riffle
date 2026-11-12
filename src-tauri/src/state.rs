@@ -28,6 +28,8 @@ pub struct OpenFile {
     pub path: PathBuf,
     /// tail 모드 감시 핸들 (켜져 있을 때만 존재)
     pub tail: Option<TailHandle>,
+    /// gzip 압축 파일 여부 (tail 모드 미지원 판정용)
+    pub compressed: bool,
 }
 
 /// 단일 검색 세션의 상태 정보
@@ -81,7 +83,13 @@ impl Default for AppState {
 
 impl AppState {
     /// 새 열린 파일을 상태에 등록하고 고유 ID를 반환한다.
-    pub fn insert_file(&self, file: Arc<LogFile>, cancel: Arc<AtomicBool>, path: PathBuf) -> u32 {
+    pub fn insert_file(
+        &self,
+        file: Arc<LogFile>,
+        cancel: Arc<AtomicBool>,
+        path: PathBuf,
+        compressed: bool,
+    ) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
         files.insert(
@@ -91,6 +99,7 @@ impl AppState {
                 cancel,
                 path,
                 tail: None,
+                compressed,
             },
         );
         id
@@ -265,6 +274,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 path: path.clone(),
                 tail: None,
+                compressed: false,
             },
         );
         path

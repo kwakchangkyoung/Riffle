@@ -18,7 +18,9 @@ pub struct Source {
     len: AtomicU64,
     ino: u64,
     dev: u64,
-    path: PathBuf,
+    /// 경로 기반 소스만 Some. None이면 익명 소스(경로 없음)로
+    /// refresh()의 Replaced/Truncated 판정을 건너뛴다.
+    path: Option<PathBuf>,
 }
 
 impl Source {
@@ -31,8 +33,26 @@ impl Source {
             len: AtomicU64::new(metadata.len()),
             ino: metadata.ino(),
             dev: metadata.dev(),
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
         })
+    }
+
+    /// 이미 열린 파일 핸들로부터 익명(경로 없음) 소스를 만든다.
+    /// gzip 해제 임시 파일처럼 경로로 추적할 수 없는 파일에 사용한다.
+    pub fn from_file(file: File) -> Result<Source> {
+        let metadata = file.metadata()?;
+        Ok(Source {
+            file,
+            len: AtomicU64::new(metadata.len()),
+            ino: metadata.ino(),
+            dev: metadata.dev(),
+            path: None,
+        })
+    }
+
+    /// 경로 기반 소스인지 여부. false이면 익명 소스다.
+    pub(crate) fn has_path(&self) -> bool {
+        self.path.is_some()
     }
 
     /// 현재까지 확인된 파일 길이(바이트)를 반환한다.
@@ -98,8 +118,12 @@ impl Source {
 
     /// 경로가 현재 열린 파일과 같은 inode/dev를 가리키는지 확인한다.
     /// 경로의 파일이 없거나(삭제) 다른 파일로 교체됐으면(rename 로테이션) false.
+    /// 익명 소스(경로 없음)는 비교할 경로가 없으므로 항상 true를 반환한다.
     pub(crate) fn path_matches(&self) -> Result<bool> {
-        match std::fs::metadata(&self.path) {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(true);
+        };
+        match std::fs::metadata(path) {
             Ok(meta) => Ok(meta.ino() == self.ino && meta.dev() == self.dev),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),

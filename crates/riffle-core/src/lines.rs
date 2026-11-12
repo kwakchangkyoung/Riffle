@@ -223,14 +223,20 @@ pub struct LogFile {
 impl LogFile {
     /// 로그 파일을 열어 LogFile 인스턴스를 생성한다. 인덱싱은 시작하지 않는다.
     pub fn open(path: &Path) -> Result<LogFile> {
-        let source = Source::open(path)?;
+        Ok(Self::from_source(Source::open(path)?))
+    }
+
+    /// 이미 열린 파일 핸들(익명 소스)로부터 LogFile을 생성한다.
+    /// gzip 해제 임시 파일처럼 경로가 없는 소스에 사용한다.
+    /// 인덱싱은 시작하지 않으며, 이후 refresh()가 길이 증가분만 반영한다.
+    pub(crate) fn from_source(source: Source) -> LogFile {
         let index = LineIndex::new(source.len());
-        Ok(LogFile {
+        LogFile {
             source,
             index,
             line_start_cache: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
-        })
+        }
     }
 
     /// N번째 줄의 시작 오프셋을 캐시를 거쳐 반환한다.
@@ -526,18 +532,25 @@ impl LogFile {
         // 동시 refresh 호출 직렬화: 체크포인트 중복 반영과 경합을 막는다
         let _guard = self.refresh_lock.lock().unwrap();
 
-        // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
-        if !self.source.path_matches()? {
-            self.line_start_cache.lock().unwrap().clear();
-            return Ok(RefreshOutcome::Replaced);
-        }
-
-        // 열린 파일 핸들의 현재 크기가 확인된 길이보다 작으면 truncate
         let file_len = self.source.file_len()?;
         let known_len = self.source.len();
-        if file_len < known_len {
-            self.line_start_cache.lock().unwrap().clear();
-            return Ok(RefreshOutcome::Truncated);
+
+        if self.source.has_path() {
+            // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
+            if !self.source.path_matches()? {
+                self.line_start_cache.lock().unwrap().clear();
+                return Ok(RefreshOutcome::Replaced);
+            }
+
+            // 열린 파일 핸들의 현재 크기가 확인된 길이보다 작으면 truncate
+            if file_len < known_len {
+                self.line_start_cache.lock().unwrap().clear();
+                return Ok(RefreshOutcome::Truncated);
+            }
+        } else if file_len <= known_len {
+            // 익명 소스(해제 임시 파일 등)는 경로 비교·truncate 판정 없이
+            // 핸들의 길이 증가만 Appended로 반영한다
+            return Ok(RefreshOutcome::Unchanged);
         }
 
         // 최초 인덱싱이 끝나기 전에는 추가분을 반영할 수 없다

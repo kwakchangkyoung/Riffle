@@ -4,6 +4,7 @@ export interface FileInfo {
     id: number;
     path: string;
     size: number;
+    compressed: boolean;
 }
 
 export interface IndexProgress {
@@ -11,6 +12,9 @@ export interface IndexProgress {
     totalBytes: number;
     lineCount: number;
     done: boolean;
+    contentBytes: number;
+    decompressing: boolean;
+    error: string | null;
 }
 
 export interface QueryOptions {

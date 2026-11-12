@@ -107,6 +107,8 @@ export default function App() {
     const currentFileRef = useRef<FileInfo | null>(null);
     const openSeqRef = useRef(0);
     const latestProgressRef = useRef<IndexProgress | null>(null);
+    // 진행률 이벤트로 이미 표시한 해제 오류 (같은 오류 재표시 방지)
+    const lastProgressErrorRef = useRef<string | null>(null);
     const lineCountRef = useRef(0);
     useEffect(() => {
         lineCountRef.current = lineCount;
@@ -219,6 +221,7 @@ export default function App() {
             const seq = ++openSeqRef.current;
             setErrorMessage(null);
             latestProgressRef.current = null;
+            lastProgressErrorRef.current = null;
 
             // 진행 중이던 tail appended 배치 취소 (이전 파일 기준 이벤트는 폐기)
             pendingAppendedRef.current = null;
@@ -272,6 +275,16 @@ export default function App() {
                         progress.lineCount,
                         progress.done,
                     );
+                    // gzip 해제 실패/디스크 부족 등: 그 전까지 해제된 내용은 계속 사용 가능
+                    if (
+                        progress.error !== null &&
+                        progress.error !== lastProgressErrorRef.current
+                    ) {
+                        lastProgressErrorRef.current = progress.error;
+                        setErrorMessage(
+                            `압축 해제 실패: ${progress.error} (그때까지 해제된 내용은 볼 수 있습니다)`,
+                        );
+                    }
                 });
 
                 // 열리는 도중 다른 파일 열기 요청이 시작되었으면 취소
@@ -326,7 +339,8 @@ export default function App() {
     // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
     const handleToggleTail = useCallback(() => {
         const current = currentFileRef.current;
-        if (!current) return;
+        // 압축 파일(.gz)은 임시 파일 해제 방식이라 tail 모드를 지원하지 않는다
+        if (!current || current.compressed) return;
         const next = !tailEnabledRef.current;
         tailEnabledRef.current = next;
         setTailEnabled(next);
@@ -956,6 +970,10 @@ export default function App() {
     );
     const isAtBottomNow = topLine >= maxTopNow - 0.5;
 
+    // gzip 해제가 끝나지 않은 상태 (done 수신 전까지 검색 결과는 부분 결과)
+    const decompressing =
+        file?.compressed === true && indexProgress?.done !== true;
+
     return (
         <div className="flex flex-col h-screen w-screen overflow-hidden bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 select-none">
             {/* 상단 바: 파일명 + 검색바 + 파일 열기 버튼 */}
@@ -1001,6 +1019,7 @@ export default function App() {
                             onClearSearch={handleClearSearch}
                             currentHit={currentHit}
                             setCurrentHit={setCurrentHit}
+                            decompressing={decompressing}
                         />
                     </div>
                 )}
@@ -1010,14 +1029,18 @@ export default function App() {
                     <button
                         type="button"
                         onClick={handleToggleTail}
-                        disabled={!file}
-                        title="tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                        disabled={!file || file.compressed}
+                        title={
+                            file?.compressed
+                                ? "압축 파일은 tail 을 지원하지 않습니다"
+                                : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                        }
                         className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 ${
                             tailEnabled
                                 ? "bg-emerald-600 text-white hover:bg-emerald-500 shadow-xs"
                                 : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
                         } ${
-                            file
+                            file && !file.compressed
                                 ? "cursor-pointer"
                                 : "opacity-40 cursor-not-allowed"
                         }`}

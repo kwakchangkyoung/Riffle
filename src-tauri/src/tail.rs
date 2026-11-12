@@ -178,6 +178,10 @@ where
     let open_file = files
         .get_mut(&id)
         .ok_or_else(|| format!("ID {id}에 해당하는 열린 파일을 찾을 수 없습니다."))?;
+    // gzip 압축 파일은 임시 파일 해제본이라 원본 경로 감시가 의미 없으므로 tail 미지원
+    if open_file.compressed {
+        return Err("압축 파일은 tail 모드를 지원하지 않습니다".to_string());
+    }
     // 이미 감시 중이고 스레드가 살아 있으면 재사용
     if let Some(handle) = open_file.tail.as_ref()
         && !handle.thread.is_finished()
@@ -428,8 +432,9 @@ mod tests {
     fn test_enable_tail_single_watcher_and_disable() {
         let state = AppState::default();
         let temp = TempFile::create(b"a\nb\n");
-        let (info, file, _cancel) =
-            open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let opened = open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let info = opened.info;
+        let file = opened.file;
         let cancel = AtomicBool::new(false);
         file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
 
@@ -467,8 +472,9 @@ mod tests {
     fn test_close_file_stops_tail() {
         let state = AppState::default();
         let temp = TempFile::create(b"a\n");
-        let (info, file, _cancel) =
-            open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let opened = open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let info = opened.info;
+        let file = opened.file;
         let cancel = AtomicBool::new(false);
         file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
 
@@ -498,5 +504,28 @@ mod tests {
         let state = AppState::default();
         let result = enable_tail(&state, 9999, |_| {});
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enable_tail_rejects_gzip_file() {
+        let state = AppState::default();
+        let gz_path = crate::testutil::create_gzip_file("tail_gz", b"line1\nline2\n");
+        let opened =
+            open_file_internal(&state, gz_path.to_str().unwrap()).expect("gzip 파일 열기 실패");
+        assert!(opened.info.compressed);
+        assert!(opened.gz_writer.is_some());
+        let info = opened.info;
+
+        // gzip 파일은 tail 모드를 지원하지 않으므로 Err를 반환해야 한다
+        let result = enable_tail(&state, info.id, |_| {});
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("tail 모드를 지원하지 않습니다")
+        );
+
+        state.close_file(info.id);
+        let _ = std::fs::remove_file(&gz_path);
     }
 }
