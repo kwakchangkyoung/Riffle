@@ -45,11 +45,18 @@ Apple M1(메모리 16GB) 내장 SSD(순차 읽기 약 3.5GB/s)에서 10GB(6,533�
 
 ### 요구 사항
 
-- macOS 11 (Big Sur) 이상, Apple Silicon (aarch64)
+- macOS 11 (Big Sur) 이상 (Apple Silicon, Intel 모두 지원)
 
-### 빌드된 DMG로 설치
+### 릴리스에서 다운로드 (권장)
 
-1. `Riffle_<버전>_aarch64.dmg`를 열고 `Riffle.app`을 `Applications` 폴더로 드래그합니다.
+[Releases 페이지](https://github.com/kwakchangkyoung/Riffle/releases/latest)에서 Mac에 맞는 DMG를 내려받습니다.
+
+- Apple Silicon(M1 이후): `Riffle_<버전>_aarch64.dmg`
+- Intel Mac: `Riffle_<버전>_x64.dmg`
+
+### DMG로 설치
+
+1. 내려받은 DMG를 열고 `Riffle.app`을 `Applications` 폴더로 드래그합니다.
 2. 이 앱은 아직 Apple 코드 서명과 공증을 받지 않았습니다. 다른 곳에서 내려받은 DMG라서 처음 실행할 때 "확인되지 않은 개발자" 경고가 나오면, Finder에서 `Riffle.app`을 **우클릭 → 열기**로 한 번 실행하세요. 또는 아래 명령으로 격리 속성을 지울 수 있습니다.
 
     ```bash
@@ -124,6 +131,20 @@ ditto target/release/bundle/macos/Riffle.app /Applications/Riffle.app
 | Cmd+C                      | 선택한 줄 복사                       |
 | Cmd+= / Cmd+- / Cmd+0      | 글자 크게 / 작게 / 기본 크기         |
 | Esc                        | 검색창 해제, 줄 선택 해제, 패널 닫기 |
+
+## 릴리스 방법 (메인테이너용)
+
+버전 태그를 push하면 GitHub Actions(`.github/workflows/release.yml`)가 Apple Silicon과 Intel용 DMG를 빌드해 릴리스에 첨부합니다.
+
+1. `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`의 `version`을 새 버전으로 올리고 커밋합니다.
+2. 같은 버전의 태그를 만들어 push합니다. 태그와 `tauri.conf.json` 버전이 다르면 워크플로가 실패합니다.
+
+    ```bash
+    git tag v0.2.0
+    git push origin main v0.2.0
+    ```
+
+3. 진행 상황은 저장소의 **Actions** 탭에서 확인합니다. 빌드가 끝나면 **Releases**에 DMG가 올라갑니다.
 
 ## 개발
 

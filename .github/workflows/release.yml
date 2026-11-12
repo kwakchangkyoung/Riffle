@@ -1,0 +1,79 @@
+# 버전 태그(v*)를 push 하면 macOS 앱을 빌드해 GitHub 릴리스에 첨부한다.
+# 사용법: tauri.conf.json 의 version 을 올리고 커밋한 뒤
+#   git tag v0.2.0 && git push origin v0.2.0
+name: Release
+
+on:
+    push:
+        tags:
+            - "v*"
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: aarch64-apple-darwin # Apple Silicon
+                    - target: x86_64-apple-darwin # Intel
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v7
+
+            # 태그와 앱 버전이 다르면 잘못된 릴리스가 만들어지므로 먼저 막는다
+            - name: 태그와 앱 버전 일치 확인
+              run: |
+                  APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+                  if [ "v${APP_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+                      echo "태그(${GITHUB_REF_NAME})와 tauri.conf.json 버전(v${APP_VERSION})이 다릅니다."
+                      exit 1
+                  fi
+
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: 11
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 22
+                  cache: pnpm
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: ${{ matrix.target }}
+
+            - run: pnpm install --frozen-lockfile
+
+            - uses: tauri-apps/tauri-action@v1
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              with:
+                  tagName: ${{ github.ref_name }}
+                  releaseName: Riffle ${{ github.ref_name }}
+                  releaseBody: |
+                      ## 다운로드
+
+                      - **Apple Silicon (M1 이후)**: `Riffle_<버전>_aarch64.dmg`
+                      - **Intel Mac**: `Riffle_<버전>_x64.dmg`
+
+                      ## 설치
+
+                      1. DMG 를 열고 `Riffle.app` 을 `Applications` 폴더로 드래그합니다.
+                      2. 아직 Apple 코드 서명·공증 전이라 처음 실행 시 "확인되지 않은 개발자" 경고가 나옵니다.
+                         Finder 에서 `Riffle.app` 을 **우클릭 → 열기** 로 한 번 실행하거나, 아래 명령을 실행하세요.
+
+                         ```bash
+                         xattr -dr com.apple.quarantine /Applications/Riffle.app
+                         ```
+
+                      사용법은 [README](https://github.com/${{ github.repository }}#사용법) 를 참고하세요.
+                  releaseDraft: false
+                  prerelease: false
+                  args: --target ${{ matrix.target }}
