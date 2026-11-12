@@ -9,6 +9,7 @@ import {
     openFile,
     searchDensity,
     setTail,
+    takePendingOpen,
     type FileInfo,
     type IndexProgress,
     type MenuEvent,
@@ -313,6 +314,46 @@ export default function App() {
             );
         }
     }, [queueTailCommand]);
+
+    // Finder 파일 연결("open-file" 이벤트)과 콜드 스타트 대기 경로가
+    // 동시에 도착할 수 있으므로 같은 경로의 중복 열기를 짧은 시간 내에 무시한다
+    const lastFinderOpenRef = useRef<{ path: string; at: number } | null>(null);
+    const requestFinderOpen = useCallback(
+        (path: string) => {
+            const now = Date.now();
+            const last = lastFinderOpenRef.current;
+            if (last !== null && last.path === path && now - last.at < 1000) {
+                return;
+            }
+            lastFinderOpenRef.current = { path, at: now };
+            void handleOpenFileByPath(path);
+        },
+        [handleOpenFileByPath],
+    );
+
+    // Finder "다음으로 열기"/더블클릭으로 앱이 실행 중일 때 오는 파일 열기 이벤트
+    useTauriListener(
+        (handler) => listen<string>("open-file", handler),
+        (event: TauriEvent<string>) => {
+            if (event.payload) {
+                requestFinderOpen(event.payload);
+            }
+        },
+    );
+
+    // 콜드 스타트: Opened 이벤트가 리스너 등록 전에 도착한 경우
+    // 백엔드에 보관된 대기 경로를 한 번만 가져와 연다
+    useEffect(() => {
+        takePendingOpen()
+            .then((path) => {
+                if (path) {
+                    requestFinderOpen(path);
+                }
+            })
+            .catch((err) => {
+                console.warn("대기 파일 경로 조회 실패:", err);
+            });
+    }, [requestFinderOpen]);
 
     // Tauri 윈도우 드래그 앤 드롭 이벤트 등록
     useTauriListener(

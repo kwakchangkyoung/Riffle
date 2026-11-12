@@ -483,6 +483,15 @@ pub async fn get_recent_files(app: tauri::AppHandle) -> Result<Vec<String>, Stri
     crate::recent::load_recent(&app)
 }
 
+/// Finder 파일 연결로 보관된 대기 경로를 한 번만 반환한다 (콜드 스타트 대응).
+/// 반환 후에는 비워지므로 같은 경로가 두 번 열리지 않는다.
+#[tauri::command]
+pub async fn take_pending_open(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.take_pending_open())
+}
+
 /// 검색어 문법 유효성을 검사한다 (Matcher 컴파일 성공 여부).
 #[tauri::command]
 pub async fn validate_query(query: QueryDto) -> Result<(), String> {

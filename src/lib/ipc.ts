@@ -226,6 +226,14 @@ export function getRecentFiles(): Promise<string[]> {
 }
 
 /**
+ * Finder 파일 연결로 보관된 대기 경로를 한 번만 가져옵니다 (콜드 스타트 대응).
+ * 반환 후 백엔드에서 비워지므로 같은 경로가 두 번 열리지 않습니다.
+ */
+export function takePendingOpen(): Promise<string | null> {
+    return invoke<string | null>("take_pending_open");
+}
+
+/**
  * 네이티브 메뉴에서 발생한 이벤트 페이로드.
  * recent 항목은 id가 "open_recent"이고 path에 파일 경로가 담깁니다.
  */

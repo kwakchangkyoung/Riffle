@@ -55,6 +55,8 @@ pub struct AppState {
     pub next_search_id: AtomicU32,
     /// 최근 파일 목록 (최근 순, 네이티브 메뉴 표시용)
     pub recent_files: Mutex<Vec<String>>,
+    /// Finder 파일 연결로 열린 경로 (콜드 스타트 시 프론트 리스너 등록 전 도착분)
+    pub pending_open: Mutex<Option<String>>,
 }
 
 impl Default for AppState {
@@ -65,6 +67,7 @@ impl Default for AppState {
             next_id: AtomicU32::new(1),
             next_search_id: AtomicU32::new(1),
             recent_files: Mutex::new(Vec::new()),
+            pending_open: Mutex::new(None),
         }
     }
 }
@@ -201,6 +204,19 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Finder에서 연 파일 경로를 임시 보관한다 (여러 개면 마지막 것만 유지).
+    pub fn set_pending_open(&self, path: String) {
+        *self.pending_open.lock().unwrap_or_else(|p| p.into_inner()) = Some(path);
+    }
+
+    /// 보관된 대기 경로를 꺼내고 비운다. 한 번만 값을 반환한다.
+    pub fn take_pending_open(&self) -> Option<String> {
+        self.pending_open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 }
 
@@ -377,5 +393,23 @@ mod tests {
         assert!(cancel3.load(Ordering::Relaxed)); // s3 취소됨!
         assert_eq!(state.search_count(), 1); // s2만 남음
         assert!(state.get_search(s3.id).is_err());
+    }
+
+    #[test]
+    fn test_pending_open_take_once() {
+        let state = AppState::default();
+
+        // 비어 있으면 None
+        assert_eq!(state.take_pending_open(), None);
+
+        // 설정 후 take하면 경로가 반환되고 비워진다
+        state.set_pending_open("/tmp/a.log".to_string());
+        assert_eq!(state.take_pending_open().as_deref(), Some("/tmp/a.log"));
+        assert_eq!(state.take_pending_open(), None);
+
+        // 여러 번 설정하면 마지막 경로만 남는다
+        state.set_pending_open("/tmp/a.log".to_string());
+        state.set_pending_open("/tmp/b.log".to_string());
+        assert_eq!(state.take_pending_open().as_deref(), Some("/tmp/b.log"));
     }
 }

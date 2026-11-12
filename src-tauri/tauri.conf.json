@@ -1,8 +1,8 @@
 {
     "$schema": "https://schema.tauri.app/config/2",
-    "productName": "riffle",
+    "productName": "Riffle",
     "version": "0.1.0",
-    "identifier": "com.yourname.riffle",
+    "identifier": "com.gajago.riffle",
     "build": {
         "beforeDevCommand": "pnpm dev",
         "devUrl": "http://localhost:1420",
@@ -24,13 +24,28 @@
     },
     "bundle": {
         "active": true,
-        "targets": "all",
+        "targets": ["app", "dmg"],
+        "category": "DeveloperTool",
+        "shortDescription": "대용량 텍스트 로그 뷰어",
+        "longDescription": "수 GB~수십 GB 텍스트 로그를 즉시 열고 부드럽게 스크롤하며 빠르게 검색하는 macOS용 로그 뷰어입니다.",
         "icon": [
             "icons/32x32.png",
             "icons/128x128.png",
             "icons/128x128@2x.png",
             "icons/icon.icns",
-            "icons/icon.ico"
+            "icons/icon.png"
+        ],
+        "macOS": {
+            "minimumSystemVersion": "11.0"
+        },
+        "fileAssociations": [
+            {
+                "ext": ["log", "txt"],
+                "name": "Text Log",
+                "description": "텍스트 로그 파일",
+                "mimeType": "text/plain",
+                "role": "Viewer"
+            }
         ]
     }
 }
