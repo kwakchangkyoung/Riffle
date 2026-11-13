@@ -117,6 +117,7 @@ mod tests {
                 kind: "include".to_string(),
                 enabled: true,
                 color: "#ff0000".to_string(),
+                field: None,
             }],
             combine: "or".to_string(),
             levels: Vec::new(),

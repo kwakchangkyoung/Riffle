@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use riffle_core::{FilterSet, LineSet, LogFile};
+use riffle_core::{Columns, FilterSet, LineSet, LogFile};
 use riffle_remote::{S3Pool, SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
@@ -32,6 +32,24 @@ pub struct OpenFile {
     pub tail: Option<TailHandle>,
     /// gzip 압축 파일 여부 (tail 모드 미지원 판정용)
     pub compressed: bool,
+    /// 컬럼 뷰용 감지된 컬럼 정보 캐시 (첫 요청 시 감지해 파일 단위로 고정)
+    pub columns: ColumnsCache,
+}
+
+/// OpenFile에 보관하는 컬럼 감지 캐시 타입
+pub type ColumnsCache = Arc<Mutex<Option<Columns>>>;
+
+/// 파일의 컬럼 정보를 반환한다. 캐시를 우선 확인하고 없으면 detect_columns으로
+/// 감지해 캐시에 저장한다. 표본 읽기(최대 1MB)가 발생하므로 블로킹 가능한
+/// 컨텍스트에서 호출한다.
+pub fn detect_columns_cached(file: &LogFile, cache: &ColumnsCache) -> Result<Columns, String> {
+    let mut cached = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cols) = cached.as_ref() {
+        return Ok(cols.clone());
+    }
+    let cols = riffle_core::detect_columns(file).map_err(|e| e.to_string())?;
+    *cached = Some(cols.clone());
+    Ok(cols)
 }
 
 /// 단일 검색 세션의 상태 정보
@@ -183,6 +201,7 @@ impl AppState {
                 path,
                 tail: None,
                 compressed,
+                columns: Arc::new(Mutex::new(None)),
             },
         );
         id
@@ -195,6 +214,28 @@ impl AppState {
             .get(&id)
             .map(|f| f.file.clone())
             .ok_or_else(|| format!("ID {}에 해당하는 열린 파일을 찾을 수 없습니다.", id))
+    }
+
+    /// ID에 해당하는 파일 핸들과 식별 경로를 함께 조회한다.
+    /// 식별 경로는 열 때 기록된 문자열 그대로다
+    /// (로컬은 canonical 경로, 원격은 sftp://·s3:// URI).
+    /// 북마크처럼 파일을 경로/URI로 식별하는 기능에 사용한다.
+    pub fn get_file_with_path(&self, id: u32) -> Result<(Arc<LogFile>, String), String> {
+        let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        files
+            .get(&id)
+            .map(|f| (f.file.clone(), f.path.to_string_lossy().into_owned()))
+            .ok_or_else(|| format!("ID {}에 해당하는 열린 파일을 찾을 수 없습니다.", id))
+    }
+
+    /// ID에 해당하는 파일 핸들과 컬럼 캐시를 함께 반환한다.
+    /// spawn_blocking 안에서 detect_columns_cached로 감지할 때 사용한다.
+    pub fn get_columns_handle(&self, id: u32) -> Result<(Arc<LogFile>, ColumnsCache), String> {
+        let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        files
+            .get(&id)
+            .map(|f| (f.file.clone(), f.columns.clone()))
+            .ok_or_else(|| format!("ID {id}에 해당하는 열린 파일을 찾을 수 없습니다."))
     }
 
     /// 파일을 닫고 취소 플래그를 설정한 뒤 맵에서 제거한다.
@@ -453,6 +494,7 @@ mod tests {
                 path: path.clone(),
                 tail: None,
                 compressed: false,
+                columns: Arc::new(Mutex::new(None)),
             },
         );
         path
@@ -472,6 +514,7 @@ mod tests {
                 kind: "include".to_string(),
                 enabled: true,
                 color: "#ffffff".to_string(),
+                field: None,
             }],
             combine: "or".to_string(),
             levels: Vec::new(),
@@ -482,7 +525,7 @@ mod tests {
     fn compiled_set(pattern: &str) -> Arc<FilterSet> {
         let dto = dto_spec(pattern);
         let core = crate::commands::filter_spec_of(&dto).unwrap();
-        Arc::new(FilterSet::new(&core).unwrap())
+        Arc::new(FilterSet::new(&core, None).unwrap())
     }
 
     #[test]

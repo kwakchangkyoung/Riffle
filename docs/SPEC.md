@@ -132,7 +132,21 @@ pub struct Line {
 - tail 연동: `Appended` 시 `old_line_count - 1` 줄부터 `new_line_count`까지를 `filter_lines_range`로 재판정한다(이전 마지막 줄은 이어쓰여 내용이 바뀌었을 수 있으므로 `LineSet`에서 먼저 제거). `TailEvent::Appended`의 `filter_count`로 프론트가 필터 보기 줄 수를 갱신한다.
 - 프리셋: `app_data_dir/filter-presets.json`에 이름+조건을 원자적 저장한다(recent.json과 같은 방식). 같은 이름은 덮어쓰고, 파일이 없거나 깨져 있으면 빈 목록으로 처리한다.
 
-### 3.6 테스트 필수 케이스
+### 3.6 컬럼 뷰 (CSV / JSON Lines, Phase 16)
+
+구조화된 텍스트(CSV, JSON Lines)를 컬럼 단위로 해석해 표시·필터링한다. **한 줄 = 한 행**이며, CSV의 따옴표 안 줄바꿈(다중 줄 레코드)은 지원하지 않는다(로그 뷰어 범위). 정렬은 지원하지 않는다(수천만 줄 전역 정렬은 범위 밖).
+
+- 형식 감지 `detect_columns(&LogFile) -> Columns`: 파일 앞부분 표본(최대 500줄 또는 1MB)으로 판정하고, 감지 결과는 파일 단위로 고정한다. 판정 순서는 JSON Lines → CSV → Plain이다.
+  - **JSON Lines**: 비어있지 않은 표본 줄의 90% 이상이 `{`로 시작하고 JSON 객체로 파싱될 때. `names`는 표본 객체 최상위 키의 합집합이며 문서 처음 등장 순서를 유지한다. 최대 64개까지만 컬럼으로 쓰고, 넘치는 키가 있으면 마지막에 `_extra` 컬럼을 추가한다.
+  - **CSV**: 후보 구분자 `,` `\t` `;` `|` 중 표본 줄(따옴표 인식 분할)의 필드 수가 가장 일정한 것(최빈값 비율 ≥ 90%, 필드 수 ≥ 2)을 선택한다. `has_header`는 첫 줄의 필드가 모두 비어있지 않고 숫자가 아니며 서로 다르고, 둘째 줄 이후에 숫자 필드가 있는 열이 하나라도 있을 때 true다. `names`는 헤더면 첫 줄 필드, 아니면 `"열1".."열N"`이다.
+  - **그 외**: `Plain` (`names` 빈 목록). 빈 파일·섞인 파일·일반 로그도 `Plain`이다.
+- 줄 분할 `split_fields(&str, &Columns) -> Vec<String>`: 반환 길이는 항상 `names.len()`이다(부족하면 `""` 채움, 넘치면 마지막 컬럼에 나머지를 구분자로 합침).
+  - CSV는 RFC4180 따옴표(`""` 이스케이프)를 인식한다.
+  - JSONL은 문자열은 값 그대로, 숫자/불/null은 JSON 표기 그대로, 객체/배열은 compact JSON으로 반환한다. `names`에 없는 키는 `_extra` 컬럼에 compact JSON 객체로 모으고, 파싱 실패 줄은 첫 컬럼에 원문을 넣고 나머지는 `""`다.
+  - `Plain`이면 줄 전체 하나를 반환한다.
+- 필드 필터: `FilterRule.field`에 컬럼 이름을 지정하면 그 규칙은 줄 전체가 아니라 `split_fields`로 분할한 해당 컬럼 값에만 매치한다. `FilterSet::new(spec, columns)`는 `columns`가 없거나 지정된 컬럼 이름이 없으면 `"규칙 N: 컬럼 'x' 를 찾을 수 없습니다"` 에러를 반환한다. `field`가 없는 규칙과 레벨 조건·include/exclude·AND/OR 의미는 그대로 유지된다. 필드 규칙이 하나도 없으면 줄 분할을 수행하지 않아 기존 경로와 동일한 비용을 유지한다. 필드 규칙의 `rule_highlights`는 생략한다.
+
+### 3.7 테스트 필수 케이스
 
 빈 파일, 개행 없는 마지막 줄, CRLF, 개행만 있는 파일, 16KB를 넘는 단일 줄, 잘못된 UTF-8 바이트, 청크 경계에 정확히 걸치는 줄, 청크 경계에 걸치는 검색 매치, 한글이 포함된 줄의 하이라이트 범위, K의 배수 번째 줄.
 
@@ -143,14 +157,15 @@ pub struct Line {
 | 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
 | `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote, source }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP), `s3://버킷/키`이면 S3 객체로 열기 (Phase 12·13). `source`는 `"local" \| "sftp" \| "s3"` |
-| `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`                                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용               |
+| `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`, `with_fields?`                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용. withFields=true이고 형식이 plain이 아니면 `Line.fields`에 컬럼 분할 값 (Phase 16) |
 | `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
 | `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
-| `validate_filter`    | `spec`                                                                                                 | `()`                          | FilterSet 컴파일 가능 여부 (오류에 규칙 번호 포함)       |
+| `validate_filter`    | `id?`, `spec`                                                                                          | `()`                          | FilterSet 컴파일 가능 여부 (오류에 규칙 번호 포함). 필드 규칙은 id 파일의 컬럼으로 검증 (Phase 16) |
 | `start_filter`       | `id`, `spec`, `on_event: Channel<SearchEvent>`                                                          | `filter_id`                   | 같은 파일의 이전 필터 자동 취소. 백그라운드 스캔         |
 | `cancel_filter`      | `filter_id`                                                                                            | `()`                          |                                                         |
 | `get_filter`         | `filter_id`                                                                                            | `FilterInfo`                  | 조건, 현재 줄 수, done/capped                            |
-| `get_filter_lines`   | `id`, `filter_id`, `start_index`, `count`, `query?`, `spec?`                                            | `Vec<Line>`                   | 필터 결과 목록의 [start_index, +count) 줄. count ≤ 1,000 |
+| `get_filter_lines`   | `id`, `filter_id`, `start_index`, `count`, `query?`, `spec?`, `with_fields?`                           | `Vec<Line>`                   | 필터 결과 목록의 [start_index, +count) 줄. count ≤ 1,000. withFields 시 `Line.fields` 포함 (Phase 16) |
+| `get_filtered_lines` | `id`, `search_id`, `start_index`, `count`, `query?`, `spec?`, `with_fields?`                           | `Vec<Line>`                   | 검색 결과 목록의 [start_index, +count) 줄. count ≤ 1,000. withFields 시 `Line.fields` 포함 (Phase 16) |
 | `filter_index_of`    | `filter_id`, `line`                                                                                    | `u64`                         | line 이상인 첫 보이는 줄의 index (스크롤 위치 유지)      |
 | `filter_density`     | `filter_id`, `bins`, `total_lines`                                                                     | `Vec<u32>`                    | 스크롤바 마커용 밀도                                     |
 | `list_filter_presets`| -                                                                                                      | `Vec<FilterPreset>`           | 이름순                                                  |
@@ -158,6 +173,7 @@ pub struct Line {
 | `delete_filter_preset`| `name`                                                                                                | `()`                          | 없으면 에러                                              |
 | `copy_lines`         | `id`, `start`, `end`                                                                                   | `()`                          | Rust에서 직접 클립보드에 기록 (대량 복사 대비)            |
 | `close_file`         | `id`                                                                                                   | `()`                          | 인덱싱/검색/필터 취소 및 자원 해제                       |
+| `detect_columns`     | `id`                                                                                                   | `Columns`                     | 파일 형식 감지 결과 (`format: "plain"\|"csv"\|"jsonl"`, `delimiter?`, `hasHeader`, `names`). 파일별로 캐시하고 표본 읽기는 `spawn_blocking`에서 수행 (Phase 16) |
 | `take_pending_open`  | -                                                                                                      | `string[]`                    | Finder 연결 대기 경로 목록 (콜드 스타트, 1회 수령)        |
 | `save_session`       | `session: { paths, activeIndex }`                                                                      | `()`                          | 탭 세션을 session.json에 원자적 저장                      |
 | `load_session`       | -                                                                                                      | `Session \| null`             | 탭 세션 로드. `restoreSession` 꺼짐/파일 없음/경로 전멸 시 null |
@@ -171,13 +187,17 @@ pub struct Line {
 | `set_s3_profile`     | `profile?`                                                                                             | `()`                           | 마지막 선택 프로필을 `settings.json`의 `s3Profile`에 저장 (Phase 13) |
 | `get_s3_bookmarks`   | -                                                                                                      | `Vec<String>`                  | `app_data_dir/s3-bookmarks.json`에서 `"bucket"`/`"bucket/prefix/"` 목록 (Phase 13) |
 | `set_s3_bookmarks`   | `items`                                                                                                | `()`                           | 즐겨찾기를 s3-bookmarks.json에 원자적 저장 (Phase 13)     |
+| `get_bookmarks`      | `id`                                                                                                   | `BookmarksDto { items, stale }` | 경로/URI + 머리 지문으로 조회. 저장된 지문이 다르거나 크기가 줄었으면 `stale=true` (Phase 15) |
+| `set_bookmarks`      | `id`, `items`                                                                                          | `()`                           | 줄 번호 오름차순 정렬·중복 제거 후 현재 지문/크기와 함께 저장 (stale 해소). 빈 목록이면 항목 삭제 (Phase 15) |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
 - (Phase 11) Finder "다음으로 열기"·다중 선택·드래그 앤 드롭으로 열린 파일은 `"open-files"` 이벤트(`string[]`, 순서 유지)로 프론트에 전달한다. 콜드 스타트처럼 프론트 준비 전에 도착한 경로는 Rust가 `pending_open`에 누적하고 `take_pending_open`으로 한 번에 수령한다. 파일 열기·드래그 앤 드롭·최근 파일·세션 복원은 모두 새 탭으로 열고, 이미 열린 같은 경로(canonical `FileInfo.path` 기준)면 해당 탭으로 전환한다.
 - (Phase 11) 탭 세션은 `session.json`에 `{ paths, activeIndex }`로 저장한다. 프론트가 탭 목록/활성 탭 변경 시 500ms 디바운스로 `save_session`을 호출하고, 시작 시 `load_session`으로 복원한다(`restoreSession` 설정, 기본 켜짐). 존재하지 않는 경로는 로드 시 걸러낸다.
 - `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나. `start_filter`도 같은 이벤트 형식을 쓴다.
-- `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다.
-- `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다.
+- `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다. `fields`(컬럼 뷰 분할 값)는 `withFields=true`이고 파일 형식이 plain이 아닐 때만 채워진다 (Phase 16).
+- `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color, field? }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다. `field`는 컬럼 뷰 필드 필터용이며 지정된 컬럼 값에만 매치한다 (Phase 16).
+- (Phase 16) 컬럼 뷰: `detect_columns`로 파일 형식(plain/csv/jsonl)·구분자·헤더 여부·컬럼명을 조회한다(파일별 캐시). `get_lines`/`get_filter_lines`/`get_filtered_lines`에 `withFields=true`를 넘기면 각 줄의 `fields`로 컬럼 값을 받는다. `start_filter`/`validate_filter`/`search`(filter_id 경유)는 파일의 감지된 컬럼으로 `FilterSet`을 컴파일하므로 `FilterRule.field`에 없는 컬럼명을 쓰면 `"규칙 N: 컬럼 'x' 를 찾을 수 없습니다"` 에러가 된다.
+- (Phase 15) 북마크는 파일의 특정 줄에 붙이는 표시+메모+색이다. `BookmarkDto { line, note, color ("#rrggbb"), createdAt (unix 초) }`. 파일 식별은 열 때 기록된 경로/URI 문자열(로컬은 canonical, 원격은 `sftp://`·`s3://`)로 하고, `app_data_dir/bookmarks.json`에 `{ "<경로/URI>": { "fingerprint": "hex", "size": 크기, "updatedAt": 초, "items": [...] } }`로 원자적 저장한다(파일 항목 최대 500개, 마지막 수정 시각이 오래된 것부터 제거). 머리 지문은 `riffle_core::head_fingerprint`(파일 앞 64KB의 FNV-1a 64비트 해시, 로컬/원격/gz 해제본 모두 Source로 계산)와 저장 당시 크기를 함께 보관하며, 다시 열 때 지문이 다르거나 현재 크기가 저장된 크기보다 작으면 `stale=true`를 반환해(크기 증가는 로그 append로 정상이므로 stale로 보지 않음) "파일 내용이 바뀌어 북마크 위치가 다를 수 있다"를 프론트가 안내하게 한다(북마크는 지우지 않음). `set_bookmarks`는 현재 지문/크기로 갱신해 stale을 해소하고, 빈 목록이면 항목을 삭제한다. 지문 계산은 `spawn_blocking`에서 수행한다(원격은 네트워크 읽기 64KB).
 - `TailEvent::Appended`에는 `filterCount`(활성 필터의 보이는 줄 수, 없으면 null)가 추가된다.
 - (Phase 12) 원격(SFTP) 파일: `open_file`의 `path`가 `sftp://호스트/경로`이면 `SftpPool`(시스템 `ssh` + russh-sftp, 앱 전역 하나, 호스트별 참조 카운트)로 연다. `FileInfo.remote`는 true이고 `path`는 URI 그대로 보관해 최근 파일·세션 복원이 그대로 동작한다. `close_file`은 원격이면 `pool.release(host)`를 호출한다. 원격 파일의 tail은 notify 대신 1초 폴링 `refresh`를 사용한다. 연결 오류는 탭 에러 바로 표시하고 재연결은 RandomRead 구현체가 read 시 1회 시도한다.
 - (Phase 12) `SshHost { alias, hostname?, user? }`, `RemoteEntry { name, isDir, size, mtime? }`(mtime은 unix 초). 모든 원격 호출은 `spawn_blocking`에서 수행한다. `list_ssh_hosts`는 `~/.ssh/config`(Include·~ 확장, 와일드카드/부정 별칭 제외)의 Host 목록을 반환한다.
@@ -251,7 +271,7 @@ pub struct Line {
 - `gen_log` 예제: 타임스탬프, 로그 레벨, 한글/영문 메시지, 가끔 매우 긴 줄이 섞인 로그를 지정 크기로 생성.
 - `source.rs`, `index.rs`, `lines.rs` 구현 (3.1~3.3).
 - `cli.rs` 예제: `open`, `lines <start> <count>`, `stats`(줄 수, 인덱싱 시간) 서브커맨드.
-- 3.5의 테스트 케이스 중 검색 외 항목 작성, 인덱싱 벤치마크 작성.
+- 3.7의 테스트 케이스 중 검색 외 항목 작성, 인덱싱 벤치마크 작성.
 - **완료 기준:** 10GB 생성 파일에 대해 CLI로 첫 줄 읽기가 즉시 되고, 인덱싱이 성능 목표 안에 끝나며, 임의 줄 번호 읽기 결과가 `sed -n 'Np'` 결과와 일치.
 
 ### Phase 4.5 gzip 압축 파일 (.gz)

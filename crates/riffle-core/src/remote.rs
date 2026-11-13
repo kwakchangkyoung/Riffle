@@ -166,7 +166,7 @@ mod tests {
 
     /// 필터 통과 줄 번호를 오름차순으로 수집한다.
     fn collect_filter(file: &LogFile, spec: &FilterSpec) -> Vec<u64> {
-        let set = FilterSet::new(spec).expect("FilterSet 생성 실패");
+        let set = FilterSet::new(spec, None).expect("FilterSet 생성 실패");
         let cancel = AtomicBool::new(false);
         let mut hits = Vec::new();
         filter_scan(
@@ -255,6 +255,7 @@ mod tests {
                     },
                     kind: RuleKind::Include,
                     enabled: true,
+                    field: None,
                 },
                 FilterRule {
                     pattern: "005|crlf".to_string(),
@@ -264,6 +265,7 @@ mod tests {
                     },
                     kind: RuleKind::Exclude,
                     enabled: true,
+                    field: None,
                 },
             ],
             combine: Combine::Or,

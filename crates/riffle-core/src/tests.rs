@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::search::{
     Matcher, SearchConfig, SearchOptions, SearchOutcome, search, search_with_config, utf16_ranges,
 };
+use crate::structured::{Columns, LogFormat};
 use crate::{Error, LogFile, MAX_DISPLAY_BYTES, RefreshOutcome};
 
 /// 테스트용 RAII 임시 파일 도우미. 스코프를 벗어나면 파일이 자동 삭제된다.
@@ -1656,6 +1657,15 @@ fn frule(pattern: &str, kind: RuleKind) -> FilterRule {
         },
         kind,
         enabled: true,
+        field: None,
+    }
+}
+
+/// 필드 규칙 헬퍼 (컬럼 뷰 필터용)
+fn ffield(pattern: &str, kind: RuleKind, field: &str) -> FilterRule {
+    FilterRule {
+        field: Some(field.to_string()),
+        ..frule(pattern, kind)
     }
 }
 
@@ -1670,11 +1680,14 @@ fn fregex(pattern: &str, kind: RuleKind) -> FilterRule {
 }
 
 fn make_filter_set(rules: Vec<FilterRule>, combine: Combine, levels: Vec<Level>) -> FilterSet {
-    FilterSet::new(&FilterSpec {
-        rules,
-        combine,
-        levels,
-    })
+    FilterSet::new(
+        &FilterSpec {
+            rules,
+            combine,
+            levels,
+        },
+        None,
+    )
     .expect("FilterSet 생성 실패")
 }
 
@@ -2227,4 +2240,190 @@ fn test_read_lines_at_rule_highlights() {
     assert_eq!(lines.len(), 2);
     assert!(lines[0].rule_highlights.contains(&(4, 9, 0)));
     assert!(lines[1].rule_highlights.contains(&(4, 8, 1)));
+}
+
+// ===== 필드 규칙 스캔 (컬럼 뷰 필터, 생성 데이터 대조) =====
+
+/// CSV 생성 데이터에서 status 컬럼만 매치하는지 순진 구현과 비교한다.
+/// 다른 컬럼(msg)에 "500"이 들어간 줄이 섞여 있어 줄 전체 매치와 결과가 달라야 한다.
+#[test]
+fn test_field_filter_scan_matches_naive_10k() {
+    // CSV 형태의 1만 줄 생성: 헤더 + "N,status,msg..." (msg에 가끔 500 포함)
+    let mut content = String::from("id,status,msg\n");
+    for i in 0..10_000u32 {
+        let status = if i % 10 == 0 { 500 } else { 200 };
+        // status와 무관하게 msg에 500이 들어가는 줄을 섞는다 (i%7==3)
+        let msg = if i % 7 == 3 {
+            "port 500 open".to_string()
+        } else {
+            format!("request {i} done")
+        };
+        content.push_str(&format!("{i},{status},{msg}\n"));
+    }
+    let content = content.into_bytes();
+
+    let cols = Columns {
+        format: LogFormat::Csv {
+            delimiter: b',',
+            has_header: true,
+        },
+        names: vec!["id".into(), "status".into(), "msg".into()],
+    };
+    let spec = FilterSpec {
+        rules: vec![ffield("500", RuleKind::Include, "status")],
+        combine: Combine::Or,
+        levels: vec![],
+    };
+    let set = FilterSet::new(&spec, Some(&cols)).expect("FilterSet 생성 실패");
+
+    // 순진 참조: passes를 모든 줄에 직접 적용
+    let expected = naive_filter_lines(&content, &set);
+    // status 컬럼이 정확히 500인 줄만 (id 컬럼의 ...500, msg의 "port 500"은 제외)
+    assert!(content.split(|&b| b == b'\n').count() > expected.len());
+    assert!(!expected.is_empty());
+    assert!(expected.iter().all(|&ln| {
+        let line = &content.split(|&b| b == b'\n').nth(ln as usize).unwrap();
+        let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+        fields.len() >= 2 && fields[1] == b"500"
+    }));
+
+    for seg in [4096, 1 << 16] {
+        let (outcome, got) = run_filter_scan_seg(&content, &set, seg);
+        assert_eq!(
+            outcome,
+            SearchOutcome::Completed {
+                total: expected.len() as u64
+            }
+        );
+        assert_eq!(got, expected, "seg={seg}");
+    }
+}
+
+/// JSONL 생성 데이터에서 level 컬럼만 매치하는지 순진 구현과 비교한다.
+#[test]
+fn test_field_filter_jsonl_scan_matches_naive() {
+    let mut content = String::new();
+    for i in 0..5_000u32 {
+        let level = if i % 5 == 0 { "error" } else { "info" };
+        // msg에 "error"가 들어가지만 level이 error가 아닌 줄을 섞는다
+        let msg = if i % 7 == 1 && i % 5 != 0 {
+            "error recovered"
+        } else {
+            "ok"
+        };
+        content.push_str(&format!(r#"{{"level":"{level}","msg":"{msg}","n":{i}}}"#));
+        content.push('\n');
+    }
+    let content = content.into_bytes();
+
+    let cols = Columns {
+        format: LogFormat::JsonLines,
+        names: vec!["level".into(), "msg".into(), "n".into()],
+    };
+    let spec = FilterSpec {
+        rules: vec![ffield("error", RuleKind::Include, "level")],
+        combine: Combine::Or,
+        levels: vec![],
+    };
+    let set = FilterSet::new(&spec, Some(&cols)).expect("FilterSet 생성 실패");
+    let expected = naive_filter_lines(&content, &set);
+    let (outcome, got) = run_filter_scan_seg(&content, &set, 1 << 16);
+    assert_eq!(
+        outcome,
+        SearchOutcome::Completed {
+            total: expected.len() as u64
+        }
+    );
+    assert_eq!(got, expected);
+    // level!=error인데 msg에 error가 있는 줄은 매치되지 않는다
+    assert!(!got.contains(&1u64));
+}
+
+/// 필드 규칙과 줄 규칙이 섞인 무작위 조합을 순진 구현과 비교한다.
+/// 결정적 xorshift PRNG로 스펙을 생성해 AND/OR·포함/제외·필드 유무를 섞는다.
+#[test]
+fn test_field_filter_random_combos_match_naive() {
+    // CSV 생성 데이터: status/msg 에 패턴 후보가 골고루 섞인 2천 줄
+    let mut content = String::from("id,status,msg\n");
+    let statuses = ["200", "201", "404", "500", "503"];
+    let words = ["ok", "timeout", "urgent", "health", "retry"];
+    for i in 0..2_000u32 {
+        let status = statuses[(i * 7 % 5) as usize];
+        let msg = format!(
+            "{} {}",
+            words[(i % 5) as usize],
+            words[(i / 5 % 5) as usize]
+        );
+        content.push_str(&format!("{i},{status},{msg}\n"));
+    }
+    let content = content.into_bytes();
+    let cols = Columns {
+        format: LogFormat::Csv {
+            delimiter: b',',
+            has_header: true,
+        },
+        names: vec!["id".into(), "status".into(), "msg".into()],
+    };
+    let fields = ["status", "msg"];
+    let patterns = ["200", "500", "timeout", "urgent", "ok"];
+
+    // xorshift64* — 테스트 재현을 위한 고정 시드
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        rng = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        rng
+    };
+
+    for trial in 0..60 {
+        let mut rules = Vec::new();
+        // 포함 규칙 1~3개
+        let n_inc = 1 + (next() % 3) as usize;
+        for _ in 0..n_inc {
+            let pat = patterns[(next() as usize) % patterns.len()];
+            rules.push(if next() % 2 == 0 {
+                ffield(pat, RuleKind::Include, fields[(next() as usize) % 2])
+            } else {
+                frule(pat, RuleKind::Include)
+            });
+        }
+        // 제외 규칙 0~2개
+        let n_exc = (next() % 3) as usize;
+        for _ in 0..n_exc {
+            let pat = patterns[(next() as usize) % patterns.len()];
+            rules.push(if next() % 2 == 0 {
+                ffield(pat, RuleKind::Exclude, fields[(next() as usize) % 2])
+            } else {
+                frule(pat, RuleKind::Exclude)
+            });
+        }
+        let combine = if next() % 2 == 0 {
+            Combine::And
+        } else {
+            Combine::Or
+        };
+        let set = FilterSet::new(
+            &FilterSpec {
+                rules,
+                combine,
+                levels: vec![],
+            },
+            Some(&cols),
+        )
+        .expect("FilterSet 생성 실패");
+        let expected = naive_filter_lines(&content, &set);
+        for seg in [4096, 1 << 16] {
+            let (outcome, got) = run_filter_scan_seg(&content, &set, seg);
+            assert_eq!(
+                outcome,
+                SearchOutcome::Completed {
+                    total: expected.len() as u64
+                },
+                "trial={trial} seg={seg}"
+            );
+            assert_eq!(got, expected, "trial={trial} seg={seg}");
+        }
+    }
 }

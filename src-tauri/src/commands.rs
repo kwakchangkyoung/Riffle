@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use riffle_core::{
-    Combine, FilterRule, FilterSet, FilterSpec, Level, LineSet, LogFile, Matcher, RuleKind,
-    SearchOptions,
+    Columns, Combine, FilterRule, FilterSet, FilterSpec, Level, LineSet, LogFile, LogFormat,
+    Matcher, RuleKind, SearchOptions,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -71,6 +71,9 @@ pub struct LineDto {
     pub highlights: Vec<(u32, u32)>,
     /// 활성 포함 규칙의 매치 범위 (UTF-16 start, end, 규칙 인덱스)
     pub rule_highlights: Vec<(u32, u32, u32)>,
+    /// 컬럼 뷰용 분할 값. with_fields=true이고 파일 형식이 plain이 아닐 때만 채운다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
 }
 
 impl From<riffle_core::Line> for LineDto {
@@ -82,6 +85,7 @@ impl From<riffle_core::Line> for LineDto {
             truncated: line.truncated,
             highlights: line.highlights,
             rule_highlights: line.rule_highlights,
+            fields: None,
         }
     }
 }
@@ -117,6 +121,10 @@ pub struct FilterRuleDto {
     pub enabled: bool,
     /// 규칙별 하이라이트 색상
     pub color: String,
+    /// 컬럼 뷰 필드 필터: 지정된 컬럼 값에만 규칙을 적용한다 (None이면 줄 전체).
+    /// 이전 버전 프리셋에는 이 키가 없으므로 역직렬화 시 기본값을 허용한다.
+    #[serde(default)]
+    pub field: Option<String>,
 }
 
 /// 필터 조건 DTO
@@ -128,6 +136,39 @@ pub struct FilterSpecDto {
     pub combine: String,
     /// "error" | "warn" | "info" | "debug" | "trace"
     pub levels: Vec<String>,
+}
+
+/// 파일의 컬럼 정보 DTO (컬럼 뷰용 형식 감지 결과)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnsDto {
+    /// "plain" | "csv" | "jsonl"
+    pub format: String,
+    /// CSV 구분자 문자열 (plain/jsonl이면 None)
+    pub delimiter: Option<String>,
+    /// CSV 첫 줄이 헤더로 감지됐는지 여부
+    pub has_header: bool,
+    /// 컬럼 이름 목록 (표시 순서, plain이면 빈 목록)
+    pub names: Vec<String>,
+}
+
+impl From<&Columns> for ColumnsDto {
+    fn from(cols: &Columns) -> Self {
+        let (format, delimiter, has_header) = match &cols.format {
+            LogFormat::Plain => ("plain", None, false),
+            LogFormat::Csv {
+                delimiter,
+                has_header,
+            } => ("csv", Some((*delimiter as char).to_string()), *has_header),
+            LogFormat::JsonLines => ("jsonl", None, false),
+        };
+        Self {
+            format: format.to_string(),
+            delimiter,
+            has_header,
+            names: cols.names.clone(),
+        }
+    }
 }
 
 /// 필터 프리셋 DTO (이름 + 조건)
@@ -196,6 +237,7 @@ pub fn filter_spec_of(dto: &FilterSpecDto) -> Result<FilterSpec, String> {
                 },
                 kind: rule_kind_of(&r.kind)?,
                 enabled: r.enabled,
+                field: r.field.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -214,10 +256,14 @@ pub fn filter_spec_of(dto: &FilterSpecDto) -> Result<FilterSpec, String> {
 
 /// spec이 유효하면 컴파일된 FilterSet을 반환한다.
 /// 무효한 spec(나쁜 정규식, 알 수 없는 값)이면 None — 하이라이트 없이 진행하기 위함.
-fn compile_filter_set(spec: Option<&FilterSpecDto>) -> Option<FilterSet> {
+/// 필드 규칙이 있으면 파일의 컬럼 정보(columns)가 있어야 컴파일된다.
+fn compile_filter_set(
+    spec: Option<&FilterSpecDto>,
+    columns: Option<&Columns>,
+) -> Option<FilterSet> {
     let dto = spec?;
     let core = filter_spec_of(dto).ok()?;
-    FilterSet::new(&core).ok()
+    FilterSet::new(&core, columns).ok()
 }
 
 /// LineSet을 bins 구간으로 나눠 각 구간의 보이는 줄 수를 계산한다.
@@ -449,33 +495,55 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
     })
 }
 
+/// core Line을 LineDto로 변환한다.
+/// columns가 plain이 아닌 형식이면 컬럼 뷰용 분할 값(fields)도 채운다.
+fn line_dto_with_fields(line: riffle_core::Line, columns: Option<&Columns>) -> LineDto {
+    let mut dto = LineDto::from(line);
+    if let Some(cols) = columns
+        && cols.format != LogFormat::Plain
+    {
+        dto.fields = Some(riffle_core::split_fields(&dto.text, cols));
+    }
+    dto
+}
+
 /// LogFile 인스턴스에서 지정한 범위의 줄들을 읽어 LineDto 벡터로 변환한다.
 /// filter가 주어지면 각 줄의 활성 포함 규칙 매치 범위(rule_highlights)를 채운다.
+/// columns가 plain이 아니면 각 줄의 컬럼 분할 값(fields)도 채운다.
 pub fn read_lines_from_file(
     file: &LogFile,
     start: u64,
     count: u32,
     matcher: Option<&Matcher>,
     filter: Option<&FilterSet>,
+    columns: Option<&Columns>,
 ) -> Result<Vec<LineDto>, String> {
     let lines = file
         .read_lines(start, count as u64, matcher, filter)
         .map_err(|e| format!("줄 읽기 실패: {e}"))?;
-    Ok(lines.into_iter().map(LineDto::from).collect())
+    Ok(lines
+        .into_iter()
+        .map(|l| line_dto_with_fields(l, columns))
+        .collect())
 }
 
 /// LogFile 인스턴스에서 임의 줄 번호 목록을 읽어 LineDto 벡터로 변환한다.
 /// filter가 주어지면 각 줄의 활성 포함 규칙 매치 범위(rule_highlights)를 채운다.
+/// columns가 plain이 아니면 각 줄의 컬럼 분할 값(fields)도 채운다.
 pub fn read_filtered_lines_from_file(
     file: &LogFile,
     line_nos: &[u64],
     matcher: Option<&Matcher>,
     filter: Option<&FilterSet>,
+    columns: Option<&Columns>,
 ) -> Result<Vec<LineDto>, String> {
     let lines = file
         .read_lines_at(line_nos, matcher, filter)
         .map_err(|e| format!("필터 줄 읽기 실패: {e}"))?;
-    Ok(lines.into_iter().map(LineDto::from).collect())
+    Ok(lines
+        .into_iter()
+        .map(|l| line_dto_with_fields(l, columns))
+        .collect())
 }
 
 /// 백그라운드 인덱싱 스레드 실행 로직.
@@ -675,6 +743,7 @@ pub async fn open_file(
 /// 지정된 범위의 로그 줄들을 읽어 반환한다.
 /// 전달된 query가 무효한 경우(문법 오류 등) 에러 대신 하이라이트 없이 정상 줄을 반환한다.
 /// spec이 오면 유효한 규칙의 매치 범위를 rule_highlights로 채운다 (무효 spec이면 비워둠).
+/// with_fields=true이고 파일 형식이 plain이 아니면 각 줄의 컬럼 분할 값(fields)도 채운다.
 #[tauri::command]
 pub async fn get_lines(
     state: tauri::State<'_, AppState>,
@@ -683,22 +752,34 @@ pub async fn get_lines(
     count: u32,
     query: Option<QueryDto>,
     spec: Option<FilterSpecDto>,
+    with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let file = state.get_file(id)?;
+    let (file, columns_cache) = state.get_columns_handle(id)?;
     let clamped_count = clamp_get_lines_count(count);
+    // 컬럼 분할 요청이거나 spec에 필드 규칙이 있으면 컬럼 정보가 필요하다
+    let need_columns = with_fields.unwrap_or(false)
+        || spec
+            .as_ref()
+            .is_some_and(|s| s.rules.iter().any(|r| r.field.is_some()));
 
     tauri::async_runtime::spawn_blocking(move || {
         let matcher = match query {
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let highlight_filter = compile_filter_set(spec.as_ref());
+        let columns = if need_columns {
+            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
+        } else {
+            None
+        };
+        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
         read_lines_from_file(
             &file,
             start,
             clamped_count,
             matcher.as_ref(),
             highlight_filter.as_ref(),
+            columns.as_ref(),
         )
     })
     .await
@@ -708,6 +789,9 @@ pub async fn get_lines(
 /// 필터 모드: 검색 결과 목록의 [start_index, start_index + count) 줄들을 읽어 반환한다.
 /// 전달된 query가 무효한 경우 에러 대신 하이라이트 없이 정상 줄을 반환한다.
 /// spec이 오면 유효한 규칙의 매치 범위를 rule_highlights로 채운다 (무효 spec이면 비워둠).
+/// with_fields=true이고 파일 형식이 plain이 아니면 각 줄의 컬럼 분할 값(fields)도 채운다.
+// IPC 인자는 프론트 계약이라 묶을 수 없다
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn get_filtered_lines(
     state: tauri::State<'_, AppState>,
@@ -717,8 +801,9 @@ pub async fn get_filtered_lines(
     count: u32,
     query: Option<QueryDto>,
     spec: Option<FilterSpecDto>,
+    with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let file = state.get_file(id)?;
+    let (file, columns_cache) = state.get_columns_handle(id)?;
     let search = state.get_search(search_id)?;
     if search.file_id != id {
         return Err(format!(
@@ -739,17 +824,29 @@ pub async fn get_filtered_lines(
         }
     };
 
+    // 컬럼 분할 요청이거나 spec에 필드 규칙이 있으면 컬럼 정보가 필요하다
+    let need_columns = with_fields.unwrap_or(false)
+        || spec
+            .as_ref()
+            .is_some_and(|s| s.rules.iter().any(|r| r.field.is_some()));
+
     tauri::async_runtime::spawn_blocking(move || {
         let matcher = match query {
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let highlight_filter = compile_filter_set(spec.as_ref());
+        let columns = if need_columns {
+            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
+        } else {
+            None
+        };
+        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
         read_filtered_lines_from_file(
             &file,
             &line_nos,
             matcher.as_ref(),
             highlight_filter.as_ref(),
+            columns.as_ref(),
         )
     })
     .await
@@ -759,6 +856,9 @@ pub async fn get_filtered_lines(
 /// 다중 필터 모드: 필터 결과 목록의 [start_index, start_index + count) 줄들을 읽어 반환한다.
 /// query는 검색 하이라이트용이며, spec은 규칙 하이라이트(rule_highlights)용이다.
 /// 둘 다 무효하면 에러 대신 하이라이트 없이 정상 줄을 반환한다.
+/// with_fields=true이고 파일 형식이 plain이 아니면 각 줄의 컬럼 분할 값(fields)도 채운다.
+// IPC 인자는 프론트 계약이라 묶을 수 없다
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn get_filter_lines(
     state: tauri::State<'_, AppState>,
@@ -768,8 +868,9 @@ pub async fn get_filter_lines(
     count: u32,
     query: Option<QueryDto>,
     spec: Option<FilterSpecDto>,
+    with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let file = state.get_file(id)?;
+    let (file, columns_cache) = state.get_columns_handle(id)?;
     let filter = state.get_filter(filter_id)?;
     if filter.file_id != id {
         return Err(format!(
@@ -791,21 +892,50 @@ pub async fn get_filter_lines(
         }
     };
 
+    // 컬럼 분할 요청이거나 spec에 필드 규칙이 있으면 컬럼 정보가 필요하다
+    let need_columns = with_fields.unwrap_or(false)
+        || spec
+            .as_ref()
+            .is_some_and(|s| s.rules.iter().any(|r| r.field.is_some()));
+
     tauri::async_runtime::spawn_blocking(move || {
         let matcher = match query {
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let highlight_filter = compile_filter_set(spec.as_ref());
+        let columns = if need_columns {
+            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
+        } else {
+            None
+        };
+        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
         read_filtered_lines_from_file(
             &file,
             &line_nos,
             matcher.as_ref(),
             highlight_filter.as_ref(),
+            columns.as_ref(),
         )
     })
     .await
     .map_err(|e| format!("필터 줄 읽기 비동기 태스크 실패: {e}"))?
+}
+
+/// 파일의 컬럼 정보를 반환한다 (컬럼 뷰용 형식 감지).
+/// 파일별로 첫 호출에 감지를 수행하고 OpenFile에 캐시해 이후 호출은 재사용한다.
+/// 표본 읽기(최대 1MB)가 발생하므로 spawn_blocking에서 수행한다.
+#[tauri::command]
+pub async fn detect_columns(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+) -> Result<ColumnsDto, String> {
+    let (file, cache) = state.get_columns_handle(id)?;
+    let cols = tauri::async_runtime::spawn_blocking(move || {
+        crate::state::detect_columns_cached(&file, &cache)
+    })
+    .await
+    .map_err(|e| format!("컬럼 감지 비동기 태스크 실패: {e}"))??;
+    Ok(ColumnsDto::from(&cols))
 }
 
 /// 열린 파일을 닫고 취소 플래그를 설정하여 자원을 정리한다.
@@ -865,7 +995,7 @@ pub async fn get_full_line(
     tauri::async_runtime::spawn_blocking(move || {
         // byte_len은 read_lines가 제공한다 (16KB 초과 줄도 개행까지 스캔해 정확한 길이를 계산).
         // 16KB 이내 줄은 이미 전체 원문이므로 read_full_line 호출 없이 바로 반환한다.
-        let meta = read_lines_from_file(&file, no, 1, None, None)?;
+        let meta = read_lines_from_file(&file, no, 1, None, None, None)?;
         let Some(line) = meta.into_iter().next() else {
             return Ok(None);
         };
@@ -920,10 +1050,32 @@ pub async fn validate_query(query: QueryDto) -> Result<(), String> {
 
 /// 필터 조건 유효성을 검사한다 (FilterSet 컴파일 성공 여부).
 /// 잘못된 정규식은 "규칙 N: …" 형태의 메시지를 반환한다.
+/// spec에 필드 규칙이 있으면 id로 지정된 파일의 감지된 컬럼으로 컬럼명을 검증한다
+/// (id가 없으면 컬럼 없음으로 간주해 필드 규칙은 무효 에러가 된다).
 #[tauri::command]
-pub async fn validate_filter(spec: FilterSpecDto) -> Result<(), String> {
+pub async fn validate_filter(
+    state: tauri::State<'_, AppState>,
+    id: Option<u32>,
+    spec: FilterSpecDto,
+) -> Result<(), String> {
     let core = filter_spec_of(&spec)?;
-    FilterSet::new(&core).map(|_| ()).map_err(|e| e.to_string())
+    let columns = if core.rules.iter().any(|r| r.field.is_some())
+        && let Some(fid) = id
+    {
+        let (file, cache) = state.get_columns_handle(fid)?;
+        Some(
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::state::detect_columns_cached(&file, &cache)
+            })
+            .await
+            .map_err(|e| format!("컬럼 감지 비동기 태스크 실패: {e}"))??,
+        )
+    } else {
+        None
+    };
+    FilterSet::new(&core, columns.as_ref())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// 백그라운드 필터 스캔을 시작하고 필터 ID를 반환한다.
@@ -937,7 +1089,20 @@ pub async fn start_filter(
 ) -> Result<u32, String> {
     let file = state.get_file(id)?;
     let core_spec = filter_spec_of(&spec)?;
-    let set = Arc::new(FilterSet::new(&core_spec).map_err(|e| e.to_string())?);
+    // 필드 규칙이 있으면 파일의 감지된 컬럼으로 컴파일한다
+    let columns = if core_spec.rules.iter().any(|r| r.field.is_some()) {
+        let (cf, cache) = state.get_columns_handle(id)?;
+        Some(
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::state::detect_columns_cached(&cf, &cache)
+            })
+            .await
+            .map_err(|e| format!("컬럼 감지 비동기 태스크 실패: {e}"))??,
+        )
+    } else {
+        None
+    };
+    let set = Arc::new(FilterSet::new(&core_spec, columns.as_ref()).map_err(|e| e.to_string())?);
     if set.is_empty() {
         return Err("적용할 필터 조건이 없습니다.".to_string());
     }
@@ -1327,7 +1492,7 @@ pub async fn save_filter_preset(
 ) -> Result<(), String> {
     // 저장 전에 spec 유효성을 검사한다
     let core = filter_spec_of(&spec)?;
-    FilterSet::new(&core).map_err(|e| e.to_string())?;
+    FilterSet::new(&core, None).map_err(|e| e.to_string())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let dir = presets_dir(&app)?;
@@ -1406,7 +1571,7 @@ mod tests {
         let cancel = &opened.cancel;
         file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
 
-        let lines = read_lines_from_file(file, 0, 3, None, None).expect("줄 읽기 실패");
+        let lines = read_lines_from_file(file, 0, 3, None, None, None).expect("줄 읽기 실패");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0");
         assert_eq!(lines[1].text, "line 1");
@@ -1609,7 +1774,7 @@ mod tests {
         let matcher = Matcher::new(&invalid_query.query, (&invalid_query).into()).ok();
         assert!(matcher.is_none());
 
-        let lines = read_lines_from_file(file, 0, 3, matcher.as_ref(), None)
+        let lines = read_lines_from_file(file, 0, 3, matcher.as_ref(), None, None)
             .expect("무효 쿼리 시에도 줄 읽기는 성공해야 함");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0: standard log message");
@@ -1630,7 +1795,7 @@ mod tests {
         let valid_matcher = Matcher::new(&valid_query.query, (&valid_query).into()).ok();
         assert!(valid_matcher.is_some());
 
-        let lines_with_hl = read_lines_from_file(file, 0, 3, valid_matcher.as_ref(), None)
+        let lines_with_hl = read_lines_from_file(file, 0, 3, valid_matcher.as_ref(), None, None)
             .expect("정상 쿼리 줄 읽기 성공");
         assert_eq!(lines_with_hl.len(), 3);
         assert!(lines_with_hl[0].highlights.is_empty());
@@ -1695,7 +1860,7 @@ mod tests {
         assert!(matcher.is_none());
 
         let line_nos = [1, 2];
-        let lines = read_filtered_lines_from_file(file, &line_nos, matcher.as_ref(), None)
+        let lines = read_filtered_lines_from_file(file, &line_nos, matcher.as_ref(), None, None)
             .expect("필터 줄 읽기 성공");
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].no, 1);
@@ -1714,6 +1879,7 @@ mod tests {
             kind: kind.to_string(),
             enabled,
             color: "#123456".to_string(),
+            field: None,
         }
     }
 
@@ -1761,13 +1927,13 @@ mod tests {
         // 나쁜 정규식 → None (하이라이트 없이 진행)
         let mut bad = rule("(", "include", true);
         bad.regex = true;
-        let set = compile_filter_set(Some(&spec_dto(vec![bad], "or", vec![])));
+        let set = compile_filter_set(Some(&spec_dto(vec![bad], "or", vec![])), None);
         assert!(set.is_none());
         // spec 자체가 None → None
-        assert!(compile_filter_set(None).is_none());
+        assert!(compile_filter_set(None, None).is_none());
         // 유효 spec → Some
         let ok = spec_dto(vec![rule("ERROR", "include", true)], "or", vec![]);
-        assert!(compile_filter_set(Some(&ok)).is_some());
+        assert!(compile_filter_set(Some(&ok), None).is_some());
     }
 
     #[test]
@@ -1815,9 +1981,9 @@ mod tests {
             "or",
             vec![],
         );
-        let set = compile_filter_set(Some(&spec)).expect("spec 컴파일 실패");
+        let set = compile_filter_set(Some(&spec), None).expect("spec 컴파일 실패");
 
-        let lines = read_lines_from_file(file, 0, 3, None, Some(&set)).expect("줄 읽기 실패");
+        let lines = read_lines_from_file(file, 0, 3, None, Some(&set), None).expect("줄 읽기 실패");
         assert_eq!(lines.len(), 3);
         // 줄 0: 매치 없음
         assert!(lines[0].rule_highlights.is_empty());
@@ -1840,14 +2006,14 @@ mod tests {
         assert!(lines[2].rule_highlights.is_empty());
 
         // filter=None이면 rule_highlights가 비어 있어야 한다
-        let plain = read_lines_from_file(file, 0, 3, None, None).expect("줄 읽기 실패");
+        let plain = read_lines_from_file(file, 0, 3, None, None, None).expect("줄 읽기 실패");
         assert!(plain.iter().all(|l| l.rule_highlights.is_empty()));
 
         // 제외 규칙만 있으면 rule_highlights는 비어 있어야 한다 (포함 규칙만 대상)
         let exc_spec = spec_dto(vec![rule("ERROR", "exclude", true)], "or", vec![]);
-        let exc_set = compile_filter_set(Some(&exc_spec)).expect("spec 컴파일 실패");
+        let exc_set = compile_filter_set(Some(&exc_spec), None).expect("spec 컴파일 실패");
         let exc_lines =
-            read_lines_from_file(file, 0, 3, None, Some(&exc_set)).expect("줄 읽기 실패");
+            read_lines_from_file(file, 0, 3, None, Some(&exc_set), None).expect("줄 읽기 실패");
         assert!(exc_lines.iter().all(|l| l.rule_highlights.is_empty()));
     }
 
@@ -1866,7 +2032,7 @@ mod tests {
         // 필터: include ERROR → 보이는 줄 {1, 2}
         let spec = spec_dto(vec![rule("ERROR", "include", true)], "or", vec![]);
         let core = filter_spec_of(&spec).unwrap();
-        let set = FilterSet::new(&core).unwrap();
+        let set = FilterSet::new(&core, None).unwrap();
         let filter_state = state
             .insert_filter(opened.info.id, spec, Arc::new(set))
             .expect("필터 등록 실패");

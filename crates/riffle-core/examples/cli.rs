@@ -20,7 +20,7 @@ fn print_usage() {
     eprintln!("    cli <파일경로> open");
     eprintln!("    cli <파일경로> search <query> [--regex] [--ignore-case]");
     eprintln!(
-        "    cli <파일경로> filter [--or|--and] [--inc PAT]... [--exc PAT]... [--level error,warn] [--regex] [--search Q]"
+        "    cli <파일경로> filter [--or|--and] [--inc PAT]... [--exc PAT]... [--field NAME] [--level error,warn] [--regex] [--search Q]"
     );
     eprintln!("    cli <파일경로> tail");
     eprintln!("    cli <파일경로> copy <start> <end>\n");
@@ -39,6 +39,9 @@ fn print_usage() {
     );
     eprintln!(
         "                       --inc/--exc 반복 지정, --level 콤마 구분, --regex는 규칙·검색 공통"
+    );
+    eprintln!(
+        "                       --field NAME은 이후 --inc/--exc 규칙을 그 컬럼 값에만 적용 (컬럼 뷰)"
     );
     eprintln!("    copy <start> <end>   [start, end] 줄 범위 원문을 stdout으로 출력 (0-based)");
 }
@@ -482,10 +485,13 @@ fn parse_level(s: &str) -> Option<Level> {
 fn run_filter(path: &Path, args: &[String]) {
     let mut combine = Combine::Or;
     let mut regex = false;
-    let mut incs: Vec<String> = Vec::new();
-    let mut excs: Vec<String> = Vec::new();
+    // (field, pattern) 쌍: --field는 그 시점 이후의 --inc/--exc 규칙에만 붙는다
+    let mut incs: Vec<(Option<String>, String)> = Vec::new();
+    let mut excs: Vec<(Option<String>, String)> = Vec::new();
     let mut levels: Vec<Level> = Vec::new();
     let mut search_query: Option<String> = None;
+    // --field로 지정된 컬럼: 이후의 --inc/--exc 규칙은 그 컬럼 값에만 매치한다
+    let mut field: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -501,8 +507,9 @@ fn run_filter(path: &Path, args: &[String]) {
             "--or" => combine = Combine::Or,
             "--and" => combine = Combine::And,
             "--regex" => regex = true,
-            "--inc" => incs.push(take_value(&mut i)),
-            "--exc" => excs.push(take_value(&mut i)),
+            "--inc" => incs.push((field.clone(), take_value(&mut i))),
+            "--exc" => excs.push((field.clone(), take_value(&mut i))),
+            "--field" => field = Some(take_value(&mut i)),
             "--level" => {
                 let v = take_value(&mut i);
                 for name in v.split(',') {
@@ -534,20 +541,22 @@ fn run_filter(path: &Path, args: &[String]) {
         case_sensitive: true,
     };
     let mut rules = Vec::new();
-    for p in incs {
+    for (field, pattern) in incs {
         rules.push(FilterRule {
-            pattern: p,
+            pattern,
             options,
             kind: RuleKind::Include,
             enabled: true,
+            field,
         });
     }
-    for p in excs {
+    for (field, pattern) in excs {
         rules.push(FilterRule {
-            pattern: p,
+            pattern,
             options,
             kind: RuleKind::Exclude,
             enabled: true,
+            field,
         });
     }
     let spec = FilterSpec {
@@ -555,7 +564,22 @@ fn run_filter(path: &Path, args: &[String]) {
         combine,
         levels,
     };
-    let set = FilterSet::new(&spec).unwrap_or_else(|e| {
+
+    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    }));
+
+    // 필드 규칙이 있으면 파일의 컬럼을 감지해 FilterSet 컴파일에 사용한다
+    let columns = if spec.rules.iter().any(|r| r.field.is_some()) {
+        Some(riffle_core::detect_columns(&log_file).unwrap_or_else(|e| {
+            eprintln!("컬럼 감지 실패: {}", e);
+            process::exit(1);
+        }))
+    } else {
+        None
+    };
+    let set = FilterSet::new(&spec, columns.as_ref()).unwrap_or_else(|e| {
         eprintln!("필터 컴파일 실패: {}", e);
         process::exit(1);
     });
@@ -563,11 +587,6 @@ fn run_filter(path: &Path, args: &[String]) {
         eprintln!("오류: 적용할 필터 조건이 없습니다.");
         process::exit(1);
     }
-
-    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
-        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
-        process::exit(1);
-    }));
 
     // 필터 스캔 (시간 + 최대 RSS 측정)
     let (stop_sample, rss_peak_kb, sampler) = start_rss_sampler();

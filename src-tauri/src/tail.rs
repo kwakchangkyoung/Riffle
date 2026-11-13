@@ -675,12 +675,13 @@ mod tests {
                 kind: "include".to_string(),
                 enabled: true,
                 color: "#ff0000".to_string(),
+                field: None,
             }],
             combine: "or".to_string(),
             levels: Vec::new(),
         };
         let core = crate::commands::filter_spec_of(&spec).expect("spec 변환 실패");
-        let set = Arc::new(FilterSet::new(&core).expect("FilterSet 생성 실패"));
+        let set = Arc::new(FilterSet::new(&core, None).expect("FilterSet 생성 실패"));
         let filter = state
             .insert_filter(info.id, spec, set)
             .expect("필터 등록 실패");

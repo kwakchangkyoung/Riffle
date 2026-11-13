@@ -247,6 +247,7 @@ pub async fn set_s3_bookmarks(app: tauri::AppHandle, items: Vec<String>) -> Resu
 mod tests {
     use super::*;
     use crate::state::OpenFile;
+    use std::sync::Mutex;
 
     #[test]
     fn test_bookmarks_roundtrip() {
@@ -289,6 +290,7 @@ mod tests {
                 path: PathBuf::from("s3://bucket/app.log"),
                 tail: None,
                 compressed: false,
+                columns: Arc::new(Mutex::new(None)),
             },
         );
         path
