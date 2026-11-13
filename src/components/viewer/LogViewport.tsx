@@ -16,6 +16,11 @@ interface LevelSpan {
     className: string;
 }
 
+/** #rrggbb 색상 문자열에 알파를 붙인 8자리 hex를 반환한다 (규칙 하이라이트 배경용) */
+function withAlpha(hex: string): string {
+    return hex.length === 7 && hex.startsWith("#") ? `${hex}40` : hex;
+}
+
 /**
  * 줄 텍스트에서 첫 로그 레벨 토큰의 범위와 색상 클래스를 찾습니다.
  */
@@ -40,17 +45,21 @@ function findLevelSpan(text: string): LevelSpan | null {
 }
 
 /**
- * 검색 하이라이트 범위와 로그 레벨 토큰 범위를 경계로 잘라
+ * 검색 하이라이트, 필터 규칙 하이라이트, 로그 레벨 토큰 범위를 경계로 잘라
  * 각 조각에 적절한 스타일을 입혀 렌더링합니다.
+ * 우선순위: 검색 하이라이트(최상위) > 규칙 배경 > 레벨 색상.
  */
 function renderLineContent(
     text: string,
     highlights: [number, number][] | undefined,
+    ruleHighlights: [number, number, number][] | undefined,
+    ruleColors: string[] | undefined,
     isCurrentHit: boolean,
 ): React.ReactNode {
     const level = findLevelSpan(text);
     const hl = highlights ?? [];
-    if (level === null && hl.length === 0) {
+    const rl = ruleHighlights ?? [];
+    if (level === null && hl.length === 0 && rl.length === 0) {
         return text;
     }
 
@@ -64,6 +73,10 @@ function renderLineContent(
         if (s >= 0 && s <= text.length) bounds.add(s);
         if (e >= 0 && e <= text.length) bounds.add(e);
     }
+    for (const [s, e] of rl) {
+        if (s >= 0 && s <= text.length) bounds.add(s);
+        if (e >= 0 && e <= text.length) bounds.add(e);
+    }
     const sorted = Array.from(bounds).sort((a, b) => a - b);
 
     const nodes: React.ReactNode[] = [];
@@ -73,6 +86,7 @@ function renderLineContent(
         if (e <= s) continue;
         const seg = text.slice(s, e);
         const inHighlight = hl.some(([hs, he]) => s >= hs && e <= he);
+        const ruleEntry = rl.find(([rs, re]) => s >= rs && e <= re);
         const inLevel = level !== null && s >= level.start && e <= level.end;
 
         if (inHighlight) {
@@ -91,6 +105,24 @@ function renderLineContent(
                         seg
                     )}
                 </mark>,
+            );
+        } else if (ruleEntry !== undefined) {
+            const color = ruleColors?.[ruleEntry[2]];
+            nodes.push(
+                <span
+                    key={i}
+                    style={
+                        color !== undefined
+                            ? { backgroundColor: withAlpha(color) }
+                            : undefined
+                    }
+                >
+                    {inLevel ? (
+                        <span className={level.className}>{seg}</span>
+                    ) : (
+                        seg
+                    )}
+                </span>,
             );
         } else if (inLevel) {
             nodes.push(
@@ -113,10 +145,12 @@ interface LogViewportProps {
     lineCache: LineCache;
     topLine: number;
     onTopLineChange: (topLine: number) => void;
-    currentHitLine: number | null; // 현재 검색 결과 줄 번호 (0-based)
-    isFilterMode: boolean; // 필터 모드 여부
+    currentHitLine: number | null; // 현재 검색 결과 줄 번호 (0-based, 실제 파일 줄 번호)
+    isFilterMode: boolean; // 검색 결과만 보기 모드 여부
+    filterViewActive?: boolean; // 다중 필터 보기 모드 여부 (인덱스 기반 보기)
     onLineDoubleClick?: (lineNo: number) => void; // 필터 모드에서 줄 더블클릭 시 호출
     densityBins?: number[]; // 스크롤바 미니맵용 밀도 배열
+    ruleColors?: string[]; // 필터 규칙 색상 (spec.rules 인덱스 → #rrggbb)
     onViewportHeightChange?: (height: number) => void;
     onTrackHeightChange?: (height: number) => void;
     fontSize: number; // 본문 폰트 크기 (px)
@@ -139,8 +173,10 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         onTopLineChange,
         currentHitLine,
         isFilterMode,
+        filterViewActive = false,
         onLineDoubleClick,
         densityBins,
+        ruleColors,
         onViewportHeightChange,
         onTrackHeightChange,
         fontSize,
@@ -357,22 +393,22 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         }[] = [];
         const badgeHeight = Math.min(16, rowHeight);
 
+        // 인덱스 기반 보기(검색 결과만 / 다중 필터) 여부
+        const indexView = isFilterMode || filterViewActive;
+
         // 본문 행 렌더링
         const rows: React.ReactNode[] = [];
         for (let i = 0; i < rowCount; i++) {
             const index = renderStart + i;
             const line = lineCache.getLine(index);
 
-            // 현재 검색 결과 줄인지 확인
+            // 현재 검색 결과 줄인지 확인 (line.no는 모든 모드에서 실제 파일 줄 번호)
             const isCurrentHit =
-                currentHitLine !== null &&
-                (isFilterMode
-                    ? line?.no === currentHitLine
-                    : index === currentHitLine);
+                currentHitLine !== null && line?.no === currentHitLine;
 
             // 줄 단위 선택 범위에 포함되는지 확인 (일반 모드에서만 index == 줄 번호)
             const isSelected =
-                !isFilterMode &&
+                !indexView &&
                 selectedRange != null &&
                 index >= selectedRange.start &&
                 index <= selectedRange.end;
@@ -396,7 +432,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                         if (isFilterMode && line && onLineDoubleClick) {
                             onLineDoubleClick(line.no);
                         } else if (
-                            !isFilterMode &&
+                            !indexView &&
                             line !== undefined &&
                             line.truncated
                         ) {
@@ -422,6 +458,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                             renderLineContent(
                                 line.text,
                                 line.highlights,
+                                line.ruleHighlights,
+                                ruleColors,
                                 isCurrentHit,
                             )
                         ) : lineCache.isLineFailed(index) ? (
@@ -462,7 +500,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     translateY={translateY}
                     rowHeight={rowHeight}
                     fontSize={fontSize}
-                    isFilterMode={isFilterMode}
+                    isFilterMode={indexView}
                     getLine={getLineCallback}
                     cacheVersion={cacheVersion}
                     onLineClick={onGutterLineClick}
@@ -485,13 +523,13 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     </div>
                 </div>
 
-                {/* 커스텀 수직 스크롤바 (필터 모드에서는 밀도 마커 숨김) */}
+                {/* 커스텀 수직 스크롤바 (인덱스 기반 보기에서는 밀도 마커 숨김) */}
                 <Scrollbar
                     topLine={topLine}
                     lineCount={lineCount}
                     visibleRows={visibleRows}
                     onScroll={onTopLineChange}
-                    densityBins={isFilterMode ? undefined : densityBins}
+                    densityBins={indexView ? undefined : densityBins}
                     onTrackHeightChange={onTrackHeightChange}
                     onDraggingChange={handleScrollbarDragging}
                 />

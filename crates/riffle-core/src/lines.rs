@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
+use crate::filter::FilterSet;
 use crate::index::{IndexProgress, LineIndex};
 use crate::search::{Matcher, utf16_ranges};
 use crate::source::Source;
@@ -24,6 +25,9 @@ pub struct Line {
     pub truncated: bool,
     /// UTF-16 [start, end) 하이라이트 범위 목록 (표시 text 기준, matcher 없으면 빈 Vec)
     pub highlights: Vec<(u32, u32)>,
+    /// 규칙별 UTF-16 [start, end, rule_idx] 목록 (표시 text 기준, filter 없으면 빈 Vec)
+    /// rule_idx는 필터 spec.rules의 인덱스이다.
+    pub rule_highlights: Vec<(u32, u32, u32)>,
 }
 
 /// LogFile::refresh()의 판정 결과
@@ -121,12 +125,20 @@ fn empty_line(line_no: u64) -> Line {
         byte_len: 0,
         truncated: false,
         highlights: Vec::new(),
+        rule_highlights: Vec::new(),
     }
 }
 
 /// raw_prefix(줄의 앞부분 바이트, 개행 제외)와 실제 줄 바이트 길이(byte_len)로 Line을 만든다.
 /// raw_prefix가 byte_len보다 짧으면(긴 줄의 표시분만 읽은 경우) 읽은 범위만 사용한다.
-fn make_line(raw_prefix: &[u8], byte_len: u64, line_no: u64, matcher: Option<&Matcher>) -> Line {
+/// filter가 제공되면 규칙별 rule_highlights(UTF-16, rule_idx 포함)도 계산한다.
+fn make_line(
+    raw_prefix: &[u8],
+    byte_len: u64,
+    line_no: u64,
+    matcher: Option<&Matcher>,
+    filter: Option<&FilterSet>,
+) -> Line {
     let take = (byte_len as usize).min(raw_prefix.len());
     let raw_line = &raw_prefix[..take];
     // 줄 전체를 읽은 경우에만 끝의 '\r'을 표시 길이 계산에서 제외한다.
@@ -158,12 +170,27 @@ fn make_line(raw_prefix: &[u8], byte_len: u64, line_no: u64, matcher: Option<&Ma
         None => Vec::new(),
     };
 
+    // 규칙별 하이라이트: rule_ranges는 표시 텍스트 기준 바이트 범위와 규칙 인덱스를 반환
+    let rule_highlights = match filter {
+        Some(f) => {
+            let mut out = Vec::new();
+            for (bs, be, rule_idx) in f.rule_ranges(text.as_bytes()) {
+                if let Some(&(s, e)) = utf16_ranges(&text, &[(bs, be)]).first() {
+                    out.push((s, e, rule_idx));
+                }
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+
     Line {
         no: line_no,
         text,
         byte_len,
         truncated,
         highlights,
+        rule_highlights,
     }
 }
 
@@ -176,6 +203,7 @@ fn decode_line_at(
     offset: u64,
     line_no: u64,
     matcher: Option<&Matcher>,
+    filter: Option<&FilterSet>,
 ) -> Result<(Line, u64)> {
     let remaining = source.len().saturating_sub(offset);
     if remaining == 0 {
@@ -200,7 +228,10 @@ fn decode_line_at(
         },
     };
 
-    Ok((make_line(head, byte_len, line_no, matcher), next_offset))
+    Ok((
+        make_line(head, byte_len, line_no, matcher, filter),
+        next_offset,
+    ))
 }
 
 /// 줄 시작 오프셋 캐시 최대 항목 수
@@ -291,11 +322,13 @@ impl LogFile {
     /// 지정된 범위의 줄들을 읽어온다.
     /// 현재까지 인덱싱이 완료되어 확인된 줄 범위까지만 반환한다.
     /// matcher가 제공되면 각 줄의 highlights(UTF-16 범위)를 계산하여 채운다.
+    /// filter가 제공되면 각 줄의 rule_highlights(규칙별 UTF-16 범위)도 계산한다.
     pub fn read_lines(
         &self,
         start: u64,
         count: u64,
         matcher: Option<&Matcher>,
+        filter: Option<&FilterSet>,
     ) -> Result<Vec<Line>> {
         let total_lines = self.index.line_count();
         if start >= total_lines || count == 0 {
@@ -331,13 +364,19 @@ impl LogFile {
             match memchr::memchr(b'\n', chunk) {
                 Some(nl_pos) => {
                     // 개행이 청크 안에 있으면 버퍼에서 바로 디코딩
-                    lines.push(make_line(&chunk[..nl_pos], nl_pos as u64, line_no, matcher));
+                    lines.push(make_line(
+                        &chunk[..nl_pos],
+                        nl_pos as u64,
+                        line_no,
+                        matcher,
+                        filter,
+                    ));
                     current_offset += nl_pos as u64 + 1;
                 }
                 None => {
                     // 개행이 청크에 없음: 청크 경계에 걸친 긴 줄이므로 개별 디코딩
                     let (line, next_offset) =
-                        decode_line_at(&self.source, current_offset, line_no, matcher)?;
+                        decode_line_at(&self.source, current_offset, line_no, matcher, filter)?;
                     self.cache_line_start(line_no + 1, next_offset);
                     lines.push(line);
                     current_offset = next_offset;
@@ -351,7 +390,13 @@ impl LogFile {
     /// 오름차순 정렬된 임의 줄 번호들을 읽는다 (필터 모드용).
     /// 현재까지 확인되지 않은 줄 번호는 건너뛴다.
     /// 연속한 줄 번호는 이전 위치에서 이어서 전진하고, 멀리 떨어지면 index.line_start를 사용한다.
-    pub fn read_lines_at(&self, line_nos: &[u64], matcher: Option<&Matcher>) -> Result<Vec<Line>> {
+    /// filter가 제공되면 각 줄의 rule_highlights(규칙별 UTF-16 범위)도 계산한다.
+    pub fn read_lines_at(
+        &self,
+        line_nos: &[u64],
+        matcher: Option<&Matcher>,
+        filter: Option<&FilterSet>,
+    ) -> Result<Vec<Line>> {
         let total_lines = self.index.line_count();
         let mut lines: Vec<Line> = Vec::with_capacity(line_nos.len());
 
@@ -396,7 +441,7 @@ impl LogFile {
             };
 
             let (line, next_offset) =
-                decode_line_at(&self.source, target_offset, line_no, matcher)?;
+                decode_line_at(&self.source, target_offset, line_no, matcher, filter)?;
             self.cache_line_start(line_no + 1, next_offset);
             lines.push(line);
             prev_line_no = Some(line_no);

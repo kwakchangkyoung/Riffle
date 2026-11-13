@@ -10,6 +10,14 @@ export interface SearchStatusInfo {
     query: string;
 }
 
+export interface FilterStatusInfo {
+    matchCount: number;
+    isSearching: boolean;
+    isCapped: boolean;
+    scannedBytes: number;
+    totalBytes: number;
+}
+
 interface StatusBarProps {
     file: FileInfo | null;
     fileSize?: number | null; // tail 모드 등으로 갱신된 파일 크기 (미지정 시 file.size)
@@ -17,8 +25,10 @@ interface StatusBarProps {
     indexProgress: IndexProgress | null;
     topLine: number;
     searchStatus?: SearchStatusInfo | null;
-    isFilterMode?: boolean;
-    actualTopLine?: number | null; // 필터 모드 시 화면 상단 행의 실제 원본 파일 줄 번호 (1-based)
+    isFilterMode?: boolean; // 검색 결과만 보기 모드
+    filterViewActive?: boolean; // 다중 필터 보기 모드
+    filterStatus?: FilterStatusInfo | null; // 다중 필터 계산 상태
+    actualTopLine?: number | null; // 인덱스 기반 보기 시 화면 상단 행의 실제 원본 파일 줄 번호 (1-based)
     tailOn?: boolean; // tail 모드 활성 여부
     tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
     copying?: boolean; // 줄 범위 복사 진행 중 여부
@@ -36,6 +46,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         topLine,
         searchStatus,
         isFilterMode,
+        filterViewActive,
+        filterStatus,
         actualTopLine,
         tailOn,
         tailPaused,
@@ -50,10 +62,11 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
             );
         }
 
-        // 현재 보이는 줄 (일반 모드: 1-based topLine, 필터 모드: 화면 상단 행의 실제 파일 줄 번호)
+        // 현재 보이는 줄 (일반 모드: 1-based topLine, 인덱스 기반 보기: 화면 상단 행의 실제 파일 줄 번호)
+        const indexView = isFilterMode || filterViewActive;
         const normalCurrentLine =
             lineCount === 0 ? 0 : Math.min(lineCount, Math.floor(topLine) + 1);
-        const displayCurrentLine = isFilterMode
+        const displayCurrentLine = indexView
             ? actualTopLine != null
                 ? actualTopLine.toLocaleString("ko-KR")
                 : "-"
@@ -103,6 +116,24 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
             searchSummary = `검색 결과: ${currentStr} / ${matchStr}${searchingSuffix}${cappedText}`;
         }
 
+        // 다중 필터 상태 텍스트: "필터: n / 전체줄" (계산 중이면 +와 진행률)
+        let filterSummary = "";
+        let filterCapped = false;
+        if (filterStatus) {
+            filterCapped = filterStatus.isCapped;
+            const countStr = filterStatus.matchCount.toLocaleString("ko-KR");
+            const plus = filterStatus.isSearching ? "+" : "";
+            const pct =
+                filterStatus.isSearching && filterStatus.totalBytes > 0
+                    ? ` (${Math.floor(
+                          (filterStatus.scannedBytes /
+                              filterStatus.totalBytes) *
+                              100,
+                      )}%)`
+                    : "";
+            filterSummary = `필터: ${countStr}${plus} / ${lineCount.toLocaleString("ko-KR")}줄${pct}`;
+        }
+
         return (
             <footer className="h-7 shrink-0 px-3 flex items-center justify-between text-xs bg-zinc-100 dark:bg-zinc-900 border-t border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 select-none font-mono">
                 {/* 좌측: 파일 경로 */}
@@ -111,8 +142,19 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                         {file.path}
                     </span>
                     {isFilterMode && (
-                        <span className="px-1.5 py-0.2 rounded bg-indigo-100 dark:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 font-semibold text-[10px]">
-                            필터 모드
+                        <span
+                            className="px-1.5 py-0.2 rounded bg-indigo-100 dark:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 font-semibold text-[10px]"
+                            title="검색 결과 줄만 표시 중"
+                        >
+                            검색 결과만
+                        </span>
+                    )}
+                    {filterViewActive && (
+                        <span
+                            className="px-1.5 py-0.2 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 font-semibold text-[10px]"
+                            title="다중 필터를 통과한 줄만 표시 중"
+                        >
+                            필터
                         </span>
                     )}
                 </div>
@@ -144,6 +186,31 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                                 }
                             >
                                 {tailPaused ? "TAIL 일시정지" : "● TAIL"}
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
+                    {filterSummary && (
+                        <>
+                            <span
+                                className={
+                                    filterCapped
+                                        ? "text-rose-600 dark:text-rose-400 font-medium"
+                                        : "text-emerald-700 dark:text-emerald-300 font-medium"
+                                }
+                                title="필터를 통과한 줄 수 / 전체 줄 수"
+                            >
+                                {filterSummary}
+                                {filterCapped && (
+                                    <span
+                                        className="ml-1 text-rose-500 font-bold"
+                                        title="결과가 너무 많음 (상한 도달)"
+                                    >
+                                        !
+                                    </span>
+                                )}
                             </span>
                             <span className="text-zinc-300 dark:text-zinc-700">
                                 |

@@ -11,7 +11,15 @@ use riffle_core::{LogFile, RefreshOutcome};
 use serde::Serialize;
 use tauri::ipc::Channel;
 
-use crate::state::{AppState, TailHandle};
+use crate::state::{AppState, FilterMap, FilterState, TailHandle};
+
+/// tail 루프가 Appended 시 활성 필터를 갱신하기 위한 컨텍스트
+pub struct TailFilterCtx {
+    /// AppState.filters와 공유하는 필터 맵
+    pub filters: FilterMap,
+    /// 감시 대상 파일 ID
+    pub file_id: u32,
+}
 
 /// 파일 변경 이벤트 디바운스 시간
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -39,6 +47,8 @@ pub enum TailEvent {
         line_count: u64,
         total_bytes: u64,
         old_line_count: u64,
+        /// 활성 필터의 보이는 줄 수 (필터가 없으면 None)
+        filter_count: Option<u64>,
     },
     Rotated {
         reason: String,
@@ -48,9 +58,43 @@ pub enum TailEvent {
     },
 }
 
+/// tail 추가분을 해당 파일의 활성 필터들에 반영하고 필터 보기 줄 수를 반환한다.
+/// 파일당 활성 필터는 하나이지만 방어적으로 모두 갱신하고 최대 줄 수를 돌려준다.
+/// 필터가 없으면 None.
+fn update_filters_on_append(
+    filters: &FilterMap,
+    file_id: u32,
+    file: &LogFile,
+    old_line_count: u64,
+    new_line_count: u64,
+) -> Option<u64> {
+    let states: Vec<Arc<FilterState>> = {
+        let map = filters.lock().unwrap_or_else(|p| p.into_inner());
+        map.values()
+            .filter(|f| f.file_id == file_id)
+            .cloned()
+            .collect()
+    };
+    if states.is_empty() {
+        return None;
+    }
+    let mut max_len = 0u64;
+    for st in &states {
+        st.apply_appended(file, old_line_count, new_line_count);
+        let len = st.lines.read().map(|l| l.len()).unwrap_or(0);
+        max_len = max_len.max(len);
+    }
+    Some(max_len)
+}
+
 /// refresh 1회 수행 후 결과를 이벤트로 전달한다.
 /// 감시를 계속할지 여부를 반환한다 (로테이션 감지 시 false).
-fn refresh_once(file: &LogFile, on_event: &mut impl FnMut(TailEvent)) -> bool {
+/// Appended 시 filter_ctx의 활성 필터 LineSet을 갱신하고 filter_count를 이벤트에 담는다.
+fn refresh_once(
+    file: &LogFile,
+    filter_ctx: &TailFilterCtx,
+    on_event: &mut impl FnMut(TailEvent),
+) -> bool {
     match file.refresh() {
         Ok(RefreshOutcome::Unchanged) | Ok(RefreshOutcome::Pending) => true,
         Ok(RefreshOutcome::Appended {
@@ -58,10 +102,19 @@ fn refresh_once(file: &LogFile, on_event: &mut impl FnMut(TailEvent)) -> bool {
             new_line_count,
             new_len,
         }) => {
+            // 필터 갱신을 이벤트 전송보다 먼저 수행해 filter_count가 최신 값이 되게 한다
+            let filter_count = update_filters_on_append(
+                &filter_ctx.filters,
+                filter_ctx.file_id,
+                file,
+                old_line_count,
+                new_line_count,
+            );
             on_event(TailEvent::Appended {
                 line_count: new_line_count,
                 total_bytes: new_len,
                 old_line_count,
+                filter_count,
             });
             true
         }
@@ -98,6 +151,7 @@ pub fn run_tail_loop(
     stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<TailLoopMsg>,
     rx: std::sync::mpsc::Receiver<TailLoopMsg>,
+    filter_ctx: TailFilterCtx,
     mut on_event: impl FnMut(TailEvent),
 ) {
     // notify 이벤트를 TailLoopMsg::Event로 변환해 같은 채널로 전달.
@@ -125,7 +179,7 @@ pub fn run_tail_loop(
     let _keepalive_tx = keepalive_tx;
 
     // 시작 시 한 번 즉시 확인 (열기 이후 변경분 반영)
-    if !refresh_once(&file, &mut on_event) {
+    if !refresh_once(&file, &filter_ctx, &mut on_event) {
         return;
     }
     let mut last_refresh = Instant::now();
@@ -152,7 +206,7 @@ pub fn run_tail_loop(
             break;
         }
         if last_refresh.elapsed() >= DEBOUNCE {
-            if !refresh_once(&file, &mut on_event) {
+            if !refresh_once(&file, &filter_ctx, &mut on_event) {
                 break; // 로테이션 감지 → 감시 종료
             }
             last_refresh = Instant::now();
@@ -190,6 +244,11 @@ where
     }
     let file = open_file.file.clone();
     let watch_dir = watch_dir_of(&open_file.path);
+    // Appended 시 활성 필터의 LineSet을 갱신하기 위해 필터 맵을 공유한다
+    let filter_ctx = TailFilterCtx {
+        filters: state.filters.clone(),
+        file_id: id,
+    };
 
     // Stop 메시지로 대기 중인 루프를 즉시 깨우기 위한 채널.
     // 송신자 하나는 watcher용(run_tail_loop 인자), 하나는 TailHandle이 보관한다.
@@ -199,7 +258,15 @@ where
     let thread_stop = stop.clone();
     let thread_tx = tx;
     let thread = std::thread::spawn(move || {
-        run_tail_loop(file, &watch_dir, thread_stop, thread_tx, rx, on_event);
+        run_tail_loop(
+            file,
+            &watch_dir,
+            thread_stop,
+            thread_tx,
+            rx,
+            filter_ctx,
+            on_event,
+        );
     });
     open_file.tail = Some(TailHandle {
         stop,
@@ -245,6 +312,7 @@ pub async fn set_tail(
 mod tests {
     use super::*;
     use crate::commands::open_file_internal;
+    use std::collections::HashMap;
     use std::io::Write;
     use std::sync::Mutex;
 
@@ -318,9 +386,20 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
-                events2.lock().unwrap().push(e);
-            });
+            run_tail_loop(
+                file,
+                &watch_dir,
+                stop2,
+                tx,
+                rx,
+                TailFilterCtx {
+                    filters: Arc::new(Mutex::new(HashMap::new())),
+                    file_id: 1,
+                },
+                move |e| {
+                    events2.lock().unwrap().push(e);
+                },
+            );
         });
 
         append_line(&temp.path, "line2");
@@ -360,9 +439,20 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
-                events2.lock().unwrap().push(e);
-            });
+            run_tail_loop(
+                file,
+                &watch_dir,
+                stop2,
+                tx,
+                rx,
+                TailFilterCtx {
+                    filters: Arc::new(Mutex::new(HashMap::new())),
+                    file_id: 1,
+                },
+                move |e| {
+                    events2.lock().unwrap().push(e);
+                },
+            );
         });
 
         // 파일을 다른 이름으로 rename → 경로의 파일이 사라짐 (Replaced)
@@ -400,9 +490,20 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop_tx = tx.clone();
         let handle = std::thread::spawn(move || {
-            run_tail_loop(file, &watch_dir, stop2, tx, rx, move |e| {
-                events2.lock().unwrap().push(e);
-            });
+            run_tail_loop(
+                file,
+                &watch_dir,
+                stop2,
+                tx,
+                rx,
+                TailFilterCtx {
+                    filters: Arc::new(Mutex::new(HashMap::new())),
+                    file_id: 1,
+                },
+                move |e| {
+                    events2.lock().unwrap().push(e);
+                },
+            );
         });
 
         // 같은 inode에서 크기를 줄임 (Truncated)
@@ -497,6 +598,78 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e, TailEvent::Appended { .. }))
         );
+    }
+
+    #[test]
+    fn test_tail_loop_updates_active_filter() {
+        use crate::commands::{FilterRuleDto, FilterSpecDto};
+        use riffle_core::FilterSet;
+
+        let state = AppState::default();
+        let temp = TempFile::create(b"INFO ok\nERROR bad\n");
+        let opened = open_file_internal(&state, temp.path_str()).expect("파일 열기 실패");
+        let info = opened.info;
+        let file = opened.file;
+        file.build_index(&AtomicBool::new(false), &mut |_| {})
+            .expect("인덱싱 실패");
+
+        // include ERROR 필터를 등록하고 스캔 완료 상태를 흉내낸다 (줄 1만 보임)
+        let spec = FilterSpecDto {
+            rules: vec![FilterRuleDto {
+                pattern: "ERROR".to_string(),
+                regex: false,
+                case_sensitive: true,
+                kind: "include".to_string(),
+                enabled: true,
+                color: "#ff0000".to_string(),
+            }],
+            combine: "or".to_string(),
+            levels: Vec::new(),
+        };
+        let core = crate::commands::filter_spec_of(&spec).expect("spec 변환 실패");
+        let set = Arc::new(FilterSet::new(&core).expect("FilterSet 생성 실패"));
+        let filter = state
+            .insert_filter(info.id, spec, set)
+            .expect("필터 등록 실패");
+        filter.lines.write().unwrap().push_line(1);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events2 = events.clone();
+        enable_tail(&state, info.id, move |e| {
+            events2.lock().unwrap().push(e);
+        })
+        .expect("tail 활성화 실패");
+
+        append_line(&temp.path, "ERROR new");
+
+        // Appended 이벤트의 filter_count가 갱신된 필터 줄 수여야 한다
+        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+            matches!(
+                e,
+                TailEvent::Appended {
+                    filter_count: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(found, "filter_count가 있는 Appended 이벤트가 도착해야 함");
+
+        let events = events.lock().unwrap();
+        let appended = events.iter().find_map(|e| match e {
+            TailEvent::Appended { filter_count, .. } => *filter_count,
+            _ => None,
+        });
+        assert_eq!(appended, Some(2)); // 줄 1, 2 둘 다 ERROR
+        drop(events);
+
+        // 필터의 LineSet에도 반영됐는지 확인
+        let lines = filter.lines.read().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(1));
+        assert!(lines.contains(2));
+        drop(lines);
+
+        state.close_file(info.id);
     }
 
     #[test]

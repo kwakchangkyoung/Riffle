@@ -162,7 +162,7 @@ fn bench_read_lines(c: &mut Criterion) {
         b.iter(|| {
             let start = rng.gen_range(0, max_start.max(1));
             let lines = log_file
-                .read_lines(start, 100, None)
+                .read_lines(start, 100, None, None)
                 .expect("read_lines 실패");
             black_box(lines);
         });

@@ -12,7 +12,8 @@ import {
 
 interface SearchBarProps {
     fileId: number | null;
-    getTopLine: () => number; // 최신 topLine 조회 함수 (매 프레임 리렌더 방지)
+    getViewportLineNo: () => number; // 뷰포트 맨 위 실제 줄 번호 조회 (매 프레임 리렌더 방지)
+    filterId: number | null; // 활성 다중 필터 ID (검색 범위 제한용)
     visibleRows: number;
     findSignal?: number; // 증가할 때마다 검색 입력창에 포커스 (메뉴 찾기 이벤트용)
     isFilterMode: boolean;
@@ -36,7 +37,8 @@ interface SearchBarProps {
 export const SearchBar: React.FC<SearchBarProps> = React.memo(
     ({
         fileId,
-        getTopLine,
+        getViewportLineNo,
+        filterId,
         isFilterMode,
         findSignal = 0,
         onToggleFilterMode,
@@ -194,7 +196,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                                 !hasAutoNavigatedRef.current
                             ) {
                                 hasAutoNavigatedRef.current = true;
-                                const from = Math.floor(getTopLine());
+                                const from = Math.floor(getViewportLineNo());
                                 searchNav(searchId, from, true)
                                     .then((hit) => {
                                         if (
@@ -244,6 +246,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                     const searchId = await search(
                         fileId,
                         queryDto,
+                        filterId,
                         (event: SearchEvent) => {
                             if (searchSeqRef.current !== seq) return;
                             if (!hasResolvedId) {
@@ -285,7 +288,8 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             return () => {
                 clearTimeout(timer);
             };
-        }, [queryText, isRegex, isCaseSensitive, fileId]); // eslint-disable-line react-hooks/exhaustive-deps
+            // filterId가 바뀌면(필터 스펙 변경) 같은 검색어라도 필터 안에서 다시 검색한다
+        }, [queryText, isRegex, isCaseSensitive, fileId, filterId]); // eslint-disable-line react-hooks/exhaustive-deps
 
         // 다음 결과로 이동
         const handleNext = useCallback(async () => {
@@ -296,7 +300,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             const fromLine =
                 currentHit !== null
                     ? currentHit.line
-                    : Math.floor(getTopLine());
+                    : Math.floor(getViewportLineNo());
 
             try {
                 let hit = await searchNav(searchId, fromLine, true);
@@ -316,7 +320,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             matchCount,
             onNavigateToHit,
             setCurrentHit,
-            getTopLine,
+            getViewportLineNo,
         ]);
 
         // 이전 결과로 이동
@@ -328,7 +332,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             const fromLine =
                 currentHit !== null
                     ? currentHit.line
-                    : Math.floor(getTopLine());
+                    : Math.floor(getViewportLineNo());
 
             try {
                 let hit = await searchNav(searchId, fromLine, false);
@@ -349,7 +353,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             matchCount,
             onNavigateToHit,
             setCurrentHit,
-            getTopLine,
+            getViewportLineNo,
         ]);
 
         // 키보드 이벤트: Enter (다음), Shift+Enter (이전), Esc (블러)
@@ -499,7 +503,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                         Aa
                     </button>
 
-                    {/* 필터 모드 토글 */}
+                    {/* 검색 결과만 보기 토글 (다중 필터와 별개) */}
                     <button
                         type="button"
                         onClick={onToggleFilterMode}
@@ -509,9 +513,13 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
                                 ? "bg-indigo-600 text-white font-medium"
                                 : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed"
                         }`}
-                        title="필터 모드 (매치된 줄만 표시)"
+                        title={
+                            filterId !== null
+                                ? "검색 결과만 표시 (필터 적용 중: 보이는 줄 안의 검색 결과)"
+                                : "검색 결과만 표시 (매치된 줄만 보기)"
+                        }
                     >
-                        <span>필터</span>
+                        <span>검색 결과만</span>
                     </button>
 
                     {/* 결과 건수 표시 */}

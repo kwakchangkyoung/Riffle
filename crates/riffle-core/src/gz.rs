@@ -407,11 +407,11 @@ mod tests {
         assert_eq!(file.index().line_count(), 501);
 
         // 임의 줄 내용이 원본과 일치하는지 확인
-        let lines = file.read_lines(0, 10, None).expect("읽기 실패");
+        let lines = file.read_lines(0, 10, None, None).expect("읽기 실패");
         assert_eq!(lines.len(), 10);
         assert_eq!(lines[0].text, "log line 0000 메시지");
         assert_eq!(lines[9].text, "log line 0009 메시지");
-        let last_lines = file.read_lines(500, 1, None).expect("읽기 실패");
+        let last_lines = file.read_lines(500, 1, None, None).expect("읽기 실패");
         assert_eq!(last_lines.len(), 1);
         assert_eq!(last_lines[0].text, "마지막 줄 개행 없음");
     }
@@ -431,7 +431,7 @@ mod tests {
             .expect("multi-member 해제 실패");
 
         assert_eq!(file.index().line_count(), 4);
-        let lines = file.read_lines(0, 10, None).expect("읽기 실패");
+        let lines = file.read_lines(0, 10, None, None).expect("읽기 실패");
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].text, "first part line1");
         assert_eq!(lines[1].text, "first part line2");
@@ -455,7 +455,7 @@ mod tests {
             .run(&file, &cancel, &mut |p| {
                 // 진행률 콜백 안에서 이미 해제된 부분을 읽을 수 있어야 한다
                 if p.decompressed > 0 && !saw_lines {
-                    let lines = file.read_lines(0, 5, None).expect("읽기 실패");
+                    let lines = file.read_lines(0, 5, None, None).expect("읽기 실패");
                     if !lines.is_empty() {
                         assert_eq!(lines[0].text, "decompress visible line 000000");
                         saw_lines = true;
@@ -502,7 +502,7 @@ mod tests {
         assert!(file.index().line_count() > 0);
 
         // 해제된 부분은 읽을 수 있다
-        let lines = file.read_lines(0, 5, None).expect("읽기 실패");
+        let lines = file.read_lines(0, 5, None, None).expect("읽기 실패");
         assert_eq!(lines.len(), 5);
         assert_eq!(lines[0].text, "cancel test line with repetitive payload");
     }
@@ -526,7 +526,7 @@ mod tests {
         assert!(result.is_err(), "손상된 gzip은 Err를 반환해야 함");
 
         // 오류 전까지 해제·인덱싱된 부분은 유효하다
-        let lines = file.read_lines(0, 5, None).expect("읽기 실패");
+        let lines = file.read_lines(0, 5, None, None).expect("읽기 실패");
         assert_eq!(lines.len(), 5);
         assert_eq!(lines[0].text, "corrupt test line 00000");
     }
@@ -546,7 +546,7 @@ mod tests {
 
         assert!(result.is_err(), "잘린 gzip은 Err를 반환해야 함");
         // 그 전까지의 내용은 읽을 수 있다
-        let _ = file.read_lines(0, 5, None).expect("읽기 실패");
+        let _ = file.read_lines(0, 5, None, None).expect("읽기 실패");
     }
 
     #[test]

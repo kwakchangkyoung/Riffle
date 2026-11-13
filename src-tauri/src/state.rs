@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use riffle_core::LogFile;
+use riffle_core::{FilterSet, LineSet, LogFile};
 
+use crate::commands::FilterSpecDto;
 use crate::tail::TailLoopMsg;
 
 /// tail 모드 감시 스레드 핸들
@@ -48,6 +49,69 @@ pub struct SearchState {
     pub capped: Arc<AtomicBool>,
 }
 
+/// 단일 다중 필터 세션의 상태 정보.
+/// lines는 보이는 줄 번호의 압축 집합(LineSet)이며 스캔 스레드와
+/// tail 갱신 스레드가 함께 쓴다 (내부 RwLock으로 직렬화).
+pub struct FilterState {
+    /// 필터 고유 ID
+    pub id: u32,
+    /// 대상 파일 ID
+    pub file_id: u32,
+    /// 프론트에서 받은 필터 조건 (프리셋 저장/조회용)
+    pub spec: FilterSpecDto,
+    /// 컴파일된 필터 판정기
+    pub set: Arc<FilterSet>,
+    /// 보이는 줄 번호 집합 (오름차순 압축 구간)
+    pub lines: Arc<RwLock<LineSet>>,
+    /// 스캔 완료 여부 플래그
+    pub done: Arc<AtomicBool>,
+    /// 구간 수 상한(MAX_FILTER_RANGES) 도달 여부 플래그
+    pub capped: Arc<AtomicBool>,
+    /// 필터 작업 취소 플래그
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl FilterState {
+    /// tail 추가분 [old_line_count-1, new_line_count) 를 재판정해 lines에 반영한다.
+    /// 이전 마지막 줄은 이어쓰여 내용이 바뀌었을 수 있으므로 먼저 제거한 뒤
+    /// filter_lines_range로 다시 판정한다. capped 상태면 더 이상 반영하지 않는다.
+    pub fn apply_appended(&self, file: &LogFile, old_line_count: u64, new_line_count: u64) {
+        if self.capped.load(Ordering::Relaxed) {
+            return;
+        }
+        let start = old_line_count.saturating_sub(1);
+        {
+            let mut lines = self.lines.write().unwrap_or_else(|p| p.into_inner());
+            if old_line_count > 0 {
+                lines.remove_line(start);
+            }
+        }
+        let lines = Arc::clone(&self.lines);
+        let capped = Arc::clone(&self.capped);
+        let cancel = Arc::clone(&self.cancel);
+        // I/O 오류는 tail 이벤트가 없으므로 무시한다 (다음 refresh가 재시도)
+        let _ = riffle_core::filter_lines_range(
+            file,
+            self.set.as_ref(),
+            start,
+            new_line_count,
+            &mut |batch| {
+                let mut ls = lines.write().unwrap_or_else(|p| p.into_inner());
+                for &n in batch {
+                    ls.push_line(n);
+                }
+                if ls.range_count() > riffle_core::MAX_FILTER_RANGES {
+                    capped.store(true, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+    }
+}
+
+/// 활성 필터 상태 맵 (tail 스레드와 공유하므로 Arc)
+pub type FilterMap = Arc<Mutex<HashMap<u32, Arc<FilterState>>>>;
+
 /// 애플리케이션 전역 상태.
 /// 열린 파일 목록과 파일 ID 발급 카운터, 검색 상태 목록을 관리한다.
 pub struct AppState {
@@ -55,10 +119,14 @@ pub struct AppState {
     pub files: Mutex<HashMap<u32, OpenFile>>,
     /// ID별 활성 검색 상태 맵
     pub searches: Mutex<HashMap<u32, Arc<SearchState>>>,
+    /// ID별 활성 필터 상태 맵 (tail 스레드와 공유)
+    pub filters: FilterMap,
     /// 다음에 발급할 파일 ID
     pub next_id: AtomicU32,
     /// 다음에 발급할 검색 ID
     pub next_search_id: AtomicU32,
+    /// 다음에 발급할 필터 ID
+    pub next_filter_id: AtomicU32,
     /// 최근 파일 목록 (최근 순, 네이티브 메뉴 표시용)
     pub recent_files: Mutex<Vec<String>>,
     /// Finder 파일 연결로 열린 경로 (콜드 스타트 시 프론트 리스너 등록 전 도착분)
@@ -72,8 +140,10 @@ impl Default for AppState {
         Self {
             files: Mutex::new(HashMap::new()),
             searches: Mutex::new(HashMap::new()),
+            filters: FilterMap::default(),
             next_id: AtomicU32::new(1),
             next_search_id: AtomicU32::new(1),
+            next_filter_id: AtomicU32::new(1),
             recent_files: Mutex::new(Vec::new()),
             pending_open: Mutex::new(None),
             front_ready: AtomicBool::new(false),
@@ -138,6 +208,18 @@ impl AppState {
         searches.retain(|_, s| {
             if s.file_id == id {
                 s.cancel.store(true, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        });
+        drop(searches);
+
+        // 3. 해당 파일의 활성 필터도 취소 및 제거
+        let mut filters = self.filters.lock().unwrap_or_else(|p| p.into_inner());
+        filters.retain(|_, f| {
+            if f.file_id == id {
+                f.cancel.store(true, Ordering::Relaxed);
                 false
             } else {
                 true
@@ -222,6 +304,69 @@ impl AppState {
         searches.len()
     }
 
+    /// 새 필터 상태를 등록한다.
+    /// 대상 파일이 아직 열려 있어야 하며, 같은 file_id를 가진 이전 필터는
+    /// 취소하고 맵에서 제거한다 (파일당 활성 필터는 하나).
+    pub fn insert_filter(
+        &self,
+        file_id: u32,
+        spec: FilterSpecDto,
+        set: Arc<FilterSet>,
+    ) -> Result<Arc<FilterState>, String> {
+        {
+            let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+            if !files.contains_key(&file_id) {
+                return Err(format!(
+                    "ID {file_id}에 해당하는 열린 파일을 찾을 수 없습니다."
+                ));
+            }
+        }
+
+        let mut filters = self.filters.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 동일 파일의 기존 필터 자동 취소 및 제거
+        filters.retain(|_, f| {
+            if f.file_id == file_id {
+                f.cancel.store(true, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        });
+
+        let id = self.next_filter_id.fetch_add(1, Ordering::Relaxed);
+        let filter_state = Arc::new(FilterState {
+            id,
+            file_id,
+            spec,
+            set,
+            lines: Arc::new(RwLock::new(LineSet::new())),
+            done: Arc::new(AtomicBool::new(false)),
+            capped: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+
+        filters.insert(id, filter_state.clone());
+        Ok(filter_state)
+    }
+
+    /// ID에 해당하는 필터 상태를 조회한다.
+    pub fn get_filter(&self, filter_id: u32) -> Result<Arc<FilterState>, String> {
+        let filters = self.filters.lock().unwrap_or_else(|p| p.into_inner());
+        filters
+            .get(&filter_id)
+            .cloned()
+            .ok_or_else(|| format!("ID {}에 해당하는 필터 상태를 찾을 수 없습니다.", filter_id))
+    }
+
+    /// 필터 작업을 취소한다.
+    pub fn cancel_filter(&self, filter_id: u32) {
+        let filters = self.filters.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(f) = filters.get(&filter_id) {
+            f.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// 최근 파일 목록을 설정한다 (파일 열기 성공 시 갱신).
     pub fn set_recent_files(&self, list: Vec<String>) {
         *self.recent_files.lock().unwrap_or_else(|p| p.into_inner()) = list;
@@ -282,6 +427,143 @@ mod tests {
 
     fn remove_test_file(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 테스트용 include 규칙 하나짜리 FilterSpecDto를 만든다.
+    fn dto_spec(pattern: &str) -> FilterSpecDto {
+        FilterSpecDto {
+            rules: vec![crate::commands::FilterRuleDto {
+                pattern: pattern.to_string(),
+                regex: false,
+                case_sensitive: true,
+                kind: "include".to_string(),
+                enabled: true,
+                color: "#ffffff".to_string(),
+            }],
+            combine: "or".to_string(),
+            levels: Vec::new(),
+        }
+    }
+
+    /// DTO를 거쳐 컴파일된 FilterSet을 만든다.
+    fn compiled_set(pattern: &str) -> Arc<FilterSet> {
+        let dto = dto_spec(pattern);
+        let core = crate::commands::filter_spec_of(&dto).unwrap();
+        Arc::new(FilterSet::new(&core).unwrap())
+    }
+
+    #[test]
+    fn test_insert_filter_cancels_previous_same_file() {
+        let state = AppState::default();
+        let p1 = insert_test_file(&state, 1);
+        let p2 = insert_test_file(&state, 2);
+
+        let f1 = state
+            .insert_filter(1, dto_spec("A"), compiled_set("A"))
+            .unwrap();
+        // 다른 파일의 필터는 영향받지 않아야 한다
+        let fx = state
+            .insert_filter(2, dto_spec("X"), compiled_set("X"))
+            .unwrap();
+        // 같은 파일의 새 필터 → 이전 필터 취소 및 제거
+        let f2 = state
+            .insert_filter(1, dto_spec("B"), compiled_set("B"))
+            .unwrap();
+
+        assert!(f1.cancel.load(Ordering::Relaxed));
+        assert!(state.get_filter(f1.id).is_err());
+        assert!(state.get_filter(f2.id).is_ok());
+        assert!(state.get_filter(fx.id).is_ok());
+        assert!(!fx.cancel.load(Ordering::Relaxed));
+
+        // 닫히지 않은 파일이 없으면 등록 실패
+        assert!(
+            state
+                .insert_filter(999, dto_spec("Z"), compiled_set("Z"))
+                .is_err()
+        );
+
+        remove_test_file(&p1);
+        remove_test_file(&p2);
+    }
+
+    #[test]
+    fn test_close_file_cleans_filters() {
+        let state = AppState::default();
+        let p1 = insert_test_file(&state, 10);
+        let p2 = insert_test_file(&state, 20);
+
+        let f1 = state
+            .insert_filter(10, dto_spec("A"), compiled_set("A"))
+            .unwrap();
+        let f2 = state
+            .insert_filter(20, dto_spec("B"), compiled_set("B"))
+            .unwrap();
+
+        state.close_file(10);
+
+        assert!(f1.cancel.load(Ordering::Relaxed));
+        assert!(state.get_filter(f1.id).is_err());
+        assert!(state.get_filter(f2.id).is_ok());
+        assert!(!f2.cancel.load(Ordering::Relaxed));
+
+        remove_test_file(&p1);
+        remove_test_file(&p2);
+    }
+
+    #[test]
+    fn test_filter_apply_appended_rejudges_last_line() {
+        // 개행 없이 끝나는 마지막 줄: "c partial"
+        let path = crate::testutil::temp_log_path("filter_tail");
+        std::fs::write(&path, b"a ERROR x\nb\nc partial").expect("임시 파일 쓰기 실패");
+        let file = Arc::new(LogFile::open(&path).expect("LogFile::open 실패"));
+        file.build_index(&AtomicBool::new(false), &mut |_| {})
+            .expect("인덱싱 실패");
+
+        let st = Arc::new(FilterState {
+            id: 1,
+            file_id: 1,
+            spec: dto_spec("ERROR"),
+            set: compiled_set("ERROR"),
+            lines: Arc::new(RwLock::new(LineSet::new())),
+            done: Arc::new(AtomicBool::new(false)),
+            capped: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+
+        // 초기 범위 [0,3) 판정 → "a ERROR x"만 통과 (줄 0)
+        st.apply_appended(&file, 0, 3);
+        assert_eq!(st.lines.read().unwrap().len(), 1);
+        assert!(st.lines.read().unwrap().contains(0));
+
+        // 마지막 미완성 줄에 이어쓰면 내용이 바뀐다: "c partial ERROR done"
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append 열기 실패");
+            f.write_all(b" ERROR done\n").expect("append 쓰기 실패");
+        }
+        let outcome = file.refresh().expect("refresh 실패");
+        let (old, new) = match outcome {
+            riffle_core::RefreshOutcome::Appended {
+                old_line_count,
+                new_line_count,
+                ..
+            } => (old_line_count, new_line_count),
+            other => panic!("Appended가 반환되어야 함: {other:?}"),
+        };
+        st.apply_appended(&file, old, new);
+
+        // 줄 2("c partial ERROR done")가 새로 통과해야 한다
+        let lines = st.lines.read().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(0));
+        assert!(lines.contains(2));
+        drop(lines);
+
+        remove_test_file(&path);
     }
 
     #[test]

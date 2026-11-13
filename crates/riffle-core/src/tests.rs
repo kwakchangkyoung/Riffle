@@ -64,7 +64,9 @@ fn test_empty_file() {
     assert_eq!(log_file.index().line_count(), 0);
     assert!(log_file.index().progress().done);
 
-    let lines = log_file.read_lines(0, 10, None).expect("read_lines 실패");
+    let lines = log_file
+        .read_lines(0, 10, None, None)
+        .expect("read_lines 실패");
     assert!(lines.is_empty());
     assert_eq!(log_file.index().line_start(log_file.source(), 0), None);
     assert_eq!(log_file.index().line_of_offset(log_file.source(), 0), None);
@@ -81,7 +83,7 @@ fn test_last_line_without_newline() {
         .expect("인덱싱 실패");
 
     assert_eq!(log_file1.index().line_count(), 1);
-    let lines1 = log_file1.read_lines(0, 10, None).expect("읽기 실패");
+    let lines1 = log_file1.read_lines(0, 10, None, None).expect("읽기 실패");
     assert_eq!(lines1.len(), 1);
     assert_eq!(lines1[0].no, 0);
     assert_eq!(lines1[0].text, "hello world");
@@ -96,7 +98,7 @@ fn test_last_line_without_newline() {
         .expect("인덱싱 실패");
 
     assert_eq!(log_file2.index().line_count(), 3);
-    let lines2 = log_file2.read_lines(0, 10, None).expect("읽기 실패");
+    let lines2 = log_file2.read_lines(0, 10, None, None).expect("읽기 실패");
     assert_eq!(lines2.len(), 3);
     assert_eq!(lines2[0].text, "line1");
     assert_eq!(lines2[1].text, "line2");
@@ -116,7 +118,7 @@ fn test_crlf_handling() {
 
     // 3줄: first line, second line, third without nl\r
     assert_eq!(log_file.index().line_count(), 3);
-    let lines = log_file.read_lines(0, 10, None).expect("읽기 실패");
+    let lines = log_file.read_lines(0, 10, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 3);
 
     // 첫 줄: \r 제거된 텍스트, byte_len은 \r 포함 (11바이트)
@@ -142,7 +144,7 @@ fn test_newlines_only() {
         .expect("인덱싱 실패");
 
     assert_eq!(log_file.index().line_count(), 3);
-    let lines = log_file.read_lines(0, 10, None).expect("읽기 실패");
+    let lines = log_file.read_lines(0, 10, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 3);
 
     for (i, line) in lines.iter().enumerate() {
@@ -170,7 +172,7 @@ fn test_long_line_over_16kb_and_korean_utf8_boundary() {
         .expect("인덱싱 실패");
 
     assert_eq!(log_file.index().line_count(), 1);
-    let lines = log_file.read_lines(0, 1, None).expect("읽기 실패");
+    let lines = log_file.read_lines(0, 1, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 1);
 
     let line = &lines[0];
@@ -197,7 +199,7 @@ fn test_invalid_utf8_bytes() {
         .build_index(&cancel, &mut |_| {})
         .expect("인덱싱 실패");
 
-    let lines = log_file.read_lines(0, 1, None).expect("읽기 실패");
+    let lines = log_file.read_lines(0, 1, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 1);
     assert!(lines[0].text.contains('\u{FFFD}'));
     assert!(lines[0].text.starts_with("Valid prefix "));
@@ -221,7 +223,7 @@ fn test_chunk_segment_boundary_straddle() {
         .expect("인덱싱 실패");
 
     assert_eq!(log_file.index().line_count(), 3);
-    let lines = log_file.read_lines(0, 5, None).expect("읽기 실패");
+    let lines = log_file.read_lines(0, 5, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines[0].text,
@@ -252,7 +254,9 @@ fn test_k_multiples_checkpoints() {
 
     let test_indices = [0, 1023, 1024, 1025, 2047, 2048, 2049];
     for &idx in &test_indices {
-        let lines = log_file.read_lines(idx, 1, None).expect("read_lines 실패");
+        let lines = log_file
+            .read_lines(idx, 1, None, None)
+            .expect("read_lines 실패");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].no, idx);
         let expected_text = format!("log message line {:05}", idx);
@@ -283,17 +287,17 @@ fn test_read_lines_past_eof() {
 
     assert_eq!(log_file.index().line_count(), 5);
 
-    let lines = log_file.read_lines(3, 10, None).expect("읽기 실패");
+    let lines = log_file.read_lines(3, 10, None, None).expect("읽기 실패");
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].no, 3);
     assert_eq!(lines[0].text, "line 3");
     assert_eq!(lines[1].no, 4);
     assert_eq!(lines[1].text, "line 4");
 
-    let lines_eof = log_file.read_lines(5, 5, None).expect("읽기 실패");
+    let lines_eof = log_file.read_lines(5, 5, None, None).expect("읽기 실패");
     assert!(lines_eof.is_empty());
 
-    let lines_far = log_file.read_lines(100, 5, None).expect("읽기 실패");
+    let lines_far = log_file.read_lines(100, 5, None, None).expect("읽기 실패");
     assert!(lines_far.is_empty());
 }
 
@@ -383,7 +387,7 @@ fn test_concurrent_read_during_indexing() {
     let mut read_success_count = 0;
     while !log_file.index().progress().done {
         if log_file.index().line_count() >= 50 {
-            let lines = log_file.read_lines(0, 50, None).expect("읽기 실패");
+            let lines = log_file.read_lines(0, 50, None, None).expect("읽기 실패");
             assert_eq!(lines.len(), 50);
             assert_eq!(lines[0].text, "concurrent line 000000");
             assert_eq!(lines[49].text, "concurrent line 000049");
@@ -934,7 +938,7 @@ fn test_read_lines_highlights() {
         },
     )
     .unwrap();
-    let lines = log_file.read_lines(0, 3, Some(&matcher)).unwrap();
+    let lines = log_file.read_lines(0, 3, Some(&matcher), None).unwrap();
 
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].highlights, vec![(0, 5)]);
@@ -967,7 +971,9 @@ fn test_read_lines_at_arbitrary_and_filter() {
 
     // 임의 오름차순 줄 번호: 연속(1,2), 인접(4), 체크포인트(1024) 넘음, 중복(1024, 1024), 범위 초과(9999)
     let requested = [1, 2, 4, 1024, 1024, 9999];
-    let lines = log_file.read_lines_at(&requested, Some(&matcher)).unwrap();
+    let lines = log_file
+        .read_lines_at(&requested, Some(&matcher), None)
+        .unwrap();
 
     // 9999는 인덱스 범위를 벗어나므로 건너뜀 -> 총 5개 반환
     assert_eq!(lines.len(), 5);
@@ -1039,7 +1045,7 @@ fn test_refresh_appended_lines() {
     }
     assert_eq!(log_file.index().line_count(), 6);
 
-    let lines = log_file.read_lines(3, 3, None).unwrap();
+    let lines = log_file.read_lines(3, 3, None, None).unwrap();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].text, "line 3");
     assert_eq!(lines[1].text, "line 4");
@@ -1056,7 +1062,7 @@ fn test_refresh_appended_lines() {
             ..
         }
     ));
-    let last = log_file.read_lines(6, 1, None).unwrap();
+    let last = log_file.read_lines(6, 1, None, None).unwrap();
     assert_eq!(last[0].text, "line 6");
 }
 
@@ -1080,7 +1086,7 @@ fn test_refresh_continues_partial_last_line() {
         }
     ));
 
-    let lines = log_file.read_lines(0, 10, None).unwrap();
+    let lines = log_file.read_lines(0, 10, None, None).unwrap();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].text, "a");
     assert_eq!(lines[1].text, "bc");
@@ -1114,7 +1120,7 @@ fn test_refresh_checkpoint_boundary_and_bulk_append() {
     ));
 
     // 1024번 줄은 체크포인트에서 바로 시작 오프셋을 얻어야 한다
-    let line1024 = log_file.read_lines(1024, 1, None).unwrap();
+    let line1024 = log_file.read_lines(1024, 1, None, None).unwrap();
     assert_eq!(line1024.len(), 1);
     assert_eq!(line1024[0].no, 1024);
     assert_eq!(line1024[0].text, "rest-line");
@@ -1140,7 +1146,7 @@ fn test_refresh_checkpoint_boundary_and_bulk_append() {
         if idx >= total {
             continue;
         }
-        let lines = log_file.read_lines(idx, 1, None).unwrap();
+        let lines = log_file.read_lines(idx, 1, None, None).unwrap();
         assert_eq!(lines.len(), 1, "줄 {} 읽기 실패", idx);
         assert_eq!(lines[0].no, idx);
         let expected = if idx < 1023 {
@@ -1196,11 +1202,11 @@ fn test_refresh_truncated_and_safe_reads() {
     assert_eq!(log_file.refresh().unwrap(), RefreshOutcome::Truncated);
 
     // truncate 이후 모든 읽기 API가 패닉 없이 반환해야 한다
-    let lines = log_file.read_lines(0, 10, None).unwrap();
+    let lines = log_file.read_lines(0, 10, None, None).unwrap();
     assert_eq!(lines.len(), 4); // 인덱스는 이전 줄 수를 유지
     assert!(lines.iter().all(|l| l.text.is_empty()));
 
-    let at_lines = log_file.read_lines_at(&[0, 1, 2, 3], None).unwrap();
+    let at_lines = log_file.read_lines_at(&[0, 1, 2, 3], None, None).unwrap();
     assert_eq!(at_lines.len(), 4);
 
     // 인덱스 조회 함수들도 패닉 없어야 한다
@@ -1249,7 +1255,7 @@ fn test_refresh_on_initially_empty_file() {
         }
     ));
 
-    let lines = log_file.read_lines(0, 10, None).unwrap();
+    let lines = log_file.read_lines(0, 10, None, None).unwrap();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].text, "first");
     assert_eq!(lines[1].text, "second");
@@ -1607,7 +1613,7 @@ fn test_line_crlf_boundary_not_truncated() {
     let cancel = AtomicBool::new(false);
     f.build_index(&cancel, &mut |_| {}).unwrap();
 
-    let lines = f.read_lines(0, 1, None).unwrap();
+    let lines = f.read_lines(0, 1, None, None).unwrap();
     assert_eq!(lines.len(), 1);
     assert!(!lines[0].truncated, "16KB+\\r 줄이 잘림으로 표시됨");
     assert_eq!(lines[0].byte_len, (MAX_DISPLAY_BYTES + 1) as u64);
@@ -1627,8 +1633,598 @@ fn test_line_start_cache_consistency() {
     let cancel = AtomicBool::new(false);
     f.build_index(&cancel, &mut |_| {}).unwrap();
 
-    let first = f.read_lines(1, 10, None).unwrap();
-    let second = f.read_lines(1, 10, None).unwrap();
+    let first = f.read_lines(1, 10, None, None).unwrap();
+    let second = f.read_lines(1, 10, None, None).unwrap();
     assert_eq!(first, second);
     assert_eq!(first[0].text, "normal line 0");
+}
+
+// ===== Phase 10: 다중 필터 스캔 테스트 =====
+
+use crate::filter::{Combine, FilterRule, FilterSet, FilterSpec, Level, RuleKind};
+use crate::search::{
+    ScanJudge, filter_lines_range, filter_scan, scan_with_config, search_filtered,
+};
+
+/// 필터 규칙 헬퍼
+fn frule(pattern: &str, kind: RuleKind) -> FilterRule {
+    FilterRule {
+        pattern: pattern.to_string(),
+        options: SearchOptions {
+            regex: false,
+            case_sensitive: true,
+        },
+        kind,
+        enabled: true,
+    }
+}
+
+fn fregex(pattern: &str, kind: RuleKind) -> FilterRule {
+    FilterRule {
+        options: SearchOptions {
+            regex: true,
+            case_sensitive: true,
+        },
+        ..frule(pattern, kind)
+    }
+}
+
+fn make_filter_set(rules: Vec<FilterRule>, combine: Combine, levels: Vec<Level>) -> FilterSet {
+    FilterSet::new(&FilterSpec {
+        rules,
+        combine,
+        levels,
+    })
+    .expect("FilterSet 생성 실패")
+}
+
+/// 순진한 줄 단위 필터 참조 구현: content를 줄로 나눠 passes를 적용한다.
+/// 반환: 통과한 줄 번호 목록 (0-based)
+fn naive_filter_lines(content: &[u8], set: &FilterSet) -> Vec<u64> {
+    let mut out = Vec::new();
+    if content.is_empty() {
+        return out;
+    }
+    let mut parts: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
+    if content.last() == Some(&b'\n') {
+        parts.pop();
+    }
+    for (i, raw) in parts.iter().enumerate() {
+        let line = if raw.last() == Some(&b'\r') {
+            &raw[..raw.len() - 1]
+        } else {
+            raw
+        };
+        if set.passes(line) {
+            out.push(i as u64);
+        }
+    }
+    out
+}
+
+/// 작은 세그먼트로 filter_scan을 실행해 (outcome, 매치 줄 번호) 반환
+fn run_filter_scan_seg(
+    content: &[u8],
+    set: &FilterSet,
+    segment_size: usize,
+) -> (SearchOutcome, Vec<u64>) {
+    let tmp = TempTestFile::new("fscan", content);
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    let cancel = AtomicBool::new(false);
+    let mut matched = Vec::new();
+    let outcome = scan_with_config(
+        &log_file,
+        &ScanJudge::Filter(set),
+        &cancel,
+        &mut |batch| matched.extend_from_slice(batch),
+        &mut |_| {},
+        SearchConfig {
+            segment_size,
+            max_results: usize::MAX,
+        },
+    )
+    .unwrap();
+    (outcome, matched)
+}
+
+/// 작은 세그먼트로 search_filtered를 실행해 (outcome, 매치 줄 번호) 반환
+fn run_search_filtered_seg(
+    content: &[u8],
+    pattern: &str,
+    regex: bool,
+    case_sensitive: bool,
+    set: Option<&FilterSet>,
+    segment_size: usize,
+) -> (SearchOutcome, Vec<u64>) {
+    let tmp = TempTestFile::new("sfscan", content);
+    let log_file = LogFile::open(tmp.path()).expect("open 실패");
+    let matcher = Matcher::new(
+        pattern,
+        SearchOptions {
+            regex,
+            case_sensitive,
+        },
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut matched = Vec::new();
+    let judge = match set {
+        Some(f) if !f.is_empty() => ScanJudge::SearchFilter(&matcher, f),
+        _ => ScanJudge::Search(&matcher),
+    };
+    let outcome = scan_with_config(
+        &log_file,
+        &judge,
+        &cancel,
+        &mut |batch| matched.extend_from_slice(batch),
+        &mut |_| {},
+        SearchConfig {
+            segment_size,
+            max_results: crate::search::MAX_RESULTS,
+        },
+    )
+    .unwrap();
+    (outcome, matched)
+}
+
+/// 검색 매치 ∧ 필터 통과의 순진한 참조 구현
+fn naive_search_filtered(content: &[u8], matcher: &Matcher, set: &FilterSet) -> Vec<u64> {
+    let mut out = Vec::new();
+    if content.is_empty() {
+        return out;
+    }
+    let mut parts: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
+    if content.last() == Some(&b'\n') {
+        parts.pop();
+    }
+    for (i, raw) in parts.iter().enumerate() {
+        let line = if raw.last() == Some(&b'\r') {
+            &raw[..raw.len() - 1]
+        } else {
+            raw
+        };
+        if matcher.line_has_match(line) && set.passes(line) {
+            out.push(i as u64);
+        }
+    }
+    out
+}
+
+/// 필터 테스트용 혼합 콘텐츠 생성
+fn filter_test_content() -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend_from_slice(b"2024-01-01 ERROR disk full\n");
+    c.extend_from_slice(b"2024-01-01 WARN retry soon\n");
+    c.extend_from_slice(b"2024-01-01 INFO all good\n");
+    c.extend_from_slice(b"heartbeat ping\n");
+    c.extend_from_slice("결제 승인 APPROVED 사용자 user_42\n".as_bytes());
+    c.extend_from_slice(b"\n"); // 빈 줄
+    c.extend_from_slice(b"no level token here\n");
+    c.extend_from_slice("2024-01-01 ERROR 결제 실패\r\n".as_bytes()); // CRLF
+    c.extend_from_slice(b"FATAL crash dump\n");
+    c.extend_from_slice(b"plain tail no newline");
+    c
+}
+
+#[test]
+fn test_filter_scan_matches_naive() {
+    let content = filter_test_content();
+    let specs: Vec<FilterSet> = vec![
+        // OR 포함
+        make_filter_set(
+            vec![
+                frule("ERROR", RuleKind::Include),
+                frule("WARN", RuleKind::Include),
+            ],
+            Combine::Or,
+            vec![],
+        ),
+        // AND 포함
+        make_filter_set(
+            vec![
+                frule("결제", RuleKind::Include),
+                frule("APPROVED", RuleKind::Include),
+            ],
+            Combine::And,
+            vec![],
+        ),
+        // 제외
+        make_filter_set(
+            vec![frule("heartbeat", RuleKind::Exclude)],
+            Combine::Or,
+            vec![],
+        ),
+        // 레벨
+        make_filter_set(vec![], Combine::Or, vec![Level::Error, Level::Warn]),
+        // 포함+제외+레벨 조합
+        make_filter_set(
+            vec![
+                frule("ERROR", RuleKind::Include),
+                frule("retry", RuleKind::Exclude),
+            ],
+            Combine::Or,
+            vec![Level::Error],
+        ),
+        // 정규식 규칙
+        make_filter_set(
+            vec![fregex(r"user_\d+", RuleKind::Include)],
+            Combine::Or,
+            vec![],
+        ),
+        // 켜진 규칙 없음 → 모든 줄 통과
+        make_filter_set(vec![], Combine::Or, vec![]),
+    ];
+
+    for (i, set) in specs.iter().enumerate() {
+        let expected = naive_filter_lines(&content, set);
+        for &seg in &[37usize, 256, 4096] {
+            let (outcome, lines) = run_filter_scan_seg(&content, set, seg);
+            assert_eq!(
+                outcome,
+                SearchOutcome::Completed {
+                    total: expected.len() as u64
+                },
+                "spec {} seg {}",
+                i,
+                seg
+            );
+            assert_eq!(lines, expected, "spec {} seg {}", i, seg);
+        }
+    }
+}
+
+#[test]
+fn test_filter_scan_random_specs() {
+    // 난수로 규칙 조합을 만들어 순진 구현과 비교 (다수 반복)
+    let mut content = Vec::new();
+    let mut rng: u64 = 0xdead_beef_cafe_f00d;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let pool = [
+        "ERROR",
+        "WARN",
+        "INFO",
+        "결제",
+        "APPROVED",
+        "heartbeat",
+        "user_",
+        "status=",
+        "DEBUG",
+        "TRACE",
+    ];
+    let levels = [
+        Level::Error,
+        Level::Warn,
+        Level::Info,
+        Level::Debug,
+        Level::Trace,
+    ];
+
+    // 다양한 줄 생성
+    for i in 0..3000 {
+        let pick = next() % 10;
+        match pick {
+            0 => content.extend_from_slice(format!("2024 INFO normal {}\n", i).as_bytes()),
+            1 => content.extend_from_slice(format!("ERROR fail {}\n", i).as_bytes()),
+            2 => content.extend_from_slice(format!("WARN caution {}\n", i).as_bytes()),
+            3 => content.extend_from_slice(format!("결제 APPROVED {}\n", i).as_bytes()),
+            4 => content.extend_from_slice(format!("heartbeat {}\n", i).as_bytes()),
+            5 => content.extend_from_slice(format!("user_{} login\n", i % 50).as_bytes()),
+            6 => content.extend_from_slice(b"\n"),
+            7 => content.extend_from_slice(format!("DEBUG trace {}\r\n", i).as_bytes()),
+            8 => content.extend_from_slice(format!("status={} code\n", 200 + i % 500).as_bytes()),
+            _ => content.extend_from_slice(format!("no token plain {}\n", i).as_bytes()),
+        }
+    }
+    content.extend_from_slice(b"last line no newline");
+
+    for round in 0..30 {
+        // 규칙 0~4개 생성
+        let n_rules = (next() % 5) as usize;
+        let mut rules = Vec::new();
+        for _ in 0..n_rules {
+            let pat = pool[(next() as usize) % pool.len()];
+            let kind = if next() % 2 == 0 {
+                RuleKind::Include
+            } else {
+                RuleKind::Exclude
+            };
+            let mut r = if next() % 4 == 0 {
+                fregex(pat, kind)
+            } else {
+                frule(pat, kind)
+            };
+            if next() % 8 == 0 {
+                r.enabled = false;
+            }
+            if next() % 5 == 0 {
+                r.options.case_sensitive = false;
+            }
+            rules.push(r);
+        }
+        let combine = if next() % 2 == 0 {
+            Combine::Or
+        } else {
+            Combine::And
+        };
+        let n_levels = (next() % 6) as usize;
+        let mut lvls: Vec<Level> = (0..n_levels)
+            .map(|_| levels[(next() as usize) % levels.len()])
+            .collect();
+        lvls.sort_by_key(|l| *l as u8);
+        lvls.dedup();
+        let set = make_filter_set(rules, combine, lvls);
+
+        let expected = naive_filter_lines(&content, &set);
+        let (outcome, lines) = run_filter_scan_seg(&content, &set, 512);
+        assert_eq!(
+            outcome,
+            SearchOutcome::Completed {
+                total: expected.len() as u64
+            },
+            "round {}",
+            round
+        );
+        assert_eq!(lines, expected, "round {}", round);
+    }
+}
+
+#[test]
+fn test_filter_scan_giant_line() {
+    // 세그먼트(256B)보다 훨씬 긴 단일 줄 → 스트리밍 경로 검증
+    let mut content = Vec::new();
+    content.extend_from_slice(b"before ERROR\n");
+    // 5000바이트 무개행 줄: 중간에 패턴, 끝에 \r
+    let mut giant = vec![b'g'; 5000];
+    giant[100..105].copy_from_slice(b"ERROR");
+    giant[4990..4995].copy_from_slice(b"WARN!");
+    content.extend_from_slice(&giant);
+    content.extend_from_slice(b"\r\n");
+    content.extend_from_slice(b"after line\n");
+    // 파일 끝의 개행 없는 긴 줄
+    content.extend_from_slice(&vec![b'h'; 3000]);
+    content.extend_from_slice(b"TAILMATCH");
+
+    let set = make_filter_set(vec![frule("ERROR", RuleKind::Include)], Combine::Or, vec![]);
+    let expected = naive_filter_lines(&content, &set);
+    assert_eq!(expected, vec![0, 1]); // before, giant
+
+    let (outcome, lines) = run_filter_scan_seg(&content, &set, 256);
+    assert_eq!(outcome, SearchOutcome::Completed { total: 2 });
+    assert_eq!(lines, expected);
+
+    // 거대 줄 + 제외: giant는 ERROR를 포함하지만 heartbeat도 없으므로 통과
+    let set2 = make_filter_set(
+        vec![
+            frule("ERROR", RuleKind::Include),
+            frule("after", RuleKind::Exclude),
+        ],
+        Combine::Or,
+        vec![],
+    );
+    let expected2 = naive_filter_lines(&content, &set2);
+    assert_eq!(expected2, vec![0, 1]);
+    let (_, lines2) = run_filter_scan_seg(&content, &set2, 256);
+    assert_eq!(lines2, expected2);
+
+    // TAILMATCH 포함 규칙 → 마지막 거대 줄만 매치
+    let set3 = make_filter_set(
+        vec![frule("TAILMATCH", RuleKind::Include)],
+        Combine::Or,
+        vec![],
+    );
+    let expected3 = naive_filter_lines(&content, &set3);
+    assert_eq!(expected3.len(), 1);
+    let (_, lines3) = run_filter_scan_seg(&content, &set3, 256);
+    assert_eq!(lines3, expected3);
+}
+
+#[test]
+fn test_filter_scan_empty_and_cancel() {
+    // 빈 파일 (공개 API filter_scan 사용)
+    let set = make_filter_set(vec![frule("x", RuleKind::Include)], Combine::Or, vec![]);
+    let tmp = TempTestFile::new("fscan_empty", b"");
+    let log_file = LogFile::open(tmp.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut matched = Vec::new();
+    let outcome = filter_scan(
+        &log_file,
+        &set,
+        &cancel,
+        &mut |batch| matched.extend_from_slice(batch),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(outcome, SearchOutcome::Completed { total: 0 });
+    assert!(matched.is_empty());
+
+    // 취소
+    let content = filter_test_content();
+    let tmp = TempTestFile::new("fscan_cancel", &content);
+    let log_file = LogFile::open(tmp.path()).unwrap();
+    let cancel = AtomicBool::new(true);
+    let mut matched = Vec::new();
+    let outcome = scan_with_config(
+        &log_file,
+        &ScanJudge::Filter(&set),
+        &cancel,
+        &mut |batch| matched.extend_from_slice(batch),
+        &mut |_| {},
+        SearchConfig {
+            segment_size: 37,
+            max_results: usize::MAX,
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, SearchOutcome::Cancelled);
+}
+
+#[test]
+fn test_search_filtered_intersection() {
+    let content = filter_test_content();
+    let set = make_filter_set(vec![frule("ERROR", RuleKind::Include)], Combine::Or, vec![]);
+    let matcher = Matcher::new(
+        "결제",
+        SearchOptions {
+            regex: false,
+            case_sensitive: true,
+        },
+    )
+    .unwrap();
+
+    // 검색 "결제" ∧ 필터 "ERROR 포함" → ERROR+결제 줄만
+    let (outcome, lines) = run_search_filtered_seg(&content, "결제", false, true, Some(&set), 64);
+    let expected = naive_search_filtered(&content, &matcher, &set);
+    assert_eq!(expected, vec![7]); // "2024-01-01 ERROR 결제 실패\r\n" 줄
+    assert_eq!(lines, expected);
+    assert_eq!(
+        outcome,
+        SearchOutcome::Completed {
+            total: expected.len() as u64
+        }
+    );
+
+    // 공개 API search_filtered도 동일 결과여야 한다
+    let tmp = TempTestFile::new("sfscan_pub", &content);
+    let log_file = LogFile::open(tmp.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut pub_lines = Vec::new();
+    let pub_outcome = search_filtered(
+        &log_file,
+        &matcher,
+        Some(&set),
+        &cancel,
+        &mut |batch| pub_lines.extend_from_slice(batch),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(pub_lines, expected);
+    assert_eq!(
+        pub_outcome,
+        SearchOutcome::Completed {
+            total: expected.len() as u64
+        }
+    );
+
+    // filter=None → 일반 검색과 동일
+    let (outcome2, lines2) = run_search_filtered_seg(&content, "결제", false, true, None, 64);
+    let expected2 = naive_search_filtered(
+        &content,
+        &matcher,
+        &make_filter_set(vec![], Combine::Or, vec![]),
+    );
+    assert_eq!(lines2, expected2);
+    let _ = outcome2;
+
+    // 빈 필터 → 검색과 동일
+    let empty_set = make_filter_set(vec![], Combine::Or, vec![]);
+    let (_, lines3) = run_search_filtered_seg(&content, "결제", false, true, Some(&empty_set), 64);
+    assert_eq!(lines3, lines2);
+}
+
+#[test]
+fn test_filter_lines_range() {
+    let content = filter_test_content();
+    let (_tmp, f) = indexed_file("flines_range", &content);
+    let set = make_filter_set(
+        vec![
+            frule("ERROR", RuleKind::Include),
+            frule("WARN", RuleKind::Include),
+        ],
+        Combine::Or,
+        vec![],
+    );
+
+    // 전체 범위 = naive와 동일
+    let mut got = Vec::new();
+    filter_lines_range(&f, &set, 0, u64::MAX, &mut |b| got.extend_from_slice(b)).unwrap();
+    assert_eq!(got, naive_filter_lines(&content, &set));
+
+    // 부분 범위
+    let mut got = Vec::new();
+    filter_lines_range(&f, &set, 2, 8, &mut |b| got.extend_from_slice(b)).unwrap();
+    let expected: Vec<u64> = naive_filter_lines(&content, &set)
+        .into_iter()
+        .filter(|&l| (2..8).contains(&l))
+        .collect();
+    assert_eq!(got, expected);
+
+    // 범위 밖 / 역전 범위 → 빈 결과
+    let mut got = Vec::new();
+    filter_lines_range(&f, &set, 100, 200, &mut |b| got.extend_from_slice(b)).unwrap();
+    assert!(got.is_empty());
+    filter_lines_range(&f, &set, 5, 5, &mut |b| got.extend_from_slice(b)).unwrap();
+    assert!(got.is_empty());
+}
+
+#[test]
+fn test_read_lines_rule_highlights() {
+    // 규칙별 하이라이트: UTF-16 범위 + spec.rules 인덱스
+    let content = "ERROR foo 한글\nplain line\nWARN bar\n".as_bytes();
+    let tmp = TempTestFile::new("rule_hl", content);
+    let f = LogFile::open(tmp.path()).unwrap();
+    build_index(&f);
+
+    let set = make_filter_set(
+        vec![
+            frule("ERROR", RuleKind::Include), // idx 0
+            frule("foo", RuleKind::Include),   // idx 1
+            frule("bar", RuleKind::Exclude),   // idx 2 (제외 → 하이라이트 없음)
+        ],
+        Combine::Or,
+        vec![],
+    );
+
+    let lines = f.read_lines(0, 3, None, Some(&set)).unwrap();
+    assert_eq!(lines.len(), 3);
+
+    // 줄0 "ERROR foo 한글": ERROR(0,5,idx0), foo(6,9,idx1)
+    let hl0 = &lines[0].rule_highlights;
+    assert!(hl0.contains(&(0, 5, 0)), "hl0: {:?}", hl0);
+    assert!(hl0.contains(&(6, 9, 1)), "hl0: {:?}", hl0);
+    assert_eq!(hl0.len(), 2);
+
+    // 줄1 "plain line": 매치 없음
+    assert!(lines[1].rule_highlights.is_empty());
+
+    // 줄2 "WARN bar": bar는 제외 규칙이라 하이라이트 없음
+    assert!(lines[2].rule_highlights.is_empty());
+
+    // filter=None → rule_highlights 빈 Vec
+    let lines_nf = f.read_lines(0, 1, None, None).unwrap();
+    assert!(lines_nf[0].rule_highlights.is_empty());
+
+    // 한글이 포함된 매치의 UTF-16 변환 확인:
+    // "한글 ERROR" → ERROR는 UTF-16 인덱스 3부터 (한=1, 글=1, 공백=1)
+    let content2 = "한글 ERROR 끝".as_bytes();
+    let tmp2 = TempTestFile::new("rule_hl2", content2);
+    let f2 = LogFile::open(tmp2.path()).unwrap();
+    build_index(&f2);
+    let set2 = make_filter_set(vec![frule("ERROR", RuleKind::Include)], Combine::Or, vec![]);
+    let l2 = f2.read_lines(0, 1, None, Some(&set2)).unwrap();
+    assert_eq!(l2[0].rule_highlights, vec![(3, 8, 0)]);
+}
+
+#[test]
+fn test_read_lines_at_rule_highlights() {
+    let content = "aaa ERROR bbb\nccc\nddd WARN eee\n".as_bytes();
+    let tmp = TempTestFile::new("rule_hl_at", content);
+    let f = LogFile::open(tmp.path()).unwrap();
+    build_index(&f);
+    let set = make_filter_set(
+        vec![
+            frule("ERROR", RuleKind::Include),
+            frule("WARN", RuleKind::Include),
+        ],
+        Combine::Or,
+        vec![],
+    );
+    let lines = f.read_lines_at(&[0, 2], None, Some(&set)).unwrap();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].rule_highlights.contains(&(4, 9, 0)));
+    assert!(lines[1].rule_highlights.contains(&(4, 8, 1)));
 }

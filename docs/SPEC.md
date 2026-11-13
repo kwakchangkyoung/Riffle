@@ -114,7 +114,23 @@ pub struct Line {
 - 결과 건수 상한(예: 1,000만 건)을 두고, 넘으면 중단하고 "결과가 너무 많음" 상태를 반환한다.
 - 하이라이트: `read_lines`에 검색어가 주어지면 각 줄의 매치 범위를 함께 반환한다. **범위는 JS 문자열 인덱스와 맞도록 UTF-16 코드 유닛 기준으로 변환해서** 반환한다 (바이트 오프셋을 그대로 넘기면 한글에서 위치가 어긋난다).
 
-### 3.5 테스트 필수 케이스
+### 3.5 다중 필터 (Phase 10)
+
+필터는 "어떤 줄을 보여줄지"를 결정하고, 검색은 "보이는 줄 안에서만 찾기"(교집합은 Rust에서 계산)로 두 기능을 분리한다.
+
+- 보이는 줄 = `level_ok ∧ include_ok ∧ ¬exclude_any`.
+  - `level_ok`: 레벨 조건이 비어있지 않고 전체(5개)가 아닐 때만 적용. 줄의 레벨은 줄 앞 200바이트에서 정규식 `\b(ERROR|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE)\b` 첫 매치로 판정하고 `FATAL→ERROR`, `WARNING→WARN`으로 정규화한다. 레벨 토큰이 없는 줄은 레벨 조건 적용 시 제외된다.
+  - `include_ok`: 켜진 포함 규칙이 없으면 true. `combine=Or`이면 하나라도 매치, `And`이면 모두 매치.
+  - `exclude_any`: 켜진 제외 규칙 중 하나라도 매치하면 불통과.
+- 매치 판정은 3.4와 같은 줄 단위 의미(줄 텍스트 = `\n` 제외, 끝 `\r` 제거)를 쓰고, 빈 매치는 매치로 치지 않는다. 켜진 규칙이 하나도 없고 레벨 조건도 없으면 "필터 없음"으로 취급한다(프론트는 `start_filter`를 호출하지 않는다).
+- `FilterSet`은 켜진 규칙만 컴파일한다. 제외 규칙 판정은 줄마다 `Matcher`를 여러 번 돌리지 않고 `regex::bytes::RegexSet` 한 번으로 처리해 줄당 할당 없이 판정한다.
+- 스캔 결과(보이는 줄 번호)는 `LineSet`(정렬·서로소 반열린 구간 목록 + 누적 개수)에 보관해 대량 결과를 압축한다. 구간 수가 `MAX_FILTER_RANGES`(1,000만)를 넘으면 `capped`로 중단한다.
+- `LineSet` 연산: `push_line`(오름차순 추가, 인접 병합), `remove_line`(tail 재판정용), `contains`, `nth`(index→줄 번호), `rank`(줄 번호→index, 스크롤 위치 유지용), `len`, `range_count`.
+- 규칙별 하이라이트: `read_lines`/`read_lines_at`에 `FilterSet`을 넘기면 각 줄의 `rule_highlights`에 `(UTF-16 start, end, spec.rules 인덱스)` 목록이 채워진다. 제외·비활성 규칙은 대상이 아니다.
+- tail 연동: `Appended` 시 `old_line_count - 1` 줄부터 `new_line_count`까지를 `filter_lines_range`로 재판정한다(이전 마지막 줄은 이어쓰여 내용이 바뀌었을 수 있으므로 `LineSet`에서 먼저 제거). `TailEvent::Appended`의 `filter_count`로 프론트가 필터 보기 줄 수를 갱신한다.
+- 프리셋: `app_data_dir/filter-presets.json`에 이름+조건을 원자적 저장한다(recent.json과 같은 방식). 같은 이름은 덮어쓰고, 파일이 없거나 깨져 있으면 빈 목록으로 처리한다.
+
+### 3.6 테스트 필수 케이스
 
 빈 파일, 개행 없는 마지막 줄, CRLF, 개행만 있는 파일, 16KB를 넘는 단일 줄, 잘못된 UTF-8 바이트, 청크 경계에 정확히 걸치는 줄, 청크 경계에 걸치는 검색 매치, 한글이 포함된 줄의 하이라이트 범위, K의 배수 번째 줄.
 
@@ -122,18 +138,31 @@ pub struct Line {
 
 모든 커맨드는 `Result<T, String>` 형태로 직렬화 가능한 에러를 반환한다.
 
-| 커맨드          | 입력                                                        | 출력                          | 비고                                           |
-| --------------- | ----------------------------------------------------------- | ----------------------------- | ---------------------------------------------- |
-| `open_file`     | `path`, `on_progress: Channel<IndexProgress>`               | `FileInfo { id, path, size }` | 인덱싱을 백그라운드로 시작하고 즉시 반환       |
-| `get_lines`     | `id`, `start`, `count`, `query?`                            | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000                               |
-| `search`        | `id`, `query`, `options`, `on_result: Channel<SearchEvent>` | `search_id`                   | 이전 검색 자동 취소                            |
-| `cancel_search` | `search_id`                                                 | `()`                          |                                                |
-| `copy_lines`    | `id`, `start`, `end`                                        | `()`                          | Rust에서 직접 클립보드에 기록 (대량 복사 대비) |
-| `close_file`    | `id`                                                        | `()`                          | 인덱싱/검색 취소 및 자원 해제                  |
+| 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
+| -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
+| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size }` | 인덱싱을 백그라운드로 시작하고 즉시 반환                |
+| `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`                                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용               |
+| `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
+| `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
+| `validate_filter`    | `spec`                                                                                                 | `()`                          | FilterSet 컴파일 가능 여부 (오류에 규칙 번호 포함)       |
+| `start_filter`       | `id`, `spec`, `on_event: Channel<SearchEvent>`                                                          | `filter_id`                   | 같은 파일의 이전 필터 자동 취소. 백그라운드 스캔         |
+| `cancel_filter`      | `filter_id`                                                                                            | `()`                          |                                                         |
+| `get_filter`         | `filter_id`                                                                                            | `FilterInfo`                  | 조건, 현재 줄 수, done/capped                            |
+| `get_filter_lines`   | `id`, `filter_id`, `start_index`, `count`, `query?`, `spec?`                                            | `Vec<Line>`                   | 필터 결과 목록의 [start_index, +count) 줄. count ≤ 1,000 |
+| `filter_index_of`    | `filter_id`, `line`                                                                                    | `u64`                         | line 이상인 첫 보이는 줄의 index (스크롤 위치 유지)      |
+| `filter_density`     | `filter_id`, `bins`, `total_lines`                                                                     | `Vec<u32>`                    | 스크롤바 마커용 밀도                                     |
+| `list_filter_presets`| -                                                                                                      | `Vec<FilterPreset>`           | 이름순                                                  |
+| `save_filter_preset` | `name`, `spec`                                                                                         | `()`                          | 같은 이름 덮어쓰기. 유효하지 않은 spec은 거부            |
+| `delete_filter_preset`| `name`                                                                                                | `()`                          | 없으면 에러                                              |
+| `copy_lines`         | `id`, `start`, `end`                                                                                   | `()`                          | Rust에서 직접 클립보드에 기록 (대량 복사 대비)            |
+| `close_file`         | `id`                                                                                                   | `()`                          | 인덱싱/검색/필터 취소 및 자원 해제                       |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
-- `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나.
-- (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(필터 모드), `validate_query`로 필요한 만큼만 조회한다.
+- `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나. `start_filter`도 같은 이벤트 형식을 쓴다.
+- `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다.
+- `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다.
+- `TailEvent::Appended`에는 `filterCount`(활성 필터의 보이는 줄 수, 없으면 null)가 추가된다.
+- (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(검색 필터 모드), `validate_query`로 필요한 만큼만 조회한다. 다중 필터의 보이는 줄도 `LineSet`으로 Rust에만 보관하고 `get_filter_lines`/`filter_index_of`/`filter_density`로 필요한 만큼만 조회한다.
 - 열린 파일은 `State<AppState>` 안의 `HashMap<FileId, Arc<LogFile>>`로 관리한다.
 - `capabilities/default.json`에는 실제로 쓰는 권한(dialog, clipboard 등)만 최소로 허용한다.
 - 프론트엔드 `lib/ipc.ts`의 타입은 Rust 타입과 1:1로 맞춘다. 가능하면 `specta`/`tauri-specta`로 TS 타입을 자동 생성하는 방안을 Phase 2에서 검토하고, 도입 여부는 승인받는다.

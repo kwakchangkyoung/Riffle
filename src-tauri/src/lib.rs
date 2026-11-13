@@ -4,6 +4,7 @@ pub mod commands;
 pub mod menu;
 #[cfg(target_os = "macos")]
 pub mod opened;
+pub mod presets;
 pub mod recent;
 pub mod settings;
 pub mod state;
@@ -12,9 +13,10 @@ pub mod tail;
 mod testutil;
 
 use commands::{
-    cancel_search, close_file, copy_lines, get_filtered_lines, get_full_line, get_lines,
-    get_recent_files, open_file, search, search_density, search_hit_at, search_nav,
-    take_pending_open, validate_query,
+    cancel_filter, cancel_search, close_file, copy_lines, delete_filter_preset, filter_density,
+    filter_index_of, get_filter, get_filter_lines, get_filtered_lines, get_full_line, get_lines,
+    get_recent_files, list_filter_presets, open_file, save_filter_preset, search, search_density,
+    search_hit_at, search_nav, start_filter, take_pending_open, validate_filter, validate_query,
 };
 use settings::{get_settings, set_auto_check_updates};
 use state::AppState;
@@ -46,7 +48,17 @@ pub fn run() {
             get_recent_files,
             take_pending_open,
             get_settings,
-            set_auto_check_updates
+            set_auto_check_updates,
+            validate_filter,
+            start_filter,
+            cancel_filter,
+            get_filter,
+            get_filter_lines,
+            filter_index_of,
+            filter_density,
+            list_filter_presets,
+            save_filter_preset,
+            delete_filter_preset
         ])
         .setup(|app| {
             // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)

@@ -1,6 +1,8 @@
 import {
     getFilteredLines,
+    getFilterLines,
     getLines,
+    type FilterSpec,
     type Line,
     type QueryOptions,
 } from "./ipc";
@@ -23,17 +25,26 @@ interface CachedBlock {
     seq: number;
 }
 
+/** 줄 데이터를 가져오는 소스 종류 */
+type CacheSource =
+    | { kind: "normal" }
+    | { kind: "search"; searchId: number }
+    | { kind: "filter"; filterId: number };
+
 /**
  * 줄 단위 LRU 캐시 및 프리페치 관리 클래스.
- * 일반 모드와 필터 모드(검색 결과 매치 줄)를 모두 지원합니다.
+ * 일반 모드, 필터 모드(검색 결과 매치 줄), 다중 필터 모드(필터 통과 줄)를 지원합니다.
  */
 export class LineCache {
     private fileId: number | null = null;
-    private searchId: number | null = null;
-    private isFiltered = false;
+    private source: CacheSource = { kind: "normal" };
     private query: QueryOptions | null = null;
+    /** 규칙 하이라이트 계산용 필터 스펙 (get_*의 spec 인자) */
+    private ruleSpec: FilterSpec | null = null;
     private lineCount = 0;
     private isDone = false;
+    /** true면 새 블록 요청을 보류한다 (캐시된 줄 표시는 유지) */
+    private suspended = false;
     private blocks = new Map<number, CachedBlock>();
     // blockIndex -> 요청 토큰. 토큰이 바뀌면 진행 중이던 이전 요청 결과는 폐기한다
     private pending = new Map<number, number>();
@@ -78,13 +89,14 @@ export class LineCache {
      */
     public setFile(fileId: number | null): void {
         // 이미 분리된 상태에서 다시 분리 요청이 오면 아무것도 하지 않는다
-        if (fileId === null && this.fileId === null && !this.isFiltered) {
+        if (fileId === null && this.fileId === null) {
             return;
         }
         this.fileId = fileId;
-        this.searchId = null;
-        this.isFiltered = false;
+        this.source = { kind: "normal" };
         this.query = null;
+        this.ruleSpec = null;
+        this.suspended = false;
         this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
@@ -119,7 +131,37 @@ export class LineCache {
     }
 
     /**
-     * 필터 모드 데이터 소스를 설정하고 가시 범위를 즉시 재요청합니다.
+     * 규칙 하이라이트용 필터 스펙을 변경합니다.
+     * 하이라이트 범위가 바뀌므로 캐시된 블록은 stale로 표시하고 보이는 범위를 재요청합니다.
+     */
+    public setRuleSpec(spec: FilterSpec | null): void {
+        if (this.ruleSpec === spec) {
+            return;
+        }
+        this.ruleSpec = spec;
+        this.fetchSeq++;
+        this.attempts.clear();
+        this.failedBlocks.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 블록 요청을 일시정지/재개합니다.
+     * 정지 중에도 캐시된 줄은 계속 표시되지만 새 요청은 보내지 않습니다.
+     */
+    public setSuspended(suspended: boolean): void {
+        if (this.suspended === suspended) {
+            return;
+        }
+        this.suspended = suspended;
+        if (!suspended) {
+            this.refetchLastRange();
+        }
+    }
+
+    /**
+     * 필터 모드(검색 결과) 데이터 소스를 설정하고 가시 범위를 즉시 재요청합니다.
      * 필터 결과 인덱스 기준의 줄 매핑이 바뀌므로 캐시는 전부 비웁니다.
      */
     public setFilteredSource(
@@ -128,14 +170,45 @@ export class LineCache {
         query: QueryOptions | null,
     ): void {
         this.fileId = fileId;
-        this.searchId = searchId;
-        this.isFiltered = true;
+        this.source =
+            searchId === null
+                ? { kind: "normal" }
+                : { kind: "search", searchId };
         this.query = query;
         this.fetchSeq++;
         this.blocks.clear();
         this.pending.clear();
         this.attempts.clear();
         this.failedBlocks.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 다중 필터 모드 데이터 소스를 설정하고 가시 범위를 재요청합니다.
+     * preserveBlocks=true이면 기존 블록을 지우지 않고 stale로만 표시하여
+     * 새 필터 결과가 도착하는 동안 이전 줄들이 화면에 남게 합니다.
+     */
+    public setFilterSource(
+        fileId: number,
+        filterId: number,
+        query: QueryOptions | null,
+        spec: FilterSpec,
+        preserveBlocks = false,
+    ): void {
+        const fileChanged = fileId !== this.fileId;
+        this.fileId = fileId;
+        this.source = { kind: "filter", filterId };
+        this.query = query;
+        this.ruleSpec = spec;
+        this.suspended = false;
+        this.fetchSeq++;
+        this.pending.clear();
+        this.attempts.clear();
+        this.failedBlocks.clear();
+        if (fileChanged || !preserveBlocks) {
+            this.blocks.clear();
+        }
         this.refetchLastRange();
         this.notify();
     }
@@ -231,10 +304,7 @@ export class LineCache {
     public requestRange(startLine: number, endLine: number): void {
         this.lastRequestedRange = [startLine, endLine];
 
-        if (this.fileId === null) {
-            return;
-        }
-        if (this.isFiltered && this.searchId === null) {
+        if (this.fileId === null || this.suspended) {
             return;
         }
 
@@ -293,11 +363,7 @@ export class LineCache {
 
     private fetchBlock(blockIndex: number): void {
         const currentFileId = this.fileId;
-        if (currentFileId === null) {
-            return;
-        }
-        const currentSearchId = this.searchId;
-        if (this.isFiltered && currentSearchId === null) {
+        if (currentFileId === null || this.suspended) {
             return;
         }
         if (this.pending.has(blockIndex)) {
@@ -312,15 +378,31 @@ export class LineCache {
         const start = blockIndex * BLOCK_SIZE;
 
         const request =
-            this.isFiltered && currentSearchId !== null
+            this.source.kind === "search"
                 ? getFilteredLines(
                       currentFileId,
-                      currentSearchId,
+                      this.source.searchId,
                       start,
                       BLOCK_SIZE,
                       this.query,
+                      this.ruleSpec,
                   )
-                : getLines(currentFileId, start, BLOCK_SIZE, this.query);
+                : this.source.kind === "filter"
+                  ? getFilterLines(
+                        currentFileId,
+                        this.source.filterId,
+                        start,
+                        BLOCK_SIZE,
+                        this.query,
+                        this.ruleSpec,
+                    )
+                  : getLines(
+                        currentFileId,
+                        start,
+                        BLOCK_SIZE,
+                        this.query,
+                        this.ruleSpec,
+                    );
 
         request
             .then((lines) => {
@@ -407,10 +489,11 @@ export class LineCache {
     /**
      * 특정 줄이 속한 캐시 블록을 제거하고, 보이는 범위이면 즉시 재요청합니다.
      * tail 모드에서 개행 없이 끝나던 마지막 줄이 이어진 경우 내용이 바뀔 수 있어 사용합니다.
-     * 필터 모드(결과 인덱스 기준)에서는 지원하지 않습니다.
+     * 검색 결과 모드(결과 인덱스 기준)에서는 지원하지 않습니다.
+     * 다중 필터 모드에서는 인자가 필터 인덱스입니다.
      */
     public invalidateLine(lineNo: number): void {
-        if (this.fileId === null || this.isFiltered) {
+        if (this.fileId === null || this.source.kind === "search") {
             return;
         }
         const blockIndex = Math.floor(lineNo / BLOCK_SIZE);

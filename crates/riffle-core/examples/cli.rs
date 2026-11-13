@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use riffle_core::{LogFile, Matcher, RefreshOutcome, SearchOptions};
+use riffle_core::{
+    Combine, FilterRule, FilterSet, FilterSpec, Level, LogFile, Matcher, RefreshOutcome, RuleKind,
+    SearchOptions,
+};
 
 fn print_usage() {
     eprintln!("Riffle CLI - 파일 인덱싱 및 읽기/검색 검증 도구 (.gz 자동 판별)\n");
@@ -16,6 +19,9 @@ fn print_usage() {
     eprintln!("    cli <파일경로> lines <start> <count>");
     eprintln!("    cli <파일경로> open");
     eprintln!("    cli <파일경로> search <query> [--regex] [--ignore-case]");
+    eprintln!(
+        "    cli <파일경로> filter [--or|--and] [--inc PAT]... [--exc PAT]... [--level error,warn] [--regex] [--search Q]"
+    );
     eprintln!("    cli <파일경로> tail");
     eprintln!("    cli <파일경로> copy <start> <end>\n");
     eprintln!("서브커맨드:");
@@ -27,6 +33,12 @@ fn print_usage() {
     eprintln!("                       옵션: --regex --ignore-case --count-only(줄 출력 생략)");
     eprintln!(
         "    tail                 인덱싱 후 200ms마다 refresh하여 추가분/로테이션 출력 (Ctrl+C까지)"
+    );
+    eprintln!(
+        "    filter [opts]        다중 필터 보이는 줄 수 출력 (--search 지정 시 교집합 수도 출력)"
+    );
+    eprintln!(
+        "                       --inc/--exc 반복 지정, --level 콤마 구분, --regex는 규칙·검색 공통"
     );
     eprintln!("    copy <start> <end>   [start, end] 줄 범위 원문을 stdout으로 출력 (0-based)");
 }
@@ -88,6 +100,7 @@ fn main() {
             };
             run_search(file_path, query, options, count_only);
         }
+        "filter" => run_filter(file_path, &args[3..]),
         "tail" => run_tail(file_path),
         "copy" => {
             if args.len() < 5 {
@@ -136,7 +149,7 @@ fn run_stats(path: &Path) {
     while log_file.index().line_count() == 0 && !log_file.index().progress().done {
         thread::yield_now();
     }
-    let _ = log_file.read_lines(0, 1, None);
+    let _ = log_file.read_lines(0, 1, None, None);
     let first_line_elapsed = t0.elapsed();
 
     // 인덱싱 완료 대기
@@ -167,24 +180,18 @@ fn run_stats(path: &Path) {
     );
 }
 
-/// stats 서브커맨드 (.gz): 스트리밍 해제+인덱싱 시간, 첫 줄까지 시간,
-/// 해제 속도, 최대 RSS를 측정한다. 최대 RSS는 ps로 50ms마다 샘플링한 최댓값이다.
-fn run_stats_gz(path: &Path) {
-    let t0 = Instant::now();
-
-    let (log_file, writer) = riffle_core::open_gzip(path).unwrap_or_else(|e| {
-        eprintln!("gzip 파일 열기 실패 ({}): {}", path.display(), e);
-        process::exit(1);
-    });
-    let log_file = Arc::new(log_file);
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    // 최대 RSS 샘플러: 50ms마다 ps로 현재 RSS(KB)를 읽어 최댓값을 기록한다
-    let stop_sample = Arc::new(AtomicBool::new(false));
-    let rss_peak_kb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+/// 최대 RSS 샘플러를 시작한다.
+/// 반환된 stop 플래그를 세우고 join하면 peak(KB)에 50ms 간격 ps 샘플의 최댓값이 기록된다.
+fn start_rss_sampler() -> (
+    Arc<AtomicBool>,
+    Arc<std::sync::atomic::AtomicU64>,
+    thread::JoinHandle<()>,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sampler = {
-        let stop = Arc::clone(&stop_sample);
-        let peak = Arc::clone(&rss_peak_kb);
+        let stop = Arc::clone(&stop);
+        let peak = Arc::clone(&peak);
         thread::spawn(move || {
             let pid = std::process::id().to_string();
             while !stop.load(Ordering::Relaxed) {
@@ -200,6 +207,22 @@ fn run_stats_gz(path: &Path) {
             }
         })
     };
+    (stop, peak, sampler)
+}
+
+/// stats 서브커맨드 (.gz): 스트리밍 해제+인덱싱 시간, 첫 줄까지 시간,
+/// 해제 속도, 최대 RSS를 측정한다. 최대 RSS는 ps로 50ms마다 샘플링한 최댓값이다.
+fn run_stats_gz(path: &Path) {
+    let t0 = Instant::now();
+
+    let (log_file, writer) = riffle_core::open_gzip(path).unwrap_or_else(|e| {
+        eprintln!("gzip 파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    });
+    let log_file = Arc::new(log_file);
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let (stop_sample, rss_peak_kb, sampler) = start_rss_sampler();
 
     let lf = Arc::clone(&log_file);
     let cancel_clone = Arc::clone(&cancel);
@@ -209,7 +232,7 @@ fn run_stats_gz(path: &Path) {
     while log_file.index().line_count() == 0 && !worker.is_finished() {
         thread::yield_now();
     }
-    let _ = log_file.read_lines(0, 1, None);
+    let _ = log_file.read_lines(0, 1, None, None);
     let first_line_elapsed = t0.elapsed();
 
     let run_result = worker.join().unwrap_or_else(|_| {
@@ -285,10 +308,12 @@ fn run_lines(path: &Path, start: u64, count: u64) {
         thread::sleep(Duration::from_millis(1));
     }
 
-    let lines = log_file.read_lines(start, count, None).unwrap_or_else(|e| {
-        eprintln!("줄 읽기 실패: {}", e);
-        process::exit(1);
-    });
+    let lines = log_file
+        .read_lines(start, count, None, None)
+        .unwrap_or_else(|e| {
+            eprintln!("줄 읽기 실패: {}", e);
+            process::exit(1);
+        });
 
     for line in lines {
         println!("{}", line.text);
@@ -319,10 +344,12 @@ fn run_lines_gz(path: &Path, start: u64, count: u64) {
         thread::sleep(Duration::from_millis(1));
     }
 
-    let lines = log_file.read_lines(start, count, None).unwrap_or_else(|e| {
-        eprintln!("줄 읽기 실패: {}", e);
-        process::exit(1);
-    });
+    let lines = log_file
+        .read_lines(start, count, None, None)
+        .unwrap_or_else(|e| {
+            eprintln!("줄 읽기 실패: {}", e);
+            process::exit(1);
+        });
 
     for line in lines {
         println!("{}", line.text);
@@ -351,7 +378,7 @@ fn run_open(path: &Path) {
         thread::yield_now();
     }
 
-    let lines = log_file.read_lines(0, 20, None).unwrap_or_else(|e| {
+    let lines = log_file.read_lines(0, 20, None, None).unwrap_or_else(|e| {
         eprintln!("줄 읽기 실패: {}", e);
         process::exit(1);
     });
@@ -434,6 +461,190 @@ fn run_search(path: &Path, query: &str, options: SearchOptions, count_only: bool
     if !count_only && !first_5_lines.is_empty() {
         println!("\n처음 5개 매치 줄 (1-based 줄 번호):");
         print_matching_lines(&log_file, &first_5_lines);
+    }
+}
+
+/// "error" 등 레벨 문자열을 Level로 변환한다.
+fn parse_level(s: &str) -> Option<Level> {
+    match s {
+        "error" => Some(Level::Error),
+        "warn" => Some(Level::Warn),
+        "info" => Some(Level::Info),
+        "debug" => Some(Level::Debug),
+        "trace" => Some(Level::Trace),
+        _ => None,
+    }
+}
+
+/// filter 서브커맨드: 다중 필터로 보이는 줄 수를 출력한다.
+/// --search가 주어지면 검색 매치 ∧ 필터 통과 교집합 수도 함께 출력한다.
+/// 각 단계의 시간과 최대 RSS(ps 50ms 샘플링)를 출력한다.
+fn run_filter(path: &Path, args: &[String]) {
+    let mut combine = Combine::Or;
+    let mut regex = false;
+    let mut incs: Vec<String> = Vec::new();
+    let mut excs: Vec<String> = Vec::new();
+    let mut levels: Vec<Level> = Vec::new();
+    let mut search_query: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let take_value = |i: &mut usize| -> String {
+            *i += 1;
+            if *i >= args.len() {
+                eprintln!("오류: '{}' 옵션에는 값이 필요합니다.", args[*i - 1]);
+                process::exit(1);
+            }
+            args[*i].clone()
+        };
+        match args[i].as_str() {
+            "--or" => combine = Combine::Or,
+            "--and" => combine = Combine::And,
+            "--regex" => regex = true,
+            "--inc" => incs.push(take_value(&mut i)),
+            "--exc" => excs.push(take_value(&mut i)),
+            "--level" => {
+                let v = take_value(&mut i);
+                for name in v.split(',') {
+                    match parse_level(name.trim()) {
+                        Some(l) => levels.push(l),
+                        None => {
+                            eprintln!(
+                                "오류: 알 수 없는 레벨 '{}' (--level은 error,warn,info,debug,trace)",
+                                name.trim()
+                            );
+                            process::exit(1);
+                        }
+                    }
+                }
+            }
+            "--search" => search_query = Some(take_value(&mut i)),
+            other => eprintln!("경고: 알 수 없는 옵션 '{}'", other),
+        }
+        i += 1;
+    }
+
+    if incs.is_empty() && excs.is_empty() && levels.is_empty() {
+        eprintln!("오류: 필터 조건이 없습니다 (--inc/--exc/--level 중 하나 이상 필요)");
+        process::exit(1);
+    }
+
+    let options = SearchOptions {
+        regex,
+        case_sensitive: true,
+    };
+    let mut rules = Vec::new();
+    for p in incs {
+        rules.push(FilterRule {
+            pattern: p,
+            options,
+            kind: RuleKind::Include,
+            enabled: true,
+        });
+    }
+    for p in excs {
+        rules.push(FilterRule {
+            pattern: p,
+            options,
+            kind: RuleKind::Exclude,
+            enabled: true,
+        });
+    }
+    let spec = FilterSpec {
+        rules,
+        combine,
+        levels,
+    };
+    let set = FilterSet::new(&spec).unwrap_or_else(|e| {
+        eprintln!("필터 컴파일 실패: {}", e);
+        process::exit(1);
+    });
+    if set.is_empty() {
+        eprintln!("오류: 적용할 필터 조건이 없습니다.");
+        process::exit(1);
+    }
+
+    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    }));
+
+    // 필터 스캔 (시간 + 최대 RSS 측정)
+    let (stop_sample, rss_peak_kb, sampler) = start_rss_sampler();
+    let t0 = Instant::now();
+    let mut visible_count: u64 = 0;
+    let cancel = AtomicBool::new(false);
+    let outcome = riffle_core::filter_scan(
+        &log_file,
+        &set,
+        &cancel,
+        &mut |batch| visible_count += batch.len() as u64,
+        &mut |_p| {},
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("필터 스캔 오류: {}", e);
+        process::exit(1);
+    });
+    let filter_elapsed = t0.elapsed();
+    stop_sample.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+
+    println!("파일: {}", path.display());
+    println!(
+        "필터: combine={:?}, include={}개, exclude={}개, levels={:?}, regex={}",
+        combine,
+        spec.rules
+            .iter()
+            .filter(|r| r.kind == RuleKind::Include)
+            .count(),
+        spec.rules
+            .iter()
+            .filter(|r| r.kind == RuleKind::Exclude)
+            .count(),
+        spec.levels,
+        regex
+    );
+    println!("보이는 줄 수: {}", visible_count);
+    println!("필터 결과 상태: {:?}", outcome);
+    println!(
+        "필터 스캔 시간: {:.3}ms ({:.3}s)",
+        filter_elapsed.as_secs_f64() * 1000.0,
+        filter_elapsed.as_secs_f64()
+    );
+    println!(
+        "최대 RSS: {:.1} MB",
+        rss_peak_kb.load(Ordering::Relaxed) as f64 / 1024.0
+    );
+
+    // --search 지정 시 교집합(검색 매치 ∧ 필터 통과) 수도 출력
+    if let Some(q) = search_query {
+        let matcher = Matcher::new(&q, options).unwrap_or_else(|e| {
+            eprintln!("검색어 컴파일 실패: {}", e);
+            process::exit(1);
+        });
+        let t1 = Instant::now();
+        let mut intersection: u64 = 0;
+        let outcome2 = riffle_core::search_filtered(
+            &log_file,
+            &matcher,
+            Some(&set),
+            &cancel,
+            &mut |batch| intersection += batch.len() as u64,
+            &mut |_p| {},
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("교집합 검색 오류: {}", e);
+            process::exit(1);
+        });
+        let search_elapsed = t1.elapsed();
+        println!("검색어: {:?}", q);
+        println!("교집합 줄 수: {}", intersection);
+        println!("교집합 결과 상태: {:?}", outcome2);
+        println!(
+            "교집합 검색 시간: {:.3}ms ({:.3}s)",
+            search_elapsed.as_secs_f64() * 1000.0,
+            search_elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -531,7 +742,7 @@ fn run_copy(path: &Path, start: u64, end: u64) {
 /// 인덱스 유무와 무관하게 매치된 줄 번호들의 원문 텍스트를 출력한다.
 fn print_matching_lines(log_file: &LogFile, line_nos: &[u64]) {
     if log_file.index().line_count() > 0
-        && let Ok(lines) = log_file.read_lines_at(line_nos, None)
+        && let Ok(lines) = log_file.read_lines_at(line_nos, None, None)
     {
         for line in lines {
             println!("{:>8}: {}", line.no + 1, line.text);

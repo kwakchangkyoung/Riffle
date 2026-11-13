@@ -3,18 +3,23 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { listen, type Event as TauriEvent } from "@tauri-apps/api/event";
 import {
+    cancelFilter,
     closeFile,
     copyLines,
+    filterIndexOf,
     getRecentFiles,
     getSettings,
     openFile,
     searchDensity,
     setTail,
+    startFilter,
     takePendingOpen,
     type FileInfo,
+    type FilterSpec,
     type IndexProgress,
     type MenuEvent,
     type QueryOptions,
+    type SearchEvent,
     type SearchHit,
     type TailEvent,
 } from "@/lib/ipc";
@@ -37,7 +42,51 @@ import {
     type UpdateDialogState,
 } from "@/components/UpdateDialog";
 import { SearchBar } from "@/components/search/SearchBar";
-import { StatusBar, type SearchStatusInfo } from "@/components/StatusBar";
+import { FilterBar } from "@/components/filter/FilterBar";
+import {
+    StatusBar,
+    type FilterStatusInfo,
+    type SearchStatusInfo,
+} from "@/components/StatusBar";
+
+/** 필터 조건이 하나도 없는 초기 스펙 (레벨 전체 선택 = 조건 없음) */
+const EMPTY_FILTER_SPEC: FilterSpec = {
+    rules: [],
+    combine: "or",
+    levels: ["error", "warn", "info", "debug", "trace"],
+};
+
+/** 적용할 필터 조건(켜진 규칙 또는 레벨 부분 집합)이 있는지 확인 */
+function specHasCondition(spec: FilterSpec): boolean {
+    const hasEnabledRule = spec.rules.some((r) => r.enabled);
+    const hasLevelCondition = spec.levels.length > 0 && spec.levels.length < 5;
+    return hasEnabledRule || hasLevelCondition;
+}
+
+/**
+ * 필터 판정과 무관한 필드(규칙 색상)를 제외한 스펙 서명.
+ * 색상만 바뀐 변경으로 전체 재스캔이 일어나지 않게 비교에 사용한다.
+ */
+function filterSignature(spec: FilterSpec): string {
+    return JSON.stringify({
+        combine: spec.combine,
+        levels: spec.levels,
+        rules: spec.rules.map((r) => [
+            r.pattern,
+            r.regex,
+            r.caseSensitive,
+            r.kind,
+            r.enabled,
+        ]),
+    });
+}
+
+/** 규칙 하이라이트를 계산할 필요가 있는 스펙이면 반환, 아니면 null */
+function ruleHighlightSpec(spec: FilterSpec): FilterSpec | null {
+    return spec.rules.some((r) => r.enabled && r.kind === "include")
+        ? spec
+        : null;
+}
 
 /**
  * Riffle 메인 애플리케이션 컴포넌트
@@ -62,6 +111,16 @@ export default function App() {
     const [currentHit, setCurrentHit] = useState<SearchHit | null>(null);
     const [densityBins, setDensityBins] = useState<number[]>([]);
     const [viewportHeight, setViewportHeight] = useState(0);
+
+    // 다중 필터 상태: 스펙(파일 간 세션 유지), 최신/표시 필터 ID, 계산 진행률
+    const [filterSpec, setFilterSpec] = useState<FilterSpec>(EMPTY_FILTER_SPEC);
+    const [filterId, setFilterId] = useState<number | null>(null);
+    const [activeFilterId, setActiveFilterId] = useState<number | null>(null);
+    const [filterStatus, setFilterStatus] = useState<FilterStatusInfo | null>(
+        null,
+    );
+    const [filterMatchCount, setFilterMatchCount] = useState(0);
+    const [filterFocusSignal, setFilterFocusSignal] = useState(0);
 
     // tail 모드 상태: 사용자 의도, 일시정지 중 새 줄 수, 로테이션 안내
     const [tailEnabled, setTailEnabled] = useState(false);
@@ -105,6 +164,7 @@ export default function App() {
 
     const normalLineCache = useMemo(() => new LineCache(), []);
     const filteredLineCache = useMemo(() => new LineCache(), []);
+    const filterLineCache = useMemo(() => new LineCache(), []);
 
     const [, setCacheVersion] = useState(0);
     useEffect(() => {
@@ -114,11 +174,15 @@ export default function App() {
         const u2 = filteredLineCache.subscribe(() =>
             setCacheVersion((v) => v + 1),
         );
+        const u3 = filterLineCache.subscribe(() =>
+            setCacheVersion((v) => v + 1),
+        );
         return () => {
             u1();
             u2();
+            u3();
         };
-    }, [normalLineCache, filteredLineCache]);
+    }, [normalLineCache, filteredLineCache, filterLineCache]);
 
     const currentFileRef = useRef<FileInfo | null>(null);
     const openSeqRef = useRef(0);
@@ -148,6 +212,7 @@ export default function App() {
         oldLineCount: number;
         lineCount: number;
         totalBytes: number;
+        filterCount?: number | null;
     } | null>(null);
     const tailRafRef = useRef<number | null>(null);
     const atBottomRef = useRef(true);
@@ -155,9 +220,53 @@ export default function App() {
     const viewportHeightRef = useRef(0);
     const scrollToBottomAfterReopenRef = useRef(false);
 
+    // 다중 필터 관련 ref: 비동기 콜백에서 최신 값을 읽기 위해 state와 병행 유지
+    const filterIdRef = useRef<number | null>(null); // 최신 start_filter 결과 (검색 스코프용)
+    const activeFilterIdRef = useRef<number | null>(null); // 화면에 표시 중인 필터
+    const filterViewActiveRef = useRef(false);
+    const filterSeqRef = useRef(0); // 필터 작업 세대 (stale 이벤트 폐기용)
+    const runningFilterKeyRef = useRef(""); // 현재 계산 중/완료된 스펙 서명
+    const pendingPromoteRef = useRef<{
+        fid: number;
+        fileId: number;
+        count: number;
+        done: boolean;
+    } | null>(null); // 첫 결과 도착 전 최신 건수 보관
+    const promoteInFlightRef = useRef<number | null>(null);
+    const filterSpecRef = useRef(filterSpec);
+    const activeQueryRef = useRef<QueryOptions | null>(null); // 검색 하이라이트용 현재 쿼리
+    const filterCountRef = useRef(0); // 표시 중 필터의 마지막 확인 줄 수 (tail 무효화용)
+
     useEffect(() => {
         isFilterModeRef.current = isFilterMode;
     }, [isFilterMode]);
+
+    useEffect(() => {
+        filterSpecRef.current = filterSpec;
+    }, [filterSpec]);
+
+    useEffect(() => {
+        filterIdRef.current = filterId;
+    }, [filterId]);
+
+    useEffect(() => {
+        activeFilterIdRef.current = activeFilterId;
+        filterViewActiveRef.current = activeFilterId !== null;
+    }, [activeFilterId]);
+
+    // 규칙 하이라이트 스펙을 일반/검색 결과 캐시에 전파한다.
+    // 색상만 바뀐 경우 하이라이트 범위는 동일하므로 서명이 같으면 재요청하지 않는다.
+    const lastRuleSpecSigRef = useRef("");
+    useEffect(() => {
+        const sig = filterSignature(filterSpec);
+        if (sig === lastRuleSpecSigRef.current) {
+            return;
+        }
+        lastRuleSpecSigRef.current = sig;
+        const hs = ruleHighlightSpec(filterSpec);
+        normalLineCache.setRuleSpec(hs);
+        filteredLineCache.setRuleSpec(hs);
+    }, [filterSpec, normalLineCache, filteredLineCache]);
 
     // 비동기 업데이트 확인 콜백에서 최신 다이얼로그 상태를 읽기 위한 ref 동기화
     useEffect(() => {
@@ -168,16 +277,23 @@ export default function App() {
         viewportHeightRef.current = viewportHeight;
     }, [viewportHeight]);
 
-    // 활성 라인 캐시 및 총 라인 수 (필터 모드 / 일반 모드 분기)
-    const activeLineCache = isFilterMode ? filteredLineCache : normalLineCache;
+    // 다중 필터 보기 활성 여부 (화면에 표시 중인 필터가 있을 때)
+    const filterViewActive = activeFilterId !== null;
+
+    // 활성 라인 캐시 및 총 라인 수 (검색 결과만 / 다중 필터 / 일반 모드 분기)
+    const activeLineCache = isFilterMode
+        ? filteredLineCache
+        : filterViewActive
+          ? filterLineCache
+          : normalLineCache;
     const activeLineCount = isFilterMode
         ? (searchStatus?.matchCount ?? 0)
-        : lineCount;
+        : filterViewActive
+          ? filterMatchCount
+          : lineCount;
 
-    // 표시 줄 수 (필터 모드: 매치 건수, 일반 모드: 파일 줄 수)
-    const displayLineCount = isFilterMode
-        ? (searchStatus?.matchCount ?? 0)
-        : lineCount;
+    // 표시 줄 수 (검색 결과만: 매치 건수, 다중 필터: 필터 통과 건수, 일반: 파일 줄 수)
+    const displayLineCount = activeLineCount;
     const displayCountRef = useRef(0);
     useEffect(() => {
         displayCountRef.current = displayLineCount;
@@ -200,8 +316,18 @@ export default function App() {
         }
     }, []);
 
-    // 최신 topLine 조회 (SearchBar 등 memoized 자식에 prop 대신 전달)
-    const getTopLine = useCallback(() => topLineRef.current, []);
+    // 뷰포트 맨 위 행의 실제 파일 줄 번호.
+    // 인덱스 기반 보기(검색 결과만/다중 필터)에서는 캐시된 줄의 실제 번호를 반환한다.
+    const currentTopActualLine = useCallback((): number => {
+        const t = Math.floor(topLineRef.current);
+        if (isFilterModeRef.current) {
+            return filteredLineCache.getLine(t)?.no ?? t;
+        }
+        if (filterViewActiveRef.current) {
+            return filterLineCache.getLine(t)?.no ?? t;
+        }
+        return t;
+    }, [filteredLineCache, filterLineCache]);
 
     // topLine 직접 변경(setTopLine) 경로에 대한 ref 동기화 백업
     useEffect(() => {
@@ -262,6 +388,7 @@ export default function App() {
             // 캐시 및 화면 상태 초기화
             normalLineCache.setFile(null);
             filteredLineCache.setFile(null);
+            filterLineCache.setFile(null);
             setFile(null);
             setLiveFileSize(null);
             setLineCount(0);
@@ -277,6 +404,24 @@ export default function App() {
             setLineSelection(null);
             setFullLinePanel(null);
             setGotoLineOpen(false);
+
+            // 다중 필터 계산 상태 초기화 (스펙 자체는 파일 간 세션 유지)
+            filterSeqRef.current++;
+            runningFilterKeyRef.current = "";
+            pendingPromoteRef.current = null;
+            promoteInFlightRef.current = null;
+            const prevFilterId = filterIdRef.current;
+            filterIdRef.current = null;
+            activeFilterIdRef.current = null;
+            filterViewActiveRef.current = false;
+            filterCountRef.current = 0;
+            setFilterId(null);
+            setActiveFilterId(null);
+            setFilterStatus(null);
+            setFilterMatchCount(0);
+            if (prevFilterId !== null) {
+                cancelFilter(prevFilterId).catch(() => {});
+            }
 
             // 파일 전환 시 tail은 자동 해제 (로테이션 재오픈 시에만 유지)
             if (!options?.preserveTail) {
@@ -339,7 +484,7 @@ export default function App() {
                 }
             }
         },
-        [normalLineCache, filteredLineCache],
+        [normalLineCache, filteredLineCache, filterLineCache],
     );
 
     // 파일 선택 다이얼로그 호출
@@ -489,6 +634,8 @@ export default function App() {
         (queryDto: QueryOptions, searchId: number) => {
             activeSearchIdRef.current = searchId;
             normalLineCache.setQuery(queryDto);
+            filterLineCache.setQuery(queryDto);
+            activeQueryRef.current = queryDto;
             if (file) {
                 filteredLineCache.setFilteredSource(
                     file.id,
@@ -524,6 +671,7 @@ export default function App() {
             file,
             normalLineCache,
             filteredLineCache,
+            filterLineCache,
             handleSearchDensityRequest,
             requestDensityFetch,
         ],
@@ -580,13 +728,15 @@ export default function App() {
             densityTimerRef.current = null;
         }
         normalLineCache.setQuery(null);
+        filterLineCache.setQuery(null);
+        activeQueryRef.current = null;
         // 필터 캐시는 searchId와 함께 분리해 취소된 searchId로 재요청하지 않게 한다
         filteredLineCache.setFile(null);
         setIsFilterMode(false);
         setSearchStatus(null);
         setCurrentHit(null);
         setDensityBins([]);
-    }, [normalLineCache, filteredLineCache]);
+    }, [normalLineCache, filteredLineCache, filterLineCache]);
 
     // 검색 결과 항목으로 뷰포트 이동
     const handleNavigateToHit = useCallback(
@@ -597,16 +747,30 @@ export default function App() {
             );
 
             // 해당 줄이 화면 위에서 1/3 지점에 오도록 topLine 설정
-            const targetIndex = isFilterMode ? hit.index : hit.line;
             const visibleRows =
                 viewportHeight > 0 ? viewportHeight / rowHeight : 30;
-            const targetTop = targetIndex - Math.floor(visibleRows / 3);
-            const maxTop = Math.max(0, activeLineCount - visibleRows);
-            const clampedTop = Math.max(0, Math.min(maxTop, targetTop));
-            handleTopLineChange(clampedTop);
+            const offset = Math.floor(visibleRows / 3);
+            const scrollToIndex = (targetIndex: number) => {
+                const targetTop = targetIndex - offset;
+                const maxTop = Math.max(0, activeLineCount - visibleRows);
+                handleTopLineChange(Math.max(0, Math.min(maxTop, targetTop)));
+            };
+
+            if (isFilterMode) {
+                scrollToIndex(hit.index);
+            } else if (filterViewActive && activeFilterIdRef.current !== null) {
+                // 다중 필터 보기: 결과의 실제 줄 번호를 필터 인덱스로 변환해 이동
+                const fid = activeFilterIdRef.current;
+                filterIndexOf(fid, hit.line)
+                    .then((idx) => scrollToIndex(idx))
+                    .catch(() => scrollToIndex(hit.line));
+            } else {
+                scrollToIndex(hit.line);
+            }
         },
         [
             isFilterMode,
+            filterViewActive,
             viewportHeight,
             rowHeight,
             activeLineCount,
@@ -635,6 +799,217 @@ export default function App() {
         [viewportHeight, rowHeight, lineCount, handleTopLineChange],
     );
 
+    // ===== 다중 필터 (Phase 10) =====
+
+    // 첫 progress/done 시점에 새 필터 결과로 화면을 전환한다.
+    // 전환 직전 화면 맨 위의 실제 줄 번호를 filter_index_of로 변환해 보던 위치를 유지한다.
+    const promoteFilter = useCallback(async () => {
+        const pending = pendingPromoteRef.current;
+        if (pending === null) return;
+        const { fid, fileId } = pending;
+        if (
+            promoteInFlightRef.current === fid ||
+            activeFilterIdRef.current === fid
+        ) {
+            return;
+        }
+        promoteInFlightRef.current = fid;
+        try {
+            const topActual = currentTopActualLine();
+            let index = 0;
+            try {
+                index = await filterIndexOf(fid, topActual);
+            } catch (err) {
+                console.warn("filter_index_of 실패, 처음부터 표시:", err);
+            }
+            // 기다리는 동안 더 새 필터가 시작됐거나 파일이 바뀌었으면 폐기
+            if (
+                filterIdRef.current !== fid ||
+                currentFileRef.current?.id !== fileId
+            ) {
+                return;
+            }
+            const latest = pendingPromoteRef.current;
+            const count =
+                latest !== null && latest.fid === fid
+                    ? latest.count
+                    : pending.count;
+            const done =
+                latest !== null && latest.fid === fid
+                    ? latest.done
+                    : pending.done;
+            if (latest?.fid === fid) {
+                pendingPromoteRef.current = null;
+            }
+            activeFilterIdRef.current = fid;
+            filterViewActiveRef.current = true;
+            setActiveFilterId(fid);
+            // 이전 필터 결과 블록은 유지한 채 새 필터로 교체 (깜빡임 방지)
+            filterLineCache.setFilterSource(
+                fileId,
+                fid,
+                activeQueryRef.current,
+                filterSpecRef.current,
+                true,
+            );
+            filterLineCache.setLineCount(count, done);
+            setFilterMatchCount(count);
+            filterCountRef.current = count;
+            handleTopLineChange(index);
+        } finally {
+            if (promoteInFlightRef.current === fid) {
+                promoteInFlightRef.current = null;
+            }
+        }
+    }, [currentTopActualLine, filterLineCache, handleTopLineChange]);
+
+    // 필터 스캔 이벤트 처리 (progress/done/error). fid는 start_filter가 반환한 필터 ID.
+    const handleFilterEvent = useCallback(
+        (seq: number, fileId: number, fid: number, event: SearchEvent) => {
+            if (filterSeqRef.current !== seq) return;
+            if (event.type === "progress") {
+                setFilterStatus((prev) => ({
+                    matchCount: event.matchCount,
+                    isSearching: true,
+                    isCapped: prev?.isCapped ?? false,
+                    scannedBytes: event.scannedBytes,
+                    totalBytes: event.totalBytes,
+                }));
+                if (activeFilterIdRef.current === fid) {
+                    filterLineCache.setLineCount(event.matchCount, false);
+                    setFilterMatchCount(event.matchCount);
+                    filterCountRef.current = event.matchCount;
+                } else {
+                    pendingPromoteRef.current = {
+                        fid,
+                        fileId,
+                        count: event.matchCount,
+                        done: false,
+                    };
+                    void promoteFilter();
+                }
+            } else if (event.type === "done") {
+                setFilterStatus((prev) => ({
+                    matchCount: event.total,
+                    isSearching: false,
+                    isCapped: event.capped,
+                    scannedBytes: prev?.scannedBytes ?? 0,
+                    totalBytes: prev?.totalBytes ?? 0,
+                }));
+                if (activeFilterIdRef.current === fid) {
+                    filterLineCache.setLineCount(event.total, true);
+                    setFilterMatchCount(event.total);
+                    filterCountRef.current = event.total;
+                } else {
+                    pendingPromoteRef.current = {
+                        fid,
+                        fileId,
+                        count: event.total,
+                        done: true,
+                    };
+                    void promoteFilter();
+                }
+            } else if (event.type === "error") {
+                setErrorMessage(event.message);
+                filterLineCache.setSuspended(false);
+            }
+            // cancelled는 seq 가드로 최신 필터만 통과하므로 별도 처리 없음
+        },
+        [filterLineCache, promoteFilter],
+    );
+
+    // 필터 스캔 시작. start_filter 호출 즉시 이전 필터는 백엔드에서 제거되므로,
+    // 새 결과가 화면에 반영되기 전까지 이전 소스의 재요청을 보류해 오류를 막는다.
+    const startFilterScan = useCallback(
+        (fileId: number, spec: FilterSpec, key: string, seq: number) => {
+            let resolvedId: number | null = null;
+            const buffered: SearchEvent[] = [];
+
+            filterLineCache.setSuspended(true);
+
+            startFilter(fileId, spec, (event) => {
+                if (filterSeqRef.current !== seq) return;
+                if (resolvedId === null) {
+                    buffered.push(event);
+                    return;
+                }
+                handleFilterEvent(seq, fileId, resolvedId, event);
+            })
+                .then((newId) => {
+                    if (filterSeqRef.current !== seq) {
+                        cancelFilter(newId).catch(() => {});
+                        return;
+                    }
+                    resolvedId = newId;
+                    runningFilterKeyRef.current = key;
+                    filterIdRef.current = newId;
+                    setFilterId(newId);
+                    // 계산 중 상태바에는 이전 표시 건수를 이어서 보여준다
+                    setFilterStatus({
+                        matchCount: filterCountRef.current,
+                        isSearching: true,
+                        isCapped: false,
+                        scannedBytes: 0,
+                        totalBytes: 0,
+                    });
+                    for (const ev of buffered) {
+                        handleFilterEvent(seq, fileId, newId, ev);
+                    }
+                    buffered.length = 0;
+                })
+                .catch((err) => {
+                    if (filterSeqRef.current !== seq) return;
+                    filterLineCache.setSuspended(false);
+                    const msg =
+                        typeof err === "string"
+                            ? err
+                            : "필터를 시작할 수 없습니다.";
+                    setErrorMessage(msg);
+                });
+        },
+        [filterLineCache, handleFilterEvent],
+    );
+
+    // 필터 스펙 변경 시 300ms 디바운스 후 start_filter.
+    // 색상 등 판정과 무관한 변경은 서명이 같으므로 재스캔하지 않는다.
+    useEffect(() => {
+        const fileId = file?.id ?? null;
+        if (fileId === null || !specHasCondition(filterSpec)) {
+            // 필터 없음: 계산 중이던 작업을 폐기하고 일반/검색 보기로 복귀.
+            // 이펙트 본문의 동기 setState를 피하기 위해 마이크로태스크로 미룬다.
+            queueMicrotask(() => {
+                filterSeqRef.current++;
+                runningFilterKeyRef.current = "";
+                pendingPromoteRef.current = null;
+                const prevId = filterIdRef.current;
+                filterIdRef.current = null;
+                activeFilterIdRef.current = null;
+                filterViewActiveRef.current = false;
+                filterCountRef.current = 0;
+                setFilterId(null);
+                setActiveFilterId(null);
+                setFilterStatus(null);
+                setFilterMatchCount(0);
+                if (prevId !== null) {
+                    cancelFilter(prevId).catch(() => {});
+                }
+            });
+            return;
+        }
+
+        const key = `${fileId}:${filterSignature(filterSpec)}`;
+        if (key === runningFilterKeyRef.current) {
+            return;
+        }
+
+        const seq = ++filterSeqRef.current;
+        const timer = setTimeout(() => {
+            if (filterSeqRef.current !== seq) return;
+            startFilterScan(fileId, filterSpecRef.current, key, seq);
+        }, 300);
+        return () => clearTimeout(timer);
+    }, [filterSpec, file, startFilterScan]);
+
     // ===== tail 모드 =====
 
     // rAF 단위로 묶인 appended 이벤트를 반영한다 (프레임당 마지막 배치만 처리)
@@ -644,7 +1019,12 @@ export default function App() {
         pendingAppendedRef.current = null;
         if (!pending) return;
 
-        const { oldLineCount, lineCount: newLineCount, totalBytes } = pending;
+        const {
+            oldLineCount,
+            lineCount: newLineCount,
+            totalBytes,
+            filterCount,
+        } = pending;
 
         // 줄 수/파일 크기 갱신 + 개행 없이 끝나던 마지막 줄이 속한 블록 무효화
         normalLineCache.setLineCount(newLineCount, true);
@@ -657,6 +1037,47 @@ export default function App() {
         // 필터 모드에서는 스크롤/버튼 처리 없이 캐시만 최신화한다
         if (isFilterModeRef.current) return;
 
+        // 다중 필터 보기: 필터 줄 수 기준으로 갱신하고 따라가기/새 줄 카운터를 처리한다.
+        // 필터가 아직 계산 중이거나 최신이 아니면 스크롤 처리를 생략한다.
+        if (filterViewActiveRef.current) {
+            const fid = activeFilterIdRef.current;
+            if (
+                filterCount != null &&
+                fid !== null &&
+                fid === filterIdRef.current
+            ) {
+                const prevCount = filterCountRef.current;
+                filterLineCache.setLineCount(filterCount, true);
+                setFilterMatchCount(filterCount);
+                filterCountRef.current = filterCount;
+                setFilterStatus((prev) =>
+                    prev
+                        ? {
+                              ...prev,
+                              matchCount: filterCount,
+                              isSearching: false,
+                          }
+                        : prev,
+                );
+                // 마지막 줄이 이어쓰였을 수 있으므로 직전 끝 줄은 재요청되게 무효화
+                if (prevCount > 0) {
+                    filterLineCache.invalidateLine(prevCount - 1);
+                }
+                if (atBottomRef.current) {
+                    const maxTop = Math.max(
+                        0,
+                        filterCount -
+                            viewportHeightRef.current / rowHeightRef.current,
+                    );
+                    handleTopLineChange(maxTop);
+                } else {
+                    const added = Math.max(0, filterCount - prevCount);
+                    setNewLinesCount((prev) => prev + added);
+                }
+            }
+            return;
+        }
+
         if (atBottomRef.current) {
             // 맨 아래에 있으면 새 끝으로 자동 스크롤
             const maxTop = Math.max(
@@ -668,7 +1089,7 @@ export default function App() {
             const added = Math.max(0, newLineCount - oldLineCount);
             setNewLinesCount((prev) => prev + added);
         }
-    }, [normalLineCache, handleTopLineChange]);
+    }, [normalLineCache, filterLineCache, handleTopLineChange]);
 
     // 로테이션 감지 시 같은 경로로 자동 재오픈 (tail 상태 유지)
     const handleTailRotated = useCallback(
@@ -693,6 +1114,7 @@ export default function App() {
                     oldLineCount: prev ? prev.oldLineCount : event.oldLineCount,
                     lineCount: event.lineCount,
                     totalBytes: event.totalBytes,
+                    filterCount: event.filterCount ?? prev?.filterCount ?? null,
                 };
                 if (tailRafRef.current === null) {
                     tailRafRef.current = requestAnimationFrame(() => {
@@ -758,7 +1180,7 @@ export default function App() {
     const handleScrollToBottom = useCallback(() => {
         const maxTop = Math.max(
             0,
-            lineCountRef.current -
+            displayCountRef.current -
                 viewportHeightRef.current / rowHeightRef.current,
         );
         handleTopLineChange(maxTop);
@@ -789,7 +1211,8 @@ export default function App() {
     // 거터 줄 번호 클릭: 일반 클릭은 해당 줄 선택, Shift+클릭은 anchor~클릭 범위
     const handleGutterLineClick = useCallback(
         (index: number, shiftKey: boolean) => {
-            if (isFilterModeRef.current) return;
+            // 인덱스 기반 보기(검색 결과만/다중 필터)에서는 줄 선택을 지원하지 않는다
+            if (isFilterModeRef.current || filterViewActiveRef.current) return;
             setLineSelection((prev) => {
                 if (shiftKey && prev !== null) {
                     return { anchor: prev.anchor, focus: index };
@@ -858,8 +1281,29 @@ export default function App() {
                 viewportHeightRef.current > 0
                     ? viewportHeightRef.current / rowHeight
                     : 30;
+            const offset = Math.floor(visibleRows / 3);
             const targetIndex = lineNo - 1; // 1-based → 0-based
-            const targetTop = targetIndex - Math.floor(visibleRows / 3);
+
+            // 다중 필터 보기(검색 결과만 제외): 실제 줄 번호 → 필터 인덱스 변환
+            if (filterViewActiveRef.current && !isFilterModeRef.current) {
+                const fid = activeFilterIdRef.current;
+                if (fid !== null) {
+                    filterIndexOf(fid, targetIndex)
+                        .then((idx) => {
+                            const maxTop = Math.max(
+                                0,
+                                displayCountRef.current - visibleRows,
+                            );
+                            handleTopLineChange(
+                                Math.max(0, Math.min(maxTop, idx - offset)),
+                            );
+                        })
+                        .catch(() => {});
+                    return;
+                }
+            }
+
+            const targetTop = targetIndex - offset;
             const maxTop = Math.max(0, lineCountRef.current - visibleRows);
             handleTopLineChange(Math.max(0, Math.min(maxTop, targetTop)));
         },
@@ -956,12 +1400,14 @@ export default function App() {
 
     // 뷰포트에 전달할 정규화된 선택 범위 (일반 모드에서만)
     const selectedRange = useMemo(() => {
-        if (isFilterMode || lineSelection === null) return null;
+        if (isFilterMode || filterViewActive || lineSelection === null) {
+            return null;
+        }
         return {
             start: Math.min(lineSelection.anchor, lineSelection.focus),
             end: Math.max(lineSelection.anchor, lineSelection.focus),
         };
-    }, [isFilterMode, lineSelection]);
+    }, [isFilterMode, filterViewActive, lineSelection]);
 
     // 네이티브 메뉴 이벤트 수신 (메뉴 accelerator가 키를 먼저 가로채므로
     // 해당 단축키는 프론트 keydown이 아니라 이 이벤트로만 처리한다)
@@ -981,6 +1427,10 @@ export default function App() {
                     break;
                 case "find":
                     setFindSignal((s) => s + 1);
+                    break;
+                case "add_filter_rule":
+                    // "보기 → 필터 규칙 추가" 메뉴 (FilterBar가 keydown/시그널로 처리)
+                    setFilterFocusSignal((s) => s + 1);
                     break;
                 case "goto_line":
                     handleOpenGotoLine();
@@ -1059,11 +1509,20 @@ export default function App() {
     const fileName = file ? file.path.split("/").pop() || file.path : null;
     const currentHitLine = currentHit !== null ? currentHit.line : null;
 
-    // 필터 모드 시 화면 맨 위 행의 실제 원본 파일 줄 번호 계산
-    const topFilteredRow = isFilterMode
-        ? filteredLineCache.getLine(Math.floor(topLine))
-        : undefined;
-    const actualTopLine = topFilteredRow ? topFilteredRow.no + 1 : null;
+    // 인덱스 기반 보기(검색 결과만/다중 필터) 시 화면 맨 위 행의 실제 원본 파일 줄 번호 계산
+    const topIndexCache = isFilterMode
+        ? filteredLineCache
+        : filterViewActive
+          ? filterLineCache
+          : null;
+    const topIndexRow = topIndexCache?.getLine(Math.floor(topLine));
+    const actualTopLine = topIndexRow ? topIndexRow.no + 1 : null;
+
+    // 규칙 하이라이트에 사용할 규칙 색상 목록 (spec.rules 인덱스와 1:1)
+    const ruleColors = useMemo(
+        () => filterSpec.rules.map((r) => r.color),
+        [filterSpec],
+    );
 
     // 현재 렌더 기준 맨 아래 여부 (상태바 tail 일시정지 표시용)
     const maxTopNow = Math.max(
@@ -1104,7 +1563,8 @@ export default function App() {
                     <div className="flex-1 flex justify-center max-w-2xl">
                         <SearchBar
                             fileId={file.id}
-                            getTopLine={getTopLine}
+                            getViewportLineNo={currentTopActualLine}
+                            filterId={filterId}
                             visibleRows={
                                 viewportHeight > 0
                                     ? viewportHeight / rowHeight
@@ -1171,6 +1631,15 @@ export default function App() {
                 </div>
             </header>
 
+            {/* 다중 필터 바: 파일이 열려 있을 때만 표시 */}
+            {file && (
+                <FilterBar
+                    spec={filterSpec}
+                    onSpecChange={setFilterSpec}
+                    focusSignal={filterFocusSignal}
+                />
+            )}
+
             {/* 로테이션 안내 배너 (5초 후 자동 숨김) */}
             {rotationReason && (
                 <div className="px-4 py-2 bg-sky-50 text-sky-700 dark:bg-sky-950/50 dark:text-sky-300 text-xs flex items-center justify-between border-b border-sky-200 dark:border-sky-900">
@@ -1216,6 +1685,8 @@ export default function App() {
                             onTopLineChange={handleTopLineChange}
                             currentHitLine={currentHitLine}
                             isFilterMode={isFilterMode}
+                            filterViewActive={filterViewActive}
+                            ruleColors={ruleColors}
                             onLineDoubleClick={handleLineDoubleClick}
                             densityBins={densityBins}
                             onViewportHeightChange={setViewportHeight}
@@ -1331,6 +1802,8 @@ export default function App() {
                 topLine={topLine}
                 searchStatus={searchStatus}
                 isFilterMode={isFilterMode}
+                filterViewActive={filterViewActive}
+                filterStatus={filterStatus}
                 actualTopLine={actualTopLine}
                 tailOn={tailEnabled && file !== null}
                 tailPaused={tailEnabled && !isAtBottomNow}

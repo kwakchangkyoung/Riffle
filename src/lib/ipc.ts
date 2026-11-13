@@ -23,12 +23,93 @@ export interface QueryOptions {
     caseSensitive: boolean;
 }
 
+// ===== 다중 필터 (Phase 10) =====
+
+export type RuleKind = "include" | "exclude";
+export type LevelName = "error" | "warn" | "info" | "debug" | "trace";
+export type FilterCombine = "and" | "or";
+
+export interface FilterRule {
+    pattern: string;
+    regex: boolean;
+    caseSensitive: boolean;
+    kind: RuleKind;
+    enabled: boolean;
+    /** 규칙 하이라이트 색상 (#rrggbb). Rust는 판정에 사용하지 않고 프리셋 저장용으로만 보관한다 */
+    color: string;
+}
+
+export interface FilterSpec {
+    rules: FilterRule[];
+    combine: FilterCombine;
+    levels: LevelName[];
+}
+
+export interface FilterPreset {
+    name: string;
+    spec: FilterSpec;
+}
+
+/**
+ * 필터 스펙의 정규식 유효성을 검사합니다.
+ */
+export function validateFilter(spec: FilterSpec): Promise<void> {
+    return invoke<void>("validate_filter", { spec });
+}
+
+/**
+ * 백그라운드 필터 스캔을 시작하고 필터 ID를 반환합니다.
+ * 같은 파일의 이전 필터는 자동 취소·제거됩니다.
+ */
+export function startFilter(
+    id: number,
+    spec: FilterSpec,
+    onEvent: (event: SearchEvent) => void,
+): Promise<number> {
+    const channel = new Channel<SearchEvent>();
+    channel.onmessage = onEvent;
+    return invoke<number>("start_filter", { id, spec, onEvent: channel });
+}
+
+/**
+ * 진행 중인 필터 스캔을 취소합니다.
+ */
+export function cancelFilter(filterId: number): Promise<void> {
+    return invoke<void>("cancel_filter", { filterId });
+}
+
+/**
+ * 저장된 필터 프리셋 목록을 조회합니다.
+ */
+export function listFilterPresets(): Promise<FilterPreset[]> {
+    return invoke<FilterPreset[]>("list_filter_presets");
+}
+
+/**
+ * 필터 프리셋을 저장합니다. 같은 이름이 있으면 덮어씁니다.
+ */
+export function saveFilterPreset(
+    name: string,
+    spec: FilterSpec,
+): Promise<void> {
+    return invoke<void>("save_filter_preset", { name, spec });
+}
+
+/**
+ * 필터 프리셋을 삭제합니다.
+ */
+export function deleteFilterPreset(name: string): Promise<void> {
+    return invoke<void>("delete_filter_preset", { name });
+}
+
 export interface Line {
     no: number;
     text: string;
     byteLen: number;
     truncated: boolean;
     highlights: [number, number][];
+    /** 필터 규칙 하이라이트 [UTF-16 시작, UTF-16 끝, spec.rules 인덱스] */
+    ruleHighlights: [number, number, number][];
 }
 
 export type SearchEvent =
@@ -72,11 +153,17 @@ export function validateQuery(query: QueryOptions): Promise<void> {
 export function search(
     id: number,
     query: QueryOptions,
+    filterId: number | null,
     onEvent: (event: SearchEvent) => void,
 ): Promise<number> {
     const channel = new Channel<SearchEvent>();
     channel.onmessage = onEvent;
-    return invoke<number>("search", { id, query, onEvent: channel });
+    return invoke<number>("search", {
+        id,
+        query,
+        filterId,
+        onEvent: channel,
+    });
 }
 
 /**
@@ -134,12 +221,14 @@ export function getLines(
     start: number,
     count: number,
     query?: QueryOptions | null,
+    spec?: FilterSpec | null,
 ): Promise<Line[]> {
     return invoke<Line[]>("get_lines", {
         id,
         start,
         count,
         query: query ?? null,
+        spec: spec ?? null,
     });
 }
 
@@ -152,6 +241,7 @@ export function getFilteredLines(
     startIndex: number,
     count: number,
     query?: QueryOptions | null,
+    spec?: FilterSpec | null,
 ): Promise<Line[]> {
     return invoke<Line[]>("get_filtered_lines", {
         id,
@@ -159,7 +249,36 @@ export function getFilteredLines(
         startIndex,
         count,
         query: query ?? null,
+        spec: spec ?? null,
     });
+}
+
+/**
+ * 필터 결과 목록의 특정 구간에 해당하는 줄들을 조회합니다.
+ */
+export function getFilterLines(
+    id: number,
+    filterId: number,
+    startIndex: number,
+    count: number,
+    query?: QueryOptions | null,
+    spec?: FilterSpec | null,
+): Promise<Line[]> {
+    return invoke<Line[]>("get_filter_lines", {
+        id,
+        filterId,
+        startIndex,
+        count,
+        query: query ?? null,
+        spec: spec ?? null,
+    });
+}
+
+/**
+ * 필터 보기에서 실제 줄 번호가 처음 나타나는 필터 인덱스를 조회합니다.
+ */
+export function filterIndexOf(filterId: number, line: number): Promise<number> {
+    return invoke<number>("filter_index_of", { filterId, line });
 }
 
 export type TailEvent =
@@ -168,6 +287,8 @@ export type TailEvent =
           lineCount: number;
           totalBytes: number;
           oldLineCount: number;
+          /** 활성 필터의 현재 줄 수 (필터가 없으면 null) */
+          filterCount?: number | null;
       }
     | { type: "rotated"; reason: "truncated" | "replaced" }
     | { type: "error"; message: string };

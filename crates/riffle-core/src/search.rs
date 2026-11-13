@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::filter::FilterSet;
 use crate::lines::LogFile;
 
 /// 최대 검색 결과 건수 (1,000만 건)
@@ -140,6 +141,16 @@ impl Matcher {
         }
     }
 
+    /// 이 매처가 빈 문자열(너비 0) 매치를 만들 수 있는지 반환한다.
+    /// 리터럴은 항상 비어있지 않은 매치만 만들고, 정규식은 빈 haystack 매치 여부로 판정한다.
+    /// RegexSet 등 "매치 존재"만 아는 경로에서 빈 매치 오판을 피하기 위해 사용한다.
+    pub(crate) fn can_match_empty(&self) -> bool {
+        match &self.kind {
+            MatcherKind::Literal(..) => false,
+            MatcherKind::Regex(re) => re.is_match(b""),
+        }
+    }
+
     /// 줄 안에 비어있지 않은 매치가 하나라도 있는지 반환한다.
     /// find_ranges가 비어있지 않은지와 동일한 의미이며, 할당 없이 조기 종료한다.
     pub(crate) fn line_has_match(&self, line: &[u8]) -> bool {
@@ -269,10 +280,209 @@ pub fn search(
     )
 }
 
+/// 필터 스캔: FilterSet을 통과하는 모든 줄 번호를 오름차순 배치로 전달한다.
+/// search와 동일한 파이프라인을 사용한다. 결과 "줄 수" 자체에는 상한을 두지 않는다
+/// (호출자가 LineSet으로 압축 저장하고 구간 수로 상한을 관리한다).
+pub fn filter_scan(
+    file: &LogFile,
+    set: &FilterSet,
+    cancel: &AtomicBool,
+    on_batch: &mut dyn FnMut(&[u64]),
+    on_progress: &mut dyn FnMut(SearchProgress),
+) -> Result<SearchOutcome> {
+    scan_with_config(
+        file,
+        &ScanJudge::Filter(set),
+        cancel,
+        on_batch,
+        on_progress,
+        SearchConfig {
+            max_results: usize::MAX,
+            ..SearchConfig::default()
+        },
+    )
+}
+
+/// 검색을 필터 안으로 한정한다. filter가 None이거나 비어 있으면 search와 동일하다.
+/// 결과 = 검색 매치 ∧ 필터 통과 (교집합).
+pub fn search_filtered(
+    file: &LogFile,
+    matcher: &Matcher,
+    filter: Option<&FilterSet>,
+    cancel: &AtomicBool,
+    on_batch: &mut dyn FnMut(&[u64]),
+    on_progress: &mut dyn FnMut(SearchProgress),
+) -> Result<SearchOutcome> {
+    let judge = match filter {
+        Some(f) if !f.is_empty() => ScanJudge::SearchFilter(matcher, f),
+        _ => ScanJudge::Search(matcher),
+    };
+    scan_with_config(
+        file,
+        &judge,
+        cancel,
+        on_batch,
+        on_progress,
+        SearchConfig::default(),
+    )
+}
+
+/// filter_lines_range가 사용하는 읽기 청크 크기
+const RANGE_SCAN_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// [start_line, end_line) 범위의 줄만 판정해 통과한 줄 번호를 오름차순 배치로 전달한다.
+/// tail 추가분 재판정용이다. 인덱스가 완료되어 시작 오프셋을 알 수 있어야 하며,
+/// 알 수 없으면 아무것도 전달하지 않고 반환한다.
+pub fn filter_lines_range(
+    file: &LogFile,
+    set: &FilterSet,
+    start_line: u64,
+    end_line: u64,
+    on_batch: &mut dyn FnMut(&[u64]),
+) -> Result<()> {
+    if start_line >= end_line {
+        return Ok(());
+    }
+    let source = file.source();
+    let confirmed = file.index().line_count();
+    if start_line >= confirmed {
+        return Ok(());
+    }
+    let end = end_line.min(confirmed);
+    let Some(mut offset) = file.index().line_start(source, start_line) else {
+        return Ok(());
+    };
+
+    let mut line_no = start_line;
+    let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
+    // 현재 줄의 바이트 누적 (LONG_LINE_ACC_LIMIT 초과 시 앞부분만 판정)
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_capped = false;
+    // 개행 없이 끝난 현재 줄에 바이트가 있는지 (EOF의 미완성 마지막 줄 판정용)
+    let mut tail_pending = false;
+
+    let mut buf = vec![0u8; RANGE_SCAN_CHUNK_SIZE];
+    while line_no < end {
+        let remaining = source.len().saturating_sub(offset);
+        if remaining == 0 {
+            break;
+        }
+        let to_read = (buf.len() as u64).min(remaining) as usize;
+        let n = source.read_into(&mut buf[..to_read], offset)?;
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+        let chunk = &buf[..n];
+
+        let mut seg = 0usize;
+        for nl in memchr::memchr_iter(b'\n', chunk) {
+            // chunk[seg..nl]이 현재 줄의 나머지 바이트
+            if !line_capped {
+                let piece = &chunk[seg..nl];
+                let room = LONG_LINE_ACC_LIMIT.saturating_sub(line_buf.len());
+                if piece.len() <= room {
+                    line_buf.extend_from_slice(piece);
+                } else {
+                    line_buf.extend_from_slice(&piece[..room]);
+                    line_capped = true;
+                }
+            }
+            // 줄 완료 → 판정 (개행으로 끝나는 줄은 항상 존재)
+            if set.passes(effective_line_bytes(&line_buf, line_capped)) {
+                batch.push(line_no);
+                if batch.len() >= BATCH_SIZE {
+                    on_batch(&batch);
+                    batch.clear();
+                }
+            }
+            line_buf.clear();
+            line_capped = false;
+            tail_pending = false;
+            line_no += 1;
+            seg = nl + 1;
+            if line_no >= end {
+                break;
+            }
+        }
+        if line_no >= end {
+            break;
+        }
+        // 개행 없는 나머지 → 다음 청크로 이어지는 줄의 일부
+        if seg < n {
+            if !line_capped {
+                let piece = &chunk[seg..];
+                let room = LONG_LINE_ACC_LIMIT.saturating_sub(line_buf.len());
+                if piece.len() <= room {
+                    line_buf.extend_from_slice(piece);
+                } else {
+                    line_buf.extend_from_slice(&piece[..room]);
+                    line_capped = true;
+                }
+            }
+            tail_pending = true;
+        }
+    }
+
+    // EOF의 개행 없는 마지막 줄
+    if line_no < end && tail_pending && set.passes(effective_line_bytes(&line_buf, line_capped)) {
+        batch.push(line_no);
+    }
+    if !batch.is_empty() {
+        on_batch(&batch);
+    }
+    Ok(())
+}
+
+/// 스캔 중 각 줄에 적용할 판정기.
+/// Search: 검색 매치만 / Filter: 필터 통과만 / SearchFilter: 검색 매치 ∧ 필터 통과.
+#[derive(Clone, Copy)]
+pub(crate) enum ScanJudge<'a> {
+    Search(&'a Matcher),
+    Filter(&'a FilterSet),
+    SearchFilter(&'a Matcher, &'a FilterSet),
+}
+
+impl<'a> ScanJudge<'a> {
+    /// 필터 판정에 완전한 줄 바이트가 필요한지 (Filter/SearchFilter)
+    fn needs_line_bytes(&self) -> bool {
+        matches!(self, ScanJudge::Filter(_) | ScanJudge::SearchFilter(..))
+    }
+
+    /// 이 판정에 사용되는 FilterSet (없으면 None)
+    fn filter(&self) -> Option<&'a FilterSet> {
+        match self {
+            ScanJudge::Search(_) => None,
+            ScanJudge::Filter(f) => Some(f),
+            ScanJudge::SearchFilter(_, f) => Some(f),
+        }
+    }
+}
+
 /// 테스트용 설정을 주입받아 검색을 실행하는 내부 함수
 pub(crate) fn search_with_config(
     file: &LogFile,
     matcher: &Matcher,
+    cancel: &AtomicBool,
+    on_batch: &mut dyn FnMut(&[u64]),
+    on_progress: &mut dyn FnMut(SearchProgress),
+    config: SearchConfig,
+) -> Result<SearchOutcome> {
+    scan_with_config(
+        file,
+        &ScanJudge::Search(matcher),
+        cancel,
+        on_batch,
+        on_progress,
+        config,
+    )
+}
+
+/// 판정기를 주입받아 파일을 스캔하는 내부 함수.
+/// search/filter_scan/search_filtered가 공유하는 파이프라인이다.
+pub(crate) fn scan_with_config(
+    file: &LogFile,
+    judge: &ScanJudge,
     cancel: &AtomicBool,
     on_batch: &mut dyn FnMut(&[u64]),
     on_progress: &mut dyn FnMut(SearchProgress),
@@ -389,18 +599,18 @@ pub(crate) fn search_with_config(
             if let Some(scan) = long_line.as_mut() {
                 let line_finished = match memchr::memchr(b'\n', &buf[..valid_len]) {
                     Some(nl) => {
-                        feed_long_line(scan, matcher, &buf[..nl], true);
+                        feed_long_line(scan, judge, &buf[..nl], true);
                         true
                     }
                     None => {
                         // 개행 없음: 파일 끝이면 이 청크가 줄의 끝
-                        feed_long_line(scan, matcher, &buf[..valid_len], is_eof);
+                        feed_long_line(scan, judge, &buf[..valid_len], is_eof);
                         is_eof
                     }
                 };
 
                 if line_finished {
-                    if scan.matched {
+                    if scan.result(judge) {
                         batch.push(scan.line_no);
                         total_matches += 1;
                         if batch.len() >= BATCH_SIZE {
@@ -466,7 +676,7 @@ pub(crate) fn search_with_config(
                         // carry_over에 누적하지 않고 스트리밍 스캔으로 전환한다.
                         // combined_buf 전체가 아직 검사되지 않은 줄의 앞부분이다.
                         let mut scan = LongLineScan::new(global_line_offset);
-                        feed_long_line(&mut scan, matcher, &combined_buf, false);
+                        feed_long_line(&mut scan, judge, &combined_buf, false);
                         long_line = Some(scan);
                         carry_over.clear();
                         on_progress(SearchProgress {
@@ -509,7 +719,7 @@ pub(crate) fn search_with_config(
                 // Rayon 병렬 검색 수행
                 let results: Vec<(u64, Vec<u64>)> = subchunks
                     .par_iter()
-                    .map(|sub| search_subchunk(sub, matcher, cancel))
+                    .map(|sub| eval_subchunk(sub, judge, cancel))
                     .collect();
 
                 // 순차 prefix sum 으로 전역 줄 번호 계산 및 결과 배치 전송
@@ -608,6 +818,16 @@ fn line_bounds_around(sub: &[u8], pos: usize, abs: usize) -> (usize, usize, usiz
     (line_start, content_end, next_pos)
 }
 
+/// 판정기에 따라 서브청크 평가 함수를 선택한다.
+/// 반환값: (서브청크 내 전체 줄 수, 매치된 로컬 줄 번호 목록)
+fn eval_subchunk(sub: &[u8], judge: &ScanJudge, cancel: &AtomicBool) -> (u64, Vec<u64>) {
+    match judge {
+        ScanJudge::Search(m) => search_subchunk(sub, m, None, cancel),
+        ScanJudge::Filter(f) => filter_subchunk(sub, f, cancel),
+        ScanJudge::SearchFilter(m, f) => search_subchunk(sub, m, Some(f), cancel),
+    }
+}
+
 /// 단일 서브청크(줄 단위로 정렬된 슬라이스) 내에서 매치 검색 수행.
 /// 반환값: (서브청크 내 전체 줄 수, 매치된 로컬 줄 번호 목록)
 ///
@@ -617,7 +837,13 @@ fn line_bounds_around(sub: &[u8], pos: usize, abs: usize) -> (usize, usize, usiz
 /// (예: `foo\sbar`) 어느 한 줄의 텍스트 안에 매치가 없으면 기록하지 않는다.
 /// 결과와 관계없이 다음 줄 시작부터 재탐색하므로 교차 매치가 앞 줄에서 시작해도
 /// 뒤 줄의 매치를 놓치지 않는다. 한 줄에 여러 매치가 있어도 1회만 기록한다.
-fn search_subchunk(sub: &[u8], matcher: &Matcher, cancel: &AtomicBool) -> (u64, Vec<u64>) {
+/// filter가 Some이면 검색 매치에 더해 필터 통과 줄만 기록한다 (교집합).
+fn search_subchunk(
+    sub: &[u8],
+    matcher: &Matcher,
+    filter: Option<&FilterSet>,
+    cancel: &AtomicBool,
+) -> (u64, Vec<u64>) {
     if sub.is_empty() {
         return (0, Vec::new());
     }
@@ -660,12 +886,56 @@ fn search_subchunk(sub: &[u8], matcher: &Matcher, cancel: &AtomicBool) -> (u64, 
             Some(fb) => fb.may_contain(line) && matcher.line_has_match(line),
             None => matcher.line_has_match(line),
         };
-        if has_match {
+        if has_match && filter.is_none_or(|f| f.passes(line)) {
             matched_lines.push(line_idx);
         }
 
         pos = next_pos;
         line_no = line_idx + 1;
+    }
+
+    (total_lines, matched_lines)
+}
+
+/// 필터 판정 서브청크: 모든 줄을 순회해 FilterSet::passes로 판정한다.
+/// 반환값은 search_subchunk과 동일한 (전체 줄 수, 통과한 로컬 줄 번호 목록).
+fn filter_subchunk(sub: &[u8], set: &FilterSet, cancel: &AtomicBool) -> (u64, Vec<u64>) {
+    if sub.is_empty() {
+        return (0, Vec::new());
+    }
+
+    let newline_count = memchr::memchr_iter(b'\n', sub).count() as u64;
+    let total_lines = if !sub.ends_with(b"\n") {
+        newline_count + 1
+    } else {
+        newline_count
+    };
+
+    let mut matched_lines = Vec::new();
+    let mut pos = 0usize; // 항상 줄 시작 위치
+    let mut line_no = 0u64;
+
+    while pos < sub.len() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // 이 줄의 끝: 개행 위치(제외) 또는 슬라이스 끝
+        let (content_end, next) = match memchr::memchr(b'\n', &sub[pos..]) {
+            Some(p) => (pos + p, pos + p + 1),
+            None => (sub.len(), sub.len()),
+        };
+        // 개행 제외, 끝의 '\r' 하나 제거 (search_subchunk과 동일 규칙)
+        let mut line_end = content_end;
+        if line_end > pos && sub[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        if set.passes(&sub[pos..line_end]) {
+            matched_lines.push(line_no);
+        }
+
+        pos = next;
+        line_no += 1;
     }
 
     (total_lines, matched_lines)
@@ -967,6 +1237,12 @@ struct LongLineScan {
     overlap: Vec<u8>,
     /// 정규식 haystack(overlap ++ portion) 조립용 재사용 버퍼
     scratch: Vec<u8>,
+    /// 필터 판정용 줄 바이트 누적 (Filter/SearchFilter 판정기만 사용)
+    acc: Vec<u8>,
+    /// acc가 상한에 도달해 이후 바이트를 버렸는지
+    acc_capped: bool,
+    /// 줄 끝에서 확정된 필터 판정 결과
+    filter_passed: bool,
 }
 
 impl LongLineScan {
@@ -977,6 +1253,18 @@ impl LongLineScan {
             scanned: 0,
             overlap: Vec::new(),
             scratch: Vec::new(),
+            acc: Vec::new(),
+            acc_capped: false,
+            filter_passed: false,
+        }
+    }
+
+    /// 줄이 끝났을 때 이 줄이 결과에 포함되는지 판정한다.
+    fn result(&self, judge: &ScanJudge) -> bool {
+        match judge {
+            ScanJudge::Search(_) => self.matched,
+            ScanJudge::Filter(_) => self.filter_passed,
+            ScanJudge::SearchFilter(..) => self.matched && self.filter_passed,
         }
     }
 }
@@ -999,10 +1287,68 @@ fn update_overlap(overlap: &mut Vec<u8>, portion: &[u8], keep: usize) {
     }
 }
 
-/// 긴 줄의 한 청크(portion: 개행 미포함 줄 조각)를 스트리밍 검사한다.
+/// 필터 판정용으로 스트리밍 누적하는 줄 바이트의 상한.
+/// 이보다 긴 줄은 앞부분만으로 판정한다 (메모리 상한을 위한 근사치).
+const LONG_LINE_ACC_LIMIT: usize = 64 * 1024 * 1024;
+
+/// 누적 버퍼에 portion을 추가한다. 상한 초과 시 잘라내고 capped를 표시한다.
+fn accumulate_line_bytes(buf: &mut Vec<u8>, capped: &mut bool, portion: &[u8]) {
+    if *capped {
+        return;
+    }
+    let room = LONG_LINE_ACC_LIMIT.saturating_sub(buf.len());
+    if portion.len() <= room {
+        buf.extend_from_slice(portion);
+    } else {
+        buf.extend_from_slice(&portion[..room]);
+        *capped = true;
+    }
+}
+
+/// 누적된 줄 바이트에서 판정용 유효 범위를 만든다.
+/// capped가 아니고 끝이 '\r'이면 하나 제거한다 (줄 끝 \r 규칙과 동일).
+fn effective_line_bytes(buf: &[u8], capped: bool) -> &[u8] {
+    if !capped && buf.last() == Some(&b'\r') {
+        &buf[..buf.len() - 1]
+    } else {
+        buf
+    }
+}
+
+/// 긴 줄의 한 청크(portion: 개행 미포함 줄 조각)를 판정기에 따라 스트리밍 검사한다.
 /// line_ended는 이 portion이 줄의 끝(개행 발견 또는 파일 끝)에 도달했는지 여부.
+fn feed_long_line(scan: &mut LongLineScan, judge: &ScanJudge, portion: &[u8], line_ended: bool) {
+    // 1) 검색 매치 부분 (Search/SearchFilter만)
+    match *judge {
+        ScanJudge::Search(m) | ScanJudge::SearchFilter(m, _) => {
+            feed_matcher_long_line(scan, m, portion, line_ended);
+        }
+        ScanJudge::Filter(_) => {}
+    }
+
+    // 2) 필터 판정용 줄 바이트 누적 (Filter/SearchFilter)
+    if judge.needs_line_bytes() {
+        accumulate_line_bytes(&mut scan.acc, &mut scan.acc_capped, portion);
+    }
+
+    // 3) 줄 끝이면 필터 판정 확정
+    if line_ended {
+        scan.filter_passed = match judge.filter() {
+            Some(f) => f.passes(effective_line_bytes(&scan.acc, scan.acc_capped)),
+            None => true,
+        };
+    }
+}
+
+/// 긴 줄 청크의 검색 매치 부분만 검사한다 (기존 feed_long_line 본체).
+/// line_ended는 이 portion이 줄의 끝에 도달했는지 여부.
 /// 호출 전에 portion 끝의 '\r' 제거는 이 함수가 line_ended일 때 처리한다.
-fn feed_long_line(scan: &mut LongLineScan, matcher: &Matcher, portion: &[u8], line_ended: bool) {
+fn feed_matcher_long_line(
+    scan: &mut LongLineScan,
+    matcher: &Matcher,
+    portion: &[u8],
+    line_ended: bool,
+) {
     if scan.matched {
         scan.scanned += portion.len() as u64;
         return;

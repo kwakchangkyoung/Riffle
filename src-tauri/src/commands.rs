@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use riffle_core::{LogFile, Matcher, SearchOptions};
+use riffle_core::{
+    Combine, FilterRule, FilterSet, FilterSpec, Level, LineSet, LogFile, Matcher, RuleKind,
+    SearchOptions,
+};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri::ipc::Channel;
@@ -61,6 +64,8 @@ pub struct LineDto {
     pub byte_len: u64,
     pub truncated: bool,
     pub highlights: Vec<(u32, u32)>,
+    /// 활성 포함 규칙의 매치 범위 (UTF-16 start, end, 규칙 인덱스)
+    pub rule_highlights: Vec<(u32, u32, u32)>,
 }
 
 impl From<riffle_core::Line> for LineDto {
@@ -71,6 +76,7 @@ impl From<riffle_core::Line> for LineDto {
             byte_len: line.byte_len,
             truncated: line.truncated,
             highlights: line.highlights,
+            rule_highlights: line.rule_highlights,
         }
     }
 }
@@ -91,6 +97,155 @@ impl From<&QueryDto> for SearchOptions {
             case_sensitive: dto.case_sensitive,
         }
     }
+}
+
+/// 필터 규칙 DTO.
+/// color는 프론트 표시용이며 Rust는 저장만 하고 판정에 사용하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterRuleDto {
+    pub pattern: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    /// "include" | "exclude"
+    pub kind: String,
+    pub enabled: bool,
+    /// 규칙별 하이라이트 색상
+    pub color: String,
+}
+
+/// 필터 조건 DTO
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterSpecDto {
+    pub rules: Vec<FilterRuleDto>,
+    /// "and" | "or"
+    pub combine: String,
+    /// "error" | "warn" | "info" | "debug" | "trace"
+    pub levels: Vec<String>,
+}
+
+/// 필터 프리셋 DTO (이름 + 조건)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterPresetDto {
+    pub name: String,
+    pub spec: FilterSpecDto,
+}
+
+/// 필터 상태 조회 결과 DTO
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterInfoDto {
+    pub id: u32,
+    pub file_id: u32,
+    pub spec: FilterSpecDto,
+    /// 현재까지 판정된 보이는 줄 수
+    pub total: u64,
+    pub done: bool,
+    pub capped: bool,
+}
+
+/// 규칙 종류 문자열을 코어 RuleKind로 변환한다.
+fn rule_kind_of(s: &str) -> Result<RuleKind, String> {
+    match s {
+        "include" => Ok(RuleKind::Include),
+        "exclude" => Ok(RuleKind::Exclude),
+        _ => Err(format!("알 수 없는 필터 규칙 종류: '{s}'")),
+    }
+}
+
+/// 결합 방식 문자열을 코어 Combine으로 변환한다.
+fn combine_of(s: &str) -> Result<Combine, String> {
+    match s {
+        "and" => Ok(Combine::And),
+        "or" => Ok(Combine::Or),
+        _ => Err(format!("알 수 없는 필터 결합 방식: '{s}'")),
+    }
+}
+
+/// 레벨 문자열을 코어 Level로 변환한다.
+fn level_of(s: &str) -> Result<Level, String> {
+    match s {
+        "error" => Ok(Level::Error),
+        "warn" => Ok(Level::Warn),
+        "info" => Ok(Level::Info),
+        "debug" => Ok(Level::Debug),
+        "trace" => Ok(Level::Trace),
+        _ => Err(format!("알 수 없는 로그 레벨: '{s}'")),
+    }
+}
+
+/// DTO 필터 조건을 코어 FilterSpec으로 변환한다.
+/// 알 수 없는 kind/combine/level 문자열은 Err를 반환한다.
+pub fn filter_spec_of(dto: &FilterSpecDto) -> Result<FilterSpec, String> {
+    let rules = dto
+        .rules
+        .iter()
+        .map(|r| {
+            Ok(FilterRule {
+                pattern: r.pattern.clone(),
+                options: SearchOptions {
+                    regex: r.regex,
+                    case_sensitive: r.case_sensitive,
+                },
+                kind: rule_kind_of(&r.kind)?,
+                enabled: r.enabled,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let combine = combine_of(&dto.combine)?;
+    let levels = dto
+        .levels
+        .iter()
+        .map(|l| level_of(l))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(FilterSpec {
+        rules,
+        combine,
+        levels,
+    })
+}
+
+/// spec이 유효하면 컴파일된 FilterSet을 반환한다.
+/// 무효한 spec(나쁜 정규식, 알 수 없는 값)이면 None — 하이라이트 없이 진행하기 위함.
+fn compile_filter_set(spec: Option<&FilterSpecDto>) -> Option<FilterSet> {
+    let dto = spec?;
+    let core = filter_spec_of(dto).ok()?;
+    FilterSet::new(&core).ok()
+}
+
+/// LineSet을 bins 구간으로 나눠 각 구간의 보이는 줄 수를 계산한다.
+/// 각 bin의 줄 범위 [lo, hi) 안 원소 수 = rank(hi) - rank(lo).
+/// bin 경계는 compute_search_density와 같은 floor(line * bins / total_lines) 규칙이다.
+pub fn compute_filter_density(lines: &LineSet, bins: u32, total_lines: u64) -> Vec<u32> {
+    let bins = bins.min(2000);
+    if bins == 0 {
+        return Vec::new();
+    }
+    let mut counts = vec![0u32; bins as usize];
+    if total_lines == 0 {
+        return counts;
+    }
+
+    let bins_u128 = bins as u128;
+    let total_u128 = total_lines as u128;
+
+    for b in 0..bins as u64 {
+        // bin b에 속하는 줄 l: floor(l * bins / total) == b
+        // → l ∈ [ceil(b*total/bins), ceil((b+1)*total/bins))
+        let lo = (b as u128 * total_u128).div_ceil(bins_u128);
+        let hi = ((b as u128 + 1) * total_u128).div_ceil(bins_u128);
+        if hi <= lo {
+            continue;
+        }
+        let lo = lo.min(u64::MAX as u128) as u64;
+        let hi = hi.min(u64::MAX as u128) as u64;
+        let cnt = lines.rank(hi).saturating_sub(lines.rank(lo));
+        counts[b as usize] = cnt.min(u32::MAX as u64) as u32;
+    }
+
+    counts
 }
 
 /// 검색 진행 이벤트 스트림 DTO
@@ -275,26 +430,30 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
 }
 
 /// LogFile 인스턴스에서 지정한 범위의 줄들을 읽어 LineDto 벡터로 변환한다.
+/// filter가 주어지면 각 줄의 활성 포함 규칙 매치 범위(rule_highlights)를 채운다.
 pub fn read_lines_from_file(
     file: &LogFile,
     start: u64,
     count: u32,
     matcher: Option<&Matcher>,
+    filter: Option<&FilterSet>,
 ) -> Result<Vec<LineDto>, String> {
     let lines = file
-        .read_lines(start, count as u64, matcher)
+        .read_lines(start, count as u64, matcher, filter)
         .map_err(|e| format!("줄 읽기 실패: {e}"))?;
     Ok(lines.into_iter().map(LineDto::from).collect())
 }
 
 /// LogFile 인스턴스에서 임의 줄 번호 목록을 읽어 LineDto 벡터로 변환한다.
+/// filter가 주어지면 각 줄의 활성 포함 규칙 매치 범위(rule_highlights)를 채운다.
 pub fn read_filtered_lines_from_file(
     file: &LogFile,
     line_nos: &[u64],
     matcher: Option<&Matcher>,
+    filter: Option<&FilterSet>,
 ) -> Result<Vec<LineDto>, String> {
     let lines = file
-        .read_lines_at(line_nos, matcher)
+        .read_lines_at(line_nos, matcher, filter)
         .map_err(|e| format!("필터 줄 읽기 실패: {e}"))?;
     Ok(lines.into_iter().map(LineDto::from).collect())
 }
@@ -484,6 +643,7 @@ pub async fn open_file(
 
 /// 지정된 범위의 로그 줄들을 읽어 반환한다.
 /// 전달된 query가 무효한 경우(문법 오류 등) 에러 대신 하이라이트 없이 정상 줄을 반환한다.
+/// spec이 오면 유효한 규칙의 매치 범위를 rule_highlights로 채운다 (무효 spec이면 비워둠).
 #[tauri::command]
 pub async fn get_lines(
     state: tauri::State<'_, AppState>,
@@ -491,6 +651,7 @@ pub async fn get_lines(
     start: u64,
     count: u32,
     query: Option<QueryDto>,
+    spec: Option<FilterSpecDto>,
 ) -> Result<Vec<LineDto>, String> {
     let file = state.get_file(id)?;
     let clamped_count = clamp_get_lines_count(count);
@@ -500,7 +661,14 @@ pub async fn get_lines(
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        read_lines_from_file(&file, start, clamped_count, matcher.as_ref())
+        let highlight_filter = compile_filter_set(spec.as_ref());
+        read_lines_from_file(
+            &file,
+            start,
+            clamped_count,
+            matcher.as_ref(),
+            highlight_filter.as_ref(),
+        )
     })
     .await
     .map_err(|e| format!("줄 읽기 비동기 태스크 실패: {e}"))?
@@ -508,6 +676,7 @@ pub async fn get_lines(
 
 /// 필터 모드: 검색 결과 목록의 [start_index, start_index + count) 줄들을 읽어 반환한다.
 /// 전달된 query가 무효한 경우 에러 대신 하이라이트 없이 정상 줄을 반환한다.
+/// spec이 오면 유효한 규칙의 매치 범위를 rule_highlights로 채운다 (무효 spec이면 비워둠).
 #[tauri::command]
 pub async fn get_filtered_lines(
     state: tauri::State<'_, AppState>,
@@ -516,6 +685,7 @@ pub async fn get_filtered_lines(
     start_index: u64,
     count: u32,
     query: Option<QueryDto>,
+    spec: Option<FilterSpecDto>,
 ) -> Result<Vec<LineDto>, String> {
     let file = state.get_file(id)?;
     let search = state.get_search(search_id)?;
@@ -543,7 +713,65 @@ pub async fn get_filtered_lines(
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        read_filtered_lines_from_file(&file, &line_nos, matcher.as_ref())
+        let highlight_filter = compile_filter_set(spec.as_ref());
+        read_filtered_lines_from_file(
+            &file,
+            &line_nos,
+            matcher.as_ref(),
+            highlight_filter.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("필터 줄 읽기 비동기 태스크 실패: {e}"))?
+}
+
+/// 다중 필터 모드: 필터 결과 목록의 [start_index, start_index + count) 줄들을 읽어 반환한다.
+/// query는 검색 하이라이트용이며, spec은 규칙 하이라이트(rule_highlights)용이다.
+/// 둘 다 무효하면 에러 대신 하이라이트 없이 정상 줄을 반환한다.
+#[tauri::command]
+pub async fn get_filter_lines(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    filter_id: u32,
+    start_index: u64,
+    count: u32,
+    query: Option<QueryDto>,
+    spec: Option<FilterSpecDto>,
+) -> Result<Vec<LineDto>, String> {
+    let file = state.get_file(id)?;
+    let filter = state.get_filter(filter_id)?;
+    if filter.file_id != id {
+        return Err(format!(
+            "필터 ID {}는 파일 ID {}에 속하지 않습니다.",
+            filter_id, id
+        ));
+    }
+
+    let clamped_count = clamp_get_lines_count(count);
+    let line_nos = {
+        let lines = filter.lines.read().map_err(|e| e.to_string())?;
+        let len = lines.len() as usize;
+        let start = start_index as usize;
+        if start >= len {
+            Vec::new()
+        } else {
+            let end = (start + clamped_count as usize).min(len);
+            (start..end).filter_map(|i| lines.nth(i as u64)).collect()
+        }
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let matcher = match query {
+            Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
+            None => None,
+        };
+        let highlight_filter = compile_filter_set(spec.as_ref());
+        read_filtered_lines_from_file(
+            &file,
+            &line_nos,
+            matcher.as_ref(),
+            highlight_filter.as_ref(),
+        )
     })
     .await
     .map_err(|e| format!("필터 줄 읽기 비동기 태스크 실패: {e}"))?
@@ -606,7 +834,7 @@ pub async fn get_full_line(
     tauri::async_runtime::spawn_blocking(move || {
         // byte_len은 read_lines가 제공한다 (16KB 초과 줄도 개행까지 스캔해 정확한 길이를 계산).
         // 16KB 이내 줄은 이미 전체 원문이므로 read_full_line 호출 없이 바로 반환한다.
-        let meta = read_lines_from_file(&file, no, 1, None)?;
+        let meta = read_lines_from_file(&file, no, 1, None, None)?;
         let Some(line) = meta.into_iter().next() else {
             return Ok(None);
         };
@@ -661,16 +889,235 @@ pub async fn validate_query(query: QueryDto) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 필터 조건 유효성을 검사한다 (FilterSet 컴파일 성공 여부).
+/// 잘못된 정규식은 "규칙 N: …" 형태의 메시지를 반환한다.
+#[tauri::command]
+pub async fn validate_filter(spec: FilterSpecDto) -> Result<(), String> {
+    let core = filter_spec_of(&spec)?;
+    FilterSet::new(&core).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 백그라운드 필터 스캔을 시작하고 필터 ID를 반환한다.
+/// 같은 파일의 이전 필터는 자동 취소·제거된다.
+#[tauri::command]
+pub async fn start_filter(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+    spec: FilterSpecDto,
+    on_event: Channel<SearchEvent>,
+) -> Result<u32, String> {
+    let file = state.get_file(id)?;
+    let core_spec = filter_spec_of(&spec)?;
+    let set = Arc::new(FilterSet::new(&core_spec).map_err(|e| e.to_string())?);
+    if set.is_empty() {
+        return Err("적용할 필터 조건이 없습니다.".to_string());
+    }
+
+    // 파일이 이미 닫혔으면 Err — 스캔 스레드를 띄우지 않는다
+    let filter_state = state.insert_filter(id, spec, set)?;
+
+    let filter_id = filter_state.id;
+    std::thread::spawn(move || {
+        run_filter_scan(file, filter_state, on_event);
+    });
+
+    Ok(filter_id)
+}
+
+/// 진행 중인 필터 스캔을 취소한다.
+#[tauri::command]
+pub async fn cancel_filter(
+    state: tauri::State<'_, AppState>,
+    filter_id: u32,
+) -> Result<(), String> {
+    state.cancel_filter(filter_id);
+    Ok(())
+}
+
+/// 필터 상태(조건, 현재까지의 보이는 줄 수, 완료/상한 여부)를 조회한다.
+#[tauri::command]
+pub async fn get_filter(
+    state: tauri::State<'_, AppState>,
+    filter_id: u32,
+) -> Result<FilterInfoDto, String> {
+    let filter = state.get_filter(filter_id)?;
+    let total = {
+        let lines = filter.lines.read().map_err(|e| e.to_string())?;
+        lines.len()
+    };
+    Ok(FilterInfoDto {
+        id: filter.id,
+        file_id: filter.file_id,
+        spec: filter.spec.clone(),
+        total,
+        done: filter.done.load(Ordering::Relaxed),
+        capped: filter.capped.load(Ordering::Relaxed),
+    })
+}
+
+/// line 이상인 첫 보이는 줄의 필터 내 index(rank)를 반환한다.
+/// 스크롤 위치 유지용: 보던 줄이 숨겨지면 그 다음 보이는 줄의 위치를 구한다.
+#[tauri::command]
+pub async fn filter_index_of(
+    state: tauri::State<'_, AppState>,
+    filter_id: u32,
+    line: u64,
+) -> Result<u64, String> {
+    let filter = state.get_filter(filter_id)?;
+    let lines = filter.lines.read().map_err(|e| e.to_string())?;
+    Ok(lines.rank(line))
+}
+
+/// 스크롤바 미니맵용 필터 밀도를 조회한다.
+#[tauri::command]
+pub async fn filter_density(
+    state: tauri::State<'_, AppState>,
+    filter_id: u32,
+    bins: u32,
+    total_lines: u64,
+) -> Result<Vec<u32>, String> {
+    let filter = state.get_filter(filter_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let lines = filter.lines.read().map_err(|e| e.to_string())?;
+        Ok(compute_filter_density(&lines, bins, total_lines))
+    })
+    .await
+    .map_err(|e| format!("필터 밀도 계산 비동기 태스크 실패: {e}"))?
+}
+
+/// 백그라운드 필터 스캔 스레드 본체.
+/// 매치된 줄 번호를 LineSet에 누적하고 진행률/완료/취소/오류를 Channel로 보낸다.
+/// 스캔 완료 후에는 인덱스를 한 번 갱신해 tail로 추가된 꼬리도 반영한다.
+fn run_filter_scan(
+    file: Arc<LogFile>,
+    filter_state: Arc<crate::state::FilterState>,
+    on_event: Channel<SearchEvent>,
+) {
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut last_progress_send = Instant::now();
+        let mut sent_first_match = false;
+
+        let outcome = riffle_core::filter_scan(
+            &file,
+            filter_state.set.as_ref(),
+            &filter_state.cancel,
+            &mut |batch| {
+                let mut lines = filter_state
+                    .lines
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                for &n in batch {
+                    lines.push_line(n);
+                }
+                if lines.range_count() > riffle_core::MAX_FILTER_RANGES {
+                    filter_state.capped.store(true, Ordering::Relaxed);
+                    filter_state.cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &mut |p| {
+                let now = Instant::now();
+                let is_first_match = !sent_first_match && p.match_count > 0;
+                let should_send = is_first_match
+                    || now.duration_since(last_progress_send) >= Duration::from_millis(50);
+
+                if should_send {
+                    if is_first_match {
+                        sent_first_match = true;
+                    }
+                    last_progress_send = now;
+                    let _ = on_event.send(SearchEvent::Progress {
+                        scanned_bytes: p.scanned_bytes,
+                        total_bytes: p.total_bytes,
+                        match_count: p.match_count,
+                    });
+                }
+            },
+        );
+
+        // 스캔 중 tail로 추가된 꼬리 반영: 인덱스를 갱신하고 마지막 줄을 재판정한다.
+        // 스캔이 취소/상한이어도 이미 모은 줄은 유지한다.
+        if let Ok(riffle_core::RefreshOutcome::Appended {
+            old_line_count,
+            new_line_count,
+            ..
+        }) = file.refresh()
+        {
+            filter_state.apply_appended(&file, old_line_count, new_line_count);
+        }
+
+        let total = {
+            let lines = filter_state.lines.read().unwrap_or_else(|p| p.into_inner());
+            lines.len()
+        };
+        let capped = filter_state.capped.load(Ordering::Relaxed);
+
+        match outcome {
+            Ok(riffle_core::SearchOutcome::Completed { .. }) => {
+                filter_state.done.store(true, Ordering::Relaxed);
+                let _ = on_event.send(SearchEvent::Done { total, capped });
+            }
+            Ok(riffle_core::SearchOutcome::Capped { .. }) => {
+                filter_state.done.store(true, Ordering::Relaxed);
+                let _ = on_event.send(SearchEvent::Done {
+                    total,
+                    capped: true,
+                });
+            }
+            Ok(riffle_core::SearchOutcome::Cancelled) => {
+                if capped {
+                    filter_state.done.store(true, Ordering::Relaxed);
+                    let _ = on_event.send(SearchEvent::Done { total, capped });
+                } else {
+                    let _ = on_event.send(SearchEvent::Cancelled);
+                }
+            }
+            Err(err) => {
+                let _ = on_event.send(SearchEvent::Error {
+                    message: err.to_string(),
+                });
+            }
+        }
+    }));
+
+    if let Err(panic_payload) = panic_result {
+        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "필터 스캔 스레드 실행 중 알 수 없는 패닉이 발생했습니다.".to_string()
+        };
+        let _ = on_event.send(SearchEvent::Error { message: msg });
+    }
+}
+
 /// 백그라운드 검색을 시작하고 검색 ID를 반환한다.
+/// filter_id가 주어지면 해당 필터의 조건과 교집합(검색 매치 ∧ 필터 통과)으로 검색한다.
 #[tauri::command]
 pub async fn search(
     state: tauri::State<'_, AppState>,
     id: u32,
     query: QueryDto,
+    filter_id: Option<u32>,
     on_event: Channel<SearchEvent>,
 ) -> Result<u32, String> {
     let file = state.get_file(id)?;
     let matcher = Matcher::new(&query.query, (&query).into()).map_err(|e| e.to_string())?;
+
+    // filter_id가 있으면 그 필터의 spec으로 FilterSet을 만든다
+    let filter_set = match filter_id {
+        Some(fid) => {
+            let f = state.get_filter(fid)?;
+            if f.file_id != id {
+                return Err(format!(
+                    "필터 ID {}는 파일 ID {}에 속하지 않습니다.",
+                    fid, id
+                ));
+            }
+            Some(f.set.clone())
+        }
+        None => None,
+    };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let results = Arc::new(std::sync::RwLock::new(Vec::new()));
@@ -698,9 +1145,11 @@ pub async fn search(
             let mut last_progress_send = Instant::now();
             let mut sent_first_match = false;
 
-            let outcome = riffle_core::search(
+            // filter가 없으면(None) 기존 search와 동일한 경로로 실행된다
+            let outcome = riffle_core::search_filtered(
                 &file,
                 &matcher,
+                filter_set.as_deref(),
                 &thread_cancel,
                 &mut |batch| {
                     if let Ok(mut lock) = thread_results.write() {
@@ -821,6 +1270,55 @@ pub async fn search_density(
     .map_err(|e| format!("검색 밀도 계산 비동기 태스크 실패: {e}"))?
 }
 
+/// 프리셋 저장 디렉터리 (app_data_dir)를 반환한다.
+fn presets_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|e| format!("앱 데이터 디렉터리 조회 실패: {e}"))
+}
+
+/// 저장된 필터 프리셋 목록을 이름순으로 반환한다.
+#[tauri::command]
+pub async fn list_filter_presets(app: tauri::AppHandle) -> Result<Vec<FilterPresetDto>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = presets_dir(&app)?;
+        crate::presets::with_presets_lock(|| crate::presets::list_presets(&dir))
+    })
+    .await
+    .map_err(|e| format!("프리셋 목록 조회 비동기 태스크 실패: {e}"))?
+}
+
+/// 필터 프리셋을 저장한다. 같은 이름이 있으면 덮어쓴다.
+/// spec이 컴파일되지 않으면(나쁜 정규식 등) 저장하지 않고 Err를 반환한다.
+#[tauri::command]
+pub async fn save_filter_preset(
+    app: tauri::AppHandle,
+    name: String,
+    spec: FilterSpecDto,
+) -> Result<(), String> {
+    // 저장 전에 spec 유효성을 검사한다
+    let core = filter_spec_of(&spec)?;
+    FilterSet::new(&core).map_err(|e| e.to_string())?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = presets_dir(&app)?;
+        crate::presets::with_presets_lock(|| crate::presets::save_preset(&dir, &name, spec))
+    })
+    .await
+    .map_err(|e| format!("프리셋 저장 비동기 태스크 실패: {e}"))?
+}
+
+/// 필터 프리셋을 삭제한다. 없으면 Err.
+#[tauri::command]
+pub async fn delete_filter_preset(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = presets_dir(&app)?;
+        crate::presets::with_presets_lock(|| crate::presets::delete_preset(&dir, &name))
+    })
+    .await
+    .map_err(|e| format!("프리셋 삭제 비동기 태스크 실패: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,7 +1377,7 @@ mod tests {
         let cancel = &opened.cancel;
         file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
 
-        let lines = read_lines_from_file(file, 0, 3, None).expect("줄 읽기 실패");
+        let lines = read_lines_from_file(file, 0, 3, None, None).expect("줄 읽기 실패");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0");
         assert_eq!(lines[1].text, "line 1");
@@ -1082,7 +1580,7 @@ mod tests {
         let matcher = Matcher::new(&invalid_query.query, (&invalid_query).into()).ok();
         assert!(matcher.is_none());
 
-        let lines = read_lines_from_file(file, 0, 3, matcher.as_ref())
+        let lines = read_lines_from_file(file, 0, 3, matcher.as_ref(), None)
             .expect("무효 쿼리 시에도 줄 읽기는 성공해야 함");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "line 0: standard log message");
@@ -1103,7 +1601,7 @@ mod tests {
         let valid_matcher = Matcher::new(&valid_query.query, (&valid_query).into()).ok();
         assert!(valid_matcher.is_some());
 
-        let lines_with_hl = read_lines_from_file(file, 0, 3, valid_matcher.as_ref())
+        let lines_with_hl = read_lines_from_file(file, 0, 3, valid_matcher.as_ref(), None)
             .expect("정상 쿼리 줄 읽기 성공");
         assert_eq!(lines_with_hl.len(), 3);
         assert!(lines_with_hl[0].highlights.is_empty());
@@ -1168,7 +1666,7 @@ mod tests {
         assert!(matcher.is_none());
 
         let line_nos = [1, 2];
-        let lines = read_filtered_lines_from_file(file, &line_nos, matcher.as_ref())
+        let lines = read_filtered_lines_from_file(file, &line_nos, matcher.as_ref(), None)
             .expect("필터 줄 읽기 성공");
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].no, 1);
@@ -1177,5 +1675,212 @@ mod tests {
         assert_eq!(lines[1].no, 2);
         assert_eq!(lines[1].text, "line 2: err again");
         assert!(lines[1].highlights.is_empty());
+    }
+
+    fn rule(pattern: &str, kind: &str, enabled: bool) -> FilterRuleDto {
+        FilterRuleDto {
+            pattern: pattern.to_string(),
+            regex: false,
+            case_sensitive: true,
+            kind: kind.to_string(),
+            enabled,
+            color: "#123456".to_string(),
+        }
+    }
+
+    fn spec_dto(rules: Vec<FilterRuleDto>, combine: &str, levels: Vec<&str>) -> FilterSpecDto {
+        FilterSpecDto {
+            rules,
+            combine: combine.to_string(),
+            levels: levels.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_filter_spec_of_conversion() {
+        let dto = spec_dto(
+            vec![
+                rule("ERROR", "include", true),
+                rule("heartbeat", "exclude", false),
+            ],
+            "and",
+            vec!["error", "warn"],
+        );
+        let spec = filter_spec_of(&dto).expect("변환 성공");
+        assert_eq!(spec.rules.len(), 2);
+        assert_eq!(spec.rules[0].kind, RuleKind::Include);
+        assert!(!spec.rules[1].enabled);
+        assert_eq!(spec.combine, Combine::And);
+        assert_eq!(spec.levels, vec![Level::Error, Level::Warn]);
+    }
+
+    #[test]
+    fn test_filter_spec_of_rejects_unknown_values() {
+        // 알 수 없는 kind
+        let bad_kind = spec_dto(vec![rule("x", "maybe", true)], "or", vec![]);
+        assert!(filter_spec_of(&bad_kind).is_err());
+        // 알 수 없는 combine
+        let bad_combine = spec_dto(vec![], "xor", vec![]);
+        assert!(filter_spec_of(&bad_combine).is_err());
+        // 알 수 없는 level
+        let bad_level = spec_dto(vec![], "or", vec!["fatal"]);
+        assert!(filter_spec_of(&bad_level).is_err());
+    }
+
+    #[test]
+    fn test_compile_filter_set_invalid_returns_none() {
+        // 나쁜 정규식 → None (하이라이트 없이 진행)
+        let mut bad = rule("(", "include", true);
+        bad.regex = true;
+        let set = compile_filter_set(Some(&spec_dto(vec![bad], "or", vec![])));
+        assert!(set.is_none());
+        // spec 자체가 None → None
+        assert!(compile_filter_set(None).is_none());
+        // 유효 spec → Some
+        let ok = spec_dto(vec![rule("ERROR", "include", true)], "or", vec![]);
+        assert!(compile_filter_set(Some(&ok)).is_some());
+    }
+
+    #[test]
+    fn test_compute_filter_density_matches_search_density() {
+        // 같은 줄 집합에 대해 두 밀도 계산이 일치해야 한다
+        let results = [0u64, 5, 10, 25, 49, 50, 75, 99, 100];
+        let total_lines = 101;
+        let bins = 10;
+
+        let mut set = LineSet::new();
+        for &l in &results {
+            set.push_line(l);
+        }
+
+        let filter_counts = compute_filter_density(&set, bins, total_lines);
+        let search_counts = compute_search_density(&results, bins, total_lines);
+        assert_eq!(filter_counts, search_counts);
+        assert_eq!(filter_counts.iter().sum::<u32>(), results.len() as u32);
+
+        // 빈 집합 / total_lines=0 / bins=0 경계
+        assert_eq!(compute_filter_density(&LineSet::new(), 5, 100), vec![0; 5]);
+        assert_eq!(compute_filter_density(&set, 5, 0), vec![0; 5]);
+        assert_eq!(compute_filter_density(&set, 0, 100), Vec::<u32>::new());
+        // bins 상한 클램핑
+        assert_eq!(compute_filter_density(&set, 5000, total_lines).len(), 2000);
+    }
+
+    #[test]
+    fn test_read_lines_with_filter_rule_highlights() {
+        let content = "2024-01-01 INFO normal\n2024-01-01 ERROR fail 결제\nplain line\n".as_bytes();
+        let temp_file = TempFile::create(content);
+        let state = AppState::default();
+
+        let opened = open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
+        let file = &opened.file;
+        let cancel = &opened.cancel;
+        file.build_index(cancel, &mut |_| {}).expect("인덱싱 실패");
+
+        // include ERROR + include 결제 (OR) → 두 규칙 모두 규칙 0,1의 인덱스를 가진다
+        let spec = spec_dto(
+            vec![
+                rule("ERROR", "include", true),
+                rule("결제", "include", true),
+            ],
+            "or",
+            vec![],
+        );
+        let set = compile_filter_set(Some(&spec)).expect("spec 컴파일 실패");
+
+        let lines = read_lines_from_file(file, 0, 3, None, Some(&set)).expect("줄 읽기 실패");
+        assert_eq!(lines.len(), 3);
+        // 줄 0: 매치 없음
+        assert!(lines[0].rule_highlights.is_empty());
+        // 줄 1: ERROR(규칙0)와 결제(규칙1) 두 규칙 매치
+        assert_eq!(lines[1].rule_highlights.len(), 2);
+        let rule_idxs: Vec<u32> = lines[1]
+            .rule_highlights
+            .iter()
+            .map(|(_, _, idx)| *idx)
+            .collect();
+        assert!(rule_idxs.contains(&0));
+        assert!(rule_idxs.contains(&1));
+        // UTF-16 범위가 텍스트 안에 있어야 한다
+        for (s, e, _) in &lines[1].rule_highlights {
+            let s = *s as usize;
+            let e = *e as usize;
+            assert!(s < e && e <= lines[1].text.encode_utf16().count());
+        }
+        // 줄 2: 매치 없음
+        assert!(lines[2].rule_highlights.is_empty());
+
+        // filter=None이면 rule_highlights가 비어 있어야 한다
+        let plain = read_lines_from_file(file, 0, 3, None, None).expect("줄 읽기 실패");
+        assert!(plain.iter().all(|l| l.rule_highlights.is_empty()));
+
+        // 제외 규칙만 있으면 rule_highlights는 비어 있어야 한다 (포함 규칙만 대상)
+        let exc_spec = spec_dto(vec![rule("ERROR", "exclude", true)], "or", vec![]);
+        let exc_set = compile_filter_set(Some(&exc_spec)).expect("spec 컴파일 실패");
+        let exc_lines =
+            read_lines_from_file(file, 0, 3, None, Some(&exc_set)).expect("줄 읽기 실패");
+        assert!(exc_lines.iter().all(|l| l.rule_highlights.is_empty()));
+    }
+
+    #[test]
+    fn test_search_filtered_intersection_via_state() {
+        // IPC 경로와 동일하게: 필터의 set으로 search_filtered를 호출해 교집합을 확인한다
+        let content = "INFO 결제 완료\nERROR 결제 실패\nERROR 네트워크\nINFO 기타\n".as_bytes();
+        let temp_file = TempFile::create(content);
+        let state = AppState::default();
+
+        let opened = open_file_internal(&state, temp_file.path_str()).expect("파일 열기 실패");
+        let file = opened.file.clone();
+        let cancel = opened.cancel.clone();
+        file.build_index(&cancel, &mut |_| {}).expect("인덱싱 실패");
+
+        // 필터: include ERROR → 보이는 줄 {1, 2}
+        let spec = spec_dto(vec![rule("ERROR", "include", true)], "or", vec![]);
+        let core = filter_spec_of(&spec).unwrap();
+        let set = FilterSet::new(&core).unwrap();
+        let filter_state = state
+            .insert_filter(opened.info.id, spec, Arc::new(set))
+            .expect("필터 등록 실패");
+
+        // 필터 스캔 결과 수동 채우기 대신 filter_scan으로 채운다
+        let mut collected = Vec::new();
+        riffle_core::filter_scan(
+            &file,
+            filter_state.set.as_ref(),
+            &AtomicBool::new(false),
+            &mut |batch| collected.extend_from_slice(batch),
+            &mut |_| {},
+        )
+        .expect("filter_scan 실패");
+        {
+            let mut lines = filter_state.lines.write().unwrap();
+            for &n in &collected {
+                lines.push_line(n);
+            }
+        }
+        assert_eq!(collected, vec![1, 2]);
+
+        // 검색 "결제" ∧ 필터 ERROR → 줄 1만 ("ERROR 결제 실패")
+        let matcher = Matcher::new(
+            "결제",
+            SearchOptions {
+                regex: false,
+                case_sensitive: true,
+            },
+        )
+        .unwrap();
+        let mut hits = Vec::new();
+        riffle_core::search_filtered(
+            &file,
+            &matcher,
+            Some(filter_state.set.as_ref()),
+            &AtomicBool::new(false),
+            &mut |batch| hits.extend_from_slice(batch),
+            &mut |_| {},
+        )
+        .expect("search_filtered 실패");
+        assert_eq!(hits, vec![1]);
+
+        state.close_file(opened.info.id);
     }
 }
