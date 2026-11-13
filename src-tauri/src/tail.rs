@@ -284,7 +284,9 @@ where
     {
         return Ok(());
     }
-    let file = open_file.file.clone();
+    let Some(file) = open_file.doc.as_file().cloned() else {
+        return Err("병합 파일은 tail 모드를 지원하지 않습니다".to_string());
+    };
     // 원격(sftp://) 파일은 notify 대신 1초 폴링으로 refresh한다
     let is_remote = open_file
         .path

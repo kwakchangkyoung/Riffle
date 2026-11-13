@@ -285,7 +285,7 @@ mod tests {
         state.files.lock().unwrap().insert(
             id,
             OpenFile {
-                file: log,
+                doc: crate::state::Doc::File(log),
                 cancel: Arc::new(AtomicBool::new(false)),
                 path: PathBuf::from("s3://bucket/app.log"),
                 tail: None,

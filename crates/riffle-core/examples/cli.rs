@@ -44,6 +44,8 @@ fn print_usage() {
         "                       --field NAME은 이후 --inc/--exc 규칙을 그 컬럼 값에만 적용 (컬럼 뷰)"
     );
     eprintln!("    copy <start> <end>   [start, end] 줄 범위 원문을 stdout으로 출력 (0-based)");
+    eprintln!("    cli merge <파일>...  여러 파일을 타임스탬프 기준으로 병합한 뷰 통계 출력");
+    eprintln!("                       옵션: --search Q (병합 뷰 기준 검색 결과 수)");
 }
 
 fn main() {
@@ -51,6 +53,12 @@ fn main() {
     if args.len() < 3 {
         print_usage();
         process::exit(1);
+    }
+
+    // merge는 첫 인자가 파일 경로가 아니라 서브커맨드다: cli merge <file>... [--search Q]
+    if args[1].as_str() == "merge" {
+        run_merge(&args[2..]);
+        return;
     }
 
     let file_path = Path::new(&args[1]);
@@ -845,4 +853,175 @@ fn print_raw_line(line_no: u64, raw: &[u8]) {
     };
     let text = String::from_utf8_lossy(display);
     println!("{:>8}: {}", line_no + 1, text);
+}
+
+/// merge 서브커맨드: 여러 로그 파일을 타임스탬프 기준으로 섞은 가상 병합 뷰를
+/// 구축하고 통계를 출력한다. 병합 줄 수, 구축 시간, 임의 위치 resolve 시간,
+/// 시간순 위반 수, 최대 RSS를 출력한다. --search Q를 주면 병합 뷰 기준 검색도 수행한다.
+/// cli merge <file>... [--search Q]
+fn run_merge(args: &[String]) {
+    let mut paths = Vec::new();
+    let mut query: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--search" => {
+                i += 1;
+                let Some(q) = args.get(i) else {
+                    eprintln!("오류: --search에는 query 인자가 필요합니다.");
+                    process::exit(1);
+                };
+                query = Some(q.clone());
+            }
+            other if other.starts_with("--") => {
+                eprintln!("경고: 알 수 없는 옵션 '{}'", other);
+            }
+            p => paths.push(p.to_string()),
+        }
+        i += 1;
+    }
+    if paths.len() < 2 {
+        eprintln!("오류: merge에는 2개 이상의 파일이 필요합니다.");
+        print_usage();
+        process::exit(1);
+    }
+
+    let cancel = AtomicBool::new(false);
+    let (stop_sample, rss_peak_kb, sampler) = start_rss_sampler();
+
+    // 1. 각 원본을 열고 인덱싱한다 (병합 구축은 원본 인덱싱 완료 후 시작)
+    let files: Vec<Arc<LogFile>> = paths
+        .iter()
+        .map(|p| {
+            let path = Path::new(p);
+            Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+                eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+                process::exit(1);
+            }))
+        })
+        .collect();
+    let t_index = Instant::now();
+    thread::scope(|s| {
+        let handles: Vec<_> = files
+            .iter()
+            .map(|f| s.spawn(|| f.build_index(&cancel, &mut |_| {})))
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().unwrap_or_else(|_| {
+                eprintln!("인덱싱 스레드 패닉");
+                process::exit(1);
+            }) {
+                eprintln!("인덱싱 오류: {}", e);
+                process::exit(1);
+            }
+        }
+    });
+    let index_elapsed = t_index.elapsed();
+
+    // 2. 병합 인덱스 구축 (syslog 기본 연도는 원본 수정 시각, 시간대 없는 시각은 UTC 간주)
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ctx = riffle_core::TsContext {
+        local_offset_minutes: 0,
+        default_year: riffle_core::year_of_unix_secs(now_secs),
+    };
+    let merge = riffle_core::MergeIndex::new(files, ctx);
+    let t_build = Instant::now();
+    merge.build(&cancel, &mut |_| {}).unwrap_or_else(|e| {
+        eprintln!("병합 구축 오류: {}", e);
+        process::exit(1);
+    });
+    let build_elapsed = t_build.elapsed();
+
+    // 3. 임의 위치 resolve 시간: 전체 범위에 걸쳐 256개 위치를 고르게 찍어 측정
+    let total = merge.line_count();
+    let t_resolve = Instant::now();
+    let mut resolved = 0u64;
+    if total > 0 {
+        for i in 0..256u64 {
+            let pos = i * total / 256;
+            resolved += merge.resolve(pos, 1).map(|v| v.len() as u64).unwrap_or(0);
+        }
+    }
+    let resolve_elapsed = t_resolve.elapsed();
+
+    // 4. 원본이 각각 시간순이면 병합 결과의 타임스탬프도 비감소여야 한다
+    let t_verify = Instant::now();
+    let violations = merge.verify_order().unwrap_or(u64::MAX);
+    let verify_elapsed = t_verify.elapsed();
+
+    // 5. --search: 각 원본을 검색하고 결과를 병합 위치로 변환한다
+    if let Some(q) = &query {
+        let matcher = Matcher::new(q, SearchOptions::default()).unwrap_or_else(|e| {
+            eprintln!("검색어 오류: {}", e);
+            process::exit(1);
+        });
+        let t_search = Instant::now();
+        let mut per_source: Vec<Vec<u64>> = vec![Vec::new(); merge.source_count()];
+        for (s, f) in merge.sources().iter().enumerate() {
+            riffle_core::search(
+                f,
+                &matcher,
+                &cancel,
+                &mut |batch| per_source[s].extend_from_slice(batch),
+                &mut |_| {},
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("원본 {s} 검색 오류: {}", e);
+                process::exit(1);
+            });
+        }
+        let search_elapsed = t_search.elapsed();
+        let t_map = Instant::now();
+        let mapped = merge.map_positions(&per_source).unwrap_or_else(|e| {
+            eprintln!("병합 위치 변환 오류: {}", e);
+            process::exit(1);
+        });
+        let map_elapsed = t_map.elapsed();
+        let sorted = mapped.windows(2).all(|w| w[0] < w[1]);
+        println!(
+            "병합 검색 '{}': {}건 (원본 검색 {:.2}s, 위치 변환 {:.3}ms, 정렬: {})",
+            q,
+            mapped.len(),
+            search_elapsed.as_secs_f64(),
+            map_elapsed.as_secs_f64() * 1000.0,
+            if sorted { "오름차순" } else { "비정렬" }
+        );
+    }
+
+    stop_sample.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+
+    let total_bytes: u64 = merge.sources().iter().map(|f| f.source().len()).sum();
+    println!(
+        "원본: {}개, 합계 {:.2} MB",
+        paths.len(),
+        total_bytes as f64 / 1_048_576.0
+    );
+    for (s, f) in merge.sources().iter().enumerate() {
+        println!("    [{}] {} ({}줄)", s, paths[s], f.index().line_count());
+    }
+    println!("병합 줄 수: {}", total);
+    println!(
+        "원본 인덱싱 시간: {:.2}s, 병합 구축 시간: {:.2}s",
+        index_elapsed.as_secs_f64(),
+        build_elapsed.as_secs_f64()
+    );
+    println!(
+        "임의 위치 resolve: {}건 / {:.2}ms (평균 {:.3}ms)",
+        resolved,
+        resolve_elapsed.as_secs_f64() * 1000.0,
+        resolve_elapsed.as_secs_f64() * 1000.0 / 256.0
+    );
+    println!(
+        "시간순 위반: {}건 (전수 검증 {:.2}s)",
+        violations,
+        verify_elapsed.as_secs_f64()
+    );
+    println!(
+        "최대 RSS: {:.1} MB",
+        rss_peak_kb.load(Ordering::Relaxed) as f64 / 1024.0
+    );
 }

@@ -146,7 +146,20 @@ pub struct Line {
   - `Plain`이면 줄 전체 하나를 반환한다.
 - 필드 필터: `FilterRule.field`에 컬럼 이름을 지정하면 그 규칙은 줄 전체가 아니라 `split_fields`로 분할한 해당 컬럼 값에만 매치한다. `FilterSet::new(spec, columns)`는 `columns`가 없거나 지정된 컬럼 이름이 없으면 `"규칙 N: 컬럼 'x' 를 찾을 수 없습니다"` 에러를 반환한다. `field`가 없는 규칙과 레벨 조건·include/exclude·AND/OR 의미는 그대로 유지된다. 필드 규칙이 하나도 없으면 줄 분할을 수행하지 않아 기존 경로와 동일한 비용을 유지한다. 필드 규칙의 `rule_highlights`는 생략한다.
 
-### 3.7 테스트 필수 케이스
+### 3.7 여러 로그의 시간순 병합 (Phase 17)
+
+열려 있는 탭 2~8개를 골라 타임스탬프 기준으로 섞은 **가상 파일**을 새 탭으로 연다. 실제 파일은 만들지 않으며, 병합 탭도 일반 탭처럼 가상 스크롤·검색·필터를 쓴다.
+
+- **타임스탬프 추출** (`timestamp.rs`): 줄 앞 64바이트 안에서 첫 매치를 밀리초 단위 `i64`로 변환한다. 인식 형식: ISO-8601(`2026-11-12T07:15:42.134Z`, `+09:00`, 공백 구분, `,` 소수점, 소수 초 1~9자리), `2026/11/12 07:15:42`, syslog `Nov 12 07:15:42`(연도는 원본 파일 수정 시각의 연도), Apache `[12/Nov/2026:07:15:42 +0900]`, 유닉스 epoch 10자리(초)/13자리(밀리초). 시간대 표기가 없으면 로컬 시간대로 간주하며, 로컬 시간대 오프셋은 프론트(JS `Date#getTimezoneOffset`의 부호 반전값)가 `local_offset_minutes`로 넘긴다. 날짜→epoch 계산은 새 의존성 없이 직접 구현한다.
+- **타임스탬프 상속**: 타임스탬프가 없는 줄(스택 트레이스 등)은 같은 원본의 바로 앞 줄의 유효 타임스탬프를 상속해 앞 줄과 붙어 다닌다. 원본 첫 줄들에 타임스탬프가 없으면 -∞(맨 앞)으로 본다.
+- **병합 규칙**: 각 원본은 줄 순서대로만 소비한다(원본이 시간순이 아니어도 순서를 바꾸지 않는다 — k-way 병합의 "다음 줄" 비교만). 동일 타임스탬프는 원본 순번이 작은 쪽이 먼저 온다(안정 정렬). 원본이 각각 시간순이면 병합 결과도 비감소다.
+- **희소 병합 인덱스** (`MergeIndex`): 병합 결과 K(=1024)줄마다 체크포인트 = 각 원본의 `(다음에 읽을 줄 번호, 상속용 마지막 유효 타임스탬프)`를 저장한다. 메모리는 (전체 줄 수/1024) × 원본 수 × 16바이트 수준. 임의 위치 읽기(`resolve`)는 가장 가까운 체크포인트부터 최대 1023줄의 k-way 병합을 재실행한다. 블록 첫 줄의 타임스탬프(`block_ts`)를 별도 보관해 `position_at_time`(시각 → 그 시각 이상 첫 병합 위치)을 이진 탐색+최대 K줄 재실행으로 계산한다.
+- **구축**: `build()`는 백그라운드 스레드에서 실행하고 진행률(`MergeProgress`)+취소를 지원한다. 원본 인덱싱이 끝난 뒤 시작하며, 시작 시점의 확인된 줄 수·파일 길이를 스냅샷으로 쓴다(tail/이후 변경은 추적하지 않는 병합 시점 스냅샷). 각 원본은 순차 스트리밍으로 읽으며 줄 앞 64바이트만 보관한다(전체 데이터 1회 읽기). 구축 중에도 확정된 앞부분은 `resolve`로 읽을 수 있다(체크포인트 점진 공개).
+- **역변환**: `position_of(source, line) -> Option<u64>`는 원본 줄 → 병합 위치, `map_positions(&[원본별 오름차순 줄 목록]) -> Vec<u64>`는 한 번의 병합 재실행으로 전체를 변환한다(k-way). `resolve_many`는 오름차순 병합 위치 목록을 같은 K 블록끼리 커서를 공유해 변환한다.
+- **검색·필터 위임**: 병합 탭의 검색/필터는 각 원본에 기존 `search`/`filter_scan`을 실행한 뒤 원본 줄을 `map_positions`로 병합 위치로 변환해 `Vec<u64>`/`LineSet`을 채운다(원본별 결과는 이미 정렬). gz·원격 원본도 `Source` 추상화로 동일하게 동작한다.
+- **수명**: `MergeIndex`는 원본 `Arc<LogFile>`을 보유하므로 원본 탭이 닫혀도 병합 탭이 살아 있고, 병합 탭을 닫으면 원본 참조가 해제된다.
+
+### 3.8 테스트 필수 케이스
 
 빈 파일, 개행 없는 마지막 줄, CRLF, 개행만 있는 파일, 16KB를 넘는 단일 줄, 잘못된 UTF-8 바이트, 청크 경계에 정확히 걸치는 줄, 청크 경계에 걸치는 검색 매치, 한글이 포함된 줄의 하이라이트 범위, K의 배수 번째 줄.
 
@@ -156,7 +169,7 @@ pub struct Line {
 
 | 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
-| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote, source }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP), `s3://버킷/키`이면 S3 객체로 열기 (Phase 12·13). `source`는 `"local" \| "sftp" \| "s3"` |
+| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote, source }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP), `s3://버킷/키`이면 S3 객체로 열기 (Phase 12·13). `source`는 `"local" \| "sftp" \| "s3" \| "merge"` |
 | `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`, `with_fields?`                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용. withFields=true이고 형식이 plain이 아니면 `Line.fields`에 컬럼 분할 값 (Phase 16) |
 | `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
 | `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
@@ -189,12 +202,15 @@ pub struct Line {
 | `set_s3_bookmarks`   | `items`                                                                                                | `()`                           | 즐겨찾기를 s3-bookmarks.json에 원자적 저장 (Phase 13)     |
 | `get_bookmarks`      | `id`                                                                                                   | `BookmarksDto { items, stale }` | 경로/URI + 머리 지문으로 조회. 저장된 지문이 다르거나 크기가 줄었으면 `stale=true` (Phase 15) |
 | `set_bookmarks`      | `id`, `items`                                                                                          | `()`                           | 줄 번호 오름차순 정렬·중복 제거 후 현재 지문/크기와 함께 저장 (stale 해소). 빈 목록이면 항목 삭제 (Phase 15) |
+| `open_merge`         | `sourceIds`, `localOffsetMinutes`, `on_progress: Channel<IndexProgress>`                                | `FileInfo`                     | 열린 탭 2~8개를 타임스탬프 병합 뷰로 연다. `path`는 `"merge://<id>"`, `source`는 `"merge"`, `size`는 원본 크기 합. 병합 구축은 백그라운드 (Phase 17) |
+| `merge_position_at_time` | `id`, `ts_ms`                                                                                     | `u64`                          | 유효 타임스탬프가 ts_ms 이상인 첫 병합 위치. 없으면 병합 줄 수 (Phase 17) |
+| `merge_sources`      | `id`                                                                                                   | `Vec<MergeSource>`             | `{ index, path, lineCount }` 원본 목록 (Phase 17)       |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
 - (Phase 11) Finder "다음으로 열기"·다중 선택·드래그 앤 드롭으로 열린 파일은 `"open-files"` 이벤트(`string[]`, 순서 유지)로 프론트에 전달한다. 콜드 스타트처럼 프론트 준비 전에 도착한 경로는 Rust가 `pending_open`에 누적하고 `take_pending_open`으로 한 번에 수령한다. 파일 열기·드래그 앤 드롭·최근 파일·세션 복원은 모두 새 탭으로 열고, 이미 열린 같은 경로(canonical `FileInfo.path` 기준)면 해당 탭으로 전환한다.
 - (Phase 11) 탭 세션은 `session.json`에 `{ paths, activeIndex }`로 저장한다. 프론트가 탭 목록/활성 탭 변경 시 500ms 디바운스로 `save_session`을 호출하고, 시작 시 `load_session`으로 복원한다(`restoreSession` 설정, 기본 켜짐). 존재하지 않는 경로는 로드 시 걸러낸다.
 - `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나. `start_filter`도 같은 이벤트 형식을 쓴다.
-- `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다. `fields`(컬럼 뷰 분할 값)는 `withFields=true`이고 파일 형식이 plain이 아닐 때만 채워진다 (Phase 16).
+- `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다. `fields`(컬럼 뷰 분할 값)는 `withFields=true`이고 파일 형식이 plain이 아닐 때만 채워진다 (Phase 16). 병합 뷰의 줄에는 `source`(원본 순번)와 `sourceLine`(원본 줄 번호)이 채워지고 `no`는 병합 위치다; 일반 파일은 둘 다 null이다 (Phase 17).
 - `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color, field? }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다. `field`는 컬럼 뷰 필드 필터용이며 지정된 컬럼 값에만 매치한다 (Phase 16).
 - (Phase 16) 컬럼 뷰: `detect_columns`로 파일 형식(plain/csv/jsonl)·구분자·헤더 여부·컬럼명을 조회한다(파일별 캐시). `get_lines`/`get_filter_lines`/`get_filtered_lines`에 `withFields=true`를 넘기면 각 줄의 `fields`로 컬럼 값을 받는다. `start_filter`/`validate_filter`/`search`(filter_id 경유)는 파일의 감지된 컬럼으로 `FilterSet`을 컴파일하므로 `FilterRule.field`에 없는 컬럼명을 쓰면 `"규칙 N: 컬럼 'x' 를 찾을 수 없습니다"` 에러가 된다.
 - (Phase 15) 북마크는 파일의 특정 줄에 붙이는 표시+메모+색이다. `BookmarkDto { line, note, color ("#rrggbb"), createdAt (unix 초) }`. 파일 식별은 열 때 기록된 경로/URI 문자열(로컬은 canonical, 원격은 `sftp://`·`s3://`)로 하고, `app_data_dir/bookmarks.json`에 `{ "<경로/URI>": { "fingerprint": "hex", "size": 크기, "updatedAt": 초, "items": [...] } }`로 원자적 저장한다(파일 항목 최대 500개, 마지막 수정 시각이 오래된 것부터 제거). 머리 지문은 `riffle_core::head_fingerprint`(파일 앞 64KB의 FNV-1a 64비트 해시, 로컬/원격/gz 해제본 모두 Source로 계산)와 저장 당시 크기를 함께 보관하며, 다시 열 때 지문이 다르거나 현재 크기가 저장된 크기보다 작으면 `stale=true`를 반환해(크기 증가는 로그 append로 정상이므로 stale로 보지 않음) "파일 내용이 바뀌어 북마크 위치가 다를 수 있다"를 프론트가 안내하게 한다(북마크는 지우지 않음). `set_bookmarks`는 현재 지문/크기로 갱신해 stale을 해소하고, 빈 목록이면 항목을 삭제한다. 지문 계산은 `spawn_blocking`에서 수행한다(원격은 네트워크 읽기 64KB).
@@ -204,6 +220,7 @@ pub struct Line {
 - (Phase 13) S3 객체: `open_file`의 `path`가 `s3://버킷/키`이면 `S3Pool`(aws-sdk-s3, 앱 전역 하나, (프로필, 리전)별 클라이언트 캐시 + 버킷별 리전 캐시)로 연다. URI에는 프로필을 넣지 않고, 마지막 선택 프로필은 `settings.json`의 `s3Profile`에 저장한다(없으면 AWS 기본 자격 증명 체인). `FileInfo.remote`는 true, `source`는 `"s3"`이며 `path`는 URI 그대로 보관해 최근 파일·세션 복원이 그대로 동작한다. `close_file`은 별도 해제 없이 클라이언트를 풀에서 재사용한다. S3 객체는 불변이므로 `set_tail`은 `Err("S3 객체는 tail 을 지원하지 않습니다")`를 반환한다. RandomRead 구현은 `stat_len`을 HeadObject ContentLength로 얻고, 큰 요청은 8MB Range GET을 최대 16개 동시에, 작은 요청은 1MB 블록 LRU 캐시(최대 64MB)로 읽는다. 일시적 오류는 지수 백오프로 최대 3회 재시도한다. 읽기 전용 API(HeadObject, GetObject Range, ListObjectsV2, ListBuckets, GetBucketLocation/HeadBucket)만 호출한다.
 - (Phase 13) `S3Entry { name, isDir, size, mtime? }`(mtime은 unix 초, 폴더는 null). `list_aws_profiles`는 `~/.aws/config`의 `[default]`/`[profile x]`와 `~/.aws/credentials`의 `[x]` 섹션 헤더에서 프로필 이름만 읽는다(정렬, 중복 제거, default 포함). 모든 S3 호출은 `spawn_blocking`에서 수행한다.
 - (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(검색 필터 모드), `validate_query`로 필요한 만큼만 조회한다. 다중 필터의 보이는 줄도 `LineSet`으로 Rust에만 보관하고 `get_filter_lines`/`filter_index_of`/`filter_density`로 필요한 만큼만 조회한다.
+- (Phase 17) 병합 뷰: `open_merge`가 만든 가상 파일 id에서도 `get_lines`/`search`/`start_filter`/`get_filter_lines`/`get_filtered_lines`/`filter_index_of`/`copy_lines`/`get_full_line`이 동작한다(내부에서 원본으로 위임). 검색 결과와 필터 `LineSet`은 병합 위치 기준으로 보관한다. `localOffsetMinutes`는 프론트가 `new Date().getTimezoneOffset()`의 부호를 반전해 넘긴다(로컬 시각 = UTC + offset). 병합 뷰는 tail·북마크·컬럼 뷰를 지원하지 않는다. 원본 탭을 닫아도 병합 탭은 `Arc`로 원본을 유지하고, 병합 탭을 닫으면 해제된다.
 - 열린 파일은 `State<AppState>` 안의 `HashMap<FileId, Arc<LogFile>>`로 관리한다.
 - `capabilities/default.json`에는 실제로 쓰는 권한(dialog, clipboard 등)만 최소로 허용한다.
 - 프론트엔드 `lib/ipc.ts`의 타입은 Rust 타입과 1:1로 맞춘다. 가능하면 `specta`/`tauri-specta`로 TS 타입을 자동 생성하는 방안을 Phase 2에서 검토하고, 도입 여부는 승인받는다.
@@ -271,7 +288,7 @@ pub struct Line {
 - `gen_log` 예제: 타임스탬프, 로그 레벨, 한글/영문 메시지, 가끔 매우 긴 줄이 섞인 로그를 지정 크기로 생성.
 - `source.rs`, `index.rs`, `lines.rs` 구현 (3.1~3.3).
 - `cli.rs` 예제: `open`, `lines <start> <count>`, `stats`(줄 수, 인덱싱 시간) 서브커맨드.
-- 3.7의 테스트 케이스 중 검색 외 항목 작성, 인덱싱 벤치마크 작성.
+- 3.8의 테스트 케이스 중 검색 외 항목 작성, 인덱싱 벤치마크 작성.
 - **완료 기준:** 10GB 생성 파일에 대해 CLI로 첫 줄 읽기가 즉시 되고, 인덱싱이 성능 목표 안에 끝나며, 임의 줄 번호 읽기 결과가 `sed -n 'Np'` 결과와 일치.
 
 ### Phase 4.5 gzip 압축 파일 (.gz)

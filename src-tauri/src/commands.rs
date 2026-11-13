@@ -12,7 +12,7 @@ use tauri::Manager;
 use tauri::ipc::Channel;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::state::AppState;
+use crate::state::{AppState, Doc};
 
 /// 파일 정보 DTO
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub struct FileInfo {
     pub compressed: bool,
     /// 원격(sftp://, s3://) 파일 여부
     pub remote: bool,
-    /// 파일 출처: "local" | "sftp" | "s3"
+    /// 파일 출처: "local" | "sftp" | "s3" | "merge"
     pub source: String,
 }
 
@@ -74,6 +74,10 @@ pub struct LineDto {
     /// 컬럼 뷰용 분할 값. with_fields=true이고 파일 형식이 plain이 아닐 때만 채운다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
+    /// 병합 뷰에서 원본 순번 (병합 파일이 아니면 null)
+    pub source: Option<u16>,
+    /// 병합 뷰에서 원본 줄 번호 (0-based, 병합 파일이 아니면 null)
+    pub source_line: Option<u64>,
 }
 
 impl From<riffle_core::Line> for LineDto {
@@ -86,6 +90,8 @@ impl From<riffle_core::Line> for LineDto {
             highlights: line.highlights,
             rule_highlights: line.rule_highlights,
             fields: None,
+            source: None,
+            source_line: None,
         }
     }
 }
@@ -754,7 +760,12 @@ pub async fn get_lines(
     spec: Option<FilterSpecDto>,
     with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let (file, columns_cache) = state.get_columns_handle(id)?;
+    let doc = state.get_doc(id)?;
+    // 컬럼 캐시는 단일 파일만 가진다 (병합 문서는 컬럼 미지원)
+    let columns_cache = match &doc {
+        Doc::File(_) => Some(state.get_columns_handle(id)?.1),
+        Doc::Merge(_) => None,
+    };
     let clamped_count = clamp_get_lines_count(count);
     // 컬럼 분할 요청이거나 spec에 필드 규칙이 있으면 컬럼 정보가 필요하다
     let need_columns = with_fields.unwrap_or(false)
@@ -767,20 +778,38 @@ pub async fn get_lines(
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let columns = if need_columns {
-            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
-        } else {
-            None
-        };
-        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
-        read_lines_from_file(
-            &file,
-            start,
-            clamped_count,
-            matcher.as_ref(),
-            highlight_filter.as_ref(),
-            columns.as_ref(),
-        )
+        match doc {
+            Doc::File(file) => {
+                let columns = if need_columns {
+                    Some(crate::state::detect_columns_cached(
+                        &file,
+                        &columns_cache.expect("단일 파일은 컬럼 캐시가 있다"),
+                    )?)
+                } else {
+                    None
+                };
+                let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
+                read_lines_from_file(
+                    &file,
+                    start,
+                    clamped_count,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                    columns.as_ref(),
+                )
+            }
+            Doc::Merge(m) => {
+                // 병합 위치 → 원본 줄로 해석해 읽는다 (no는 병합 위치)
+                let positions: Vec<u64> = (start..start + clamped_count as u64).collect();
+                let highlight_filter = compile_filter_set(spec.as_ref(), None);
+                crate::merge::read_merged_positions(
+                    &m.index,
+                    &positions,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                )
+            }
+        }
     })
     .await
     .map_err(|e| format!("줄 읽기 비동기 태스크 실패: {e}"))?
@@ -803,7 +832,11 @@ pub async fn get_filtered_lines(
     spec: Option<FilterSpecDto>,
     with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let (file, columns_cache) = state.get_columns_handle(id)?;
+    let doc = state.get_doc(id)?;
+    let columns_cache = match &doc {
+        Doc::File(_) => Some(state.get_columns_handle(id)?.1),
+        Doc::Merge(_) => None,
+    };
     let search = state.get_search(search_id)?;
     if search.file_id != id {
         return Err(format!(
@@ -835,19 +868,36 @@ pub async fn get_filtered_lines(
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let columns = if need_columns {
-            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
-        } else {
-            None
-        };
-        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
-        read_filtered_lines_from_file(
-            &file,
-            &line_nos,
-            matcher.as_ref(),
-            highlight_filter.as_ref(),
-            columns.as_ref(),
-        )
+        match doc {
+            Doc::File(file) => {
+                let columns = if need_columns {
+                    Some(crate::state::detect_columns_cached(
+                        &file,
+                        &columns_cache.expect("단일 파일은 컬럼 캐시가 있다"),
+                    )?)
+                } else {
+                    None
+                };
+                let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
+                read_filtered_lines_from_file(
+                    &file,
+                    &line_nos,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                    columns.as_ref(),
+                )
+            }
+            Doc::Merge(m) => {
+                // 검색 결과는 병합 위치 — 원본 줄로 해석해 읽는다
+                let highlight_filter = compile_filter_set(spec.as_ref(), None);
+                crate::merge::read_merged_positions(
+                    &m.index,
+                    &line_nos,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                )
+            }
+        }
     })
     .await
     .map_err(|e| format!("필터 줄 읽기 비동기 태스크 실패: {e}"))?
@@ -870,7 +920,11 @@ pub async fn get_filter_lines(
     spec: Option<FilterSpecDto>,
     with_fields: Option<bool>,
 ) -> Result<Vec<LineDto>, String> {
-    let (file, columns_cache) = state.get_columns_handle(id)?;
+    let doc = state.get_doc(id)?;
+    let columns_cache = match &doc {
+        Doc::File(_) => Some(state.get_columns_handle(id)?.1),
+        Doc::Merge(_) => None,
+    };
     let filter = state.get_filter(filter_id)?;
     if filter.file_id != id {
         return Err(format!(
@@ -903,19 +957,36 @@ pub async fn get_filter_lines(
             Some(ref q) => Matcher::new(&q.query, q.into()).ok(),
             None => None,
         };
-        let columns = if need_columns {
-            Some(crate::state::detect_columns_cached(&file, &columns_cache)?)
-        } else {
-            None
-        };
-        let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
-        read_filtered_lines_from_file(
-            &file,
-            &line_nos,
-            matcher.as_ref(),
-            highlight_filter.as_ref(),
-            columns.as_ref(),
-        )
+        match doc {
+            Doc::File(file) => {
+                let columns = if need_columns {
+                    Some(crate::state::detect_columns_cached(
+                        &file,
+                        &columns_cache.expect("단일 파일은 컬럼 캐시가 있다"),
+                    )?)
+                } else {
+                    None
+                };
+                let highlight_filter = compile_filter_set(spec.as_ref(), columns.as_ref());
+                read_filtered_lines_from_file(
+                    &file,
+                    &line_nos,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                    columns.as_ref(),
+                )
+            }
+            Doc::Merge(m) => {
+                // 필터 결과는 병합 위치 — 원본 줄로 해석해 읽는다
+                let highlight_filter = compile_filter_set(spec.as_ref(), None);
+                crate::merge::read_merged_positions(
+                    &m.index,
+                    &line_nos,
+                    matcher.as_ref(),
+                    highlight_filter.as_ref(),
+                )
+            }
+        }
     })
     .await
     .map_err(|e| format!("필터 줄 읽기 비동기 태스크 실패: {e}"))?
@@ -955,14 +1026,20 @@ pub async fn copy_lines(
     start: u64,
     end: u64,
 ) -> Result<CopyResult, String> {
-    let file = state.get_file(id)?;
+    let doc = state.get_doc(id)?;
 
     // 100MB 범위 읽기와 클립보드 쓰기(무거운 IO)를 블로킹 스레드에서 수행
     let clipboard_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let text = file
-            .read_text_range(start, end, MAX_COPY_BYTES)
-            .map_err(|e| e.to_string())?;
+        let text = match &doc {
+            Doc::File(file) => file
+                .read_text_range(start, end, MAX_COPY_BYTES)
+                .map_err(|e| e.to_string())?,
+            Doc::Merge(m) => {
+                // 병합 위치 범위를 원본 줄로 해석해 원본 순서대로 복사한다
+                crate::merge::read_merged_text_range(&m.index, start, end, MAX_COPY_BYTES)?
+            }
+        };
         clipboard_app
             .clipboard()
             .write_text(text.clone())
@@ -990,12 +1067,18 @@ pub async fn get_full_line(
     id: u32,
     no: u64,
 ) -> Result<Option<FullLine>, String> {
-    let file = state.get_file(id)?;
+    let doc = state.get_doc(id)?;
 
     tauri::async_runtime::spawn_blocking(move || {
+        if let Doc::Merge(m) = &doc {
+            return crate::merge::get_merged_full_line(m, no);
+        }
+        let Doc::File(file) = &doc else {
+            unreachable!()
+        };
         // byte_len은 read_lines가 제공한다 (16KB 초과 줄도 개행까지 스캔해 정확한 길이를 계산).
         // 16KB 이내 줄은 이미 전체 원문이므로 read_full_line 호출 없이 바로 반환한다.
-        let meta = read_lines_from_file(&file, no, 1, None, None, None)?;
+        let meta = read_lines_from_file(file, no, 1, None, None, None)?;
         let Some(line) = meta.into_iter().next() else {
             return Ok(None);
         };
@@ -1087,9 +1170,9 @@ pub async fn start_filter(
     spec: FilterSpecDto,
     on_event: Channel<SearchEvent>,
 ) -> Result<u32, String> {
-    let file = state.get_file(id)?;
+    let doc = state.get_doc(id)?;
     let core_spec = filter_spec_of(&spec)?;
-    // 필드 규칙이 있으면 파일의 감지된 컬럼으로 컴파일한다
+    // 필드 규칙이 있으면 파일의 감지된 컬럼으로 컴파일한다 (병합 문서는 컬럼 미지원)
     let columns = if core_spec.rules.iter().any(|r| r.field.is_some()) {
         let (cf, cache) = state.get_columns_handle(id)?;
         Some(
@@ -1111,9 +1194,19 @@ pub async fn start_filter(
     let filter_state = state.insert_filter(id, spec, set)?;
 
     let filter_id = filter_state.id;
-    std::thread::spawn(move || {
-        run_filter_scan(file, filter_state, on_event);
-    });
+    match doc {
+        Doc::File(file) => {
+            std::thread::spawn(move || {
+                run_filter_scan(file, filter_state, on_event);
+            });
+        }
+        Doc::Merge(m) => {
+            // 각 원본에 filter_scan을 돌리고 병합 위치 LineSet을 채운다
+            std::thread::spawn(move || {
+                crate::merge::run_merge_filter_scan(m, filter_state, on_event);
+            });
+        }
+    }
 
     Ok(filter_id)
 }
@@ -1295,7 +1388,7 @@ pub async fn search(
     filter_id: Option<u32>,
     on_event: Channel<SearchEvent>,
 ) -> Result<u32, String> {
-    let file = state.get_file(id)?;
+    let doc = state.get_doc(id)?;
     let matcher = Matcher::new(&query.query, (&query).into()).map_err(|e| e.to_string())?;
 
     // filter_id가 있으면 그 필터의 spec으로 FilterSet을 만든다
@@ -1327,6 +1420,15 @@ pub async fn search(
         capped.clone(),
     )?;
     let search_id = search_state.id;
+
+    // 병합 문서: 각 원본에 검색을 위임하고 결과를 병합 위치로 변환한다
+    if let Doc::Merge(m) = doc {
+        std::thread::spawn(move || {
+            crate::merge::run_merge_search(m, matcher, filter_set, search_state, on_event);
+        });
+        return Ok(search_id);
+    }
+    let Doc::File(file) = doc else { unreachable!() };
 
     let thread_cancel = cancel;
     let thread_results = results;

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
-use riffle_core::{Columns, FilterSet, LineSet, LogFile};
+use riffle_core::{Columns, FilterSet, LineSet, LogFile, MergeIndex};
 use riffle_remote::{S3Pool, SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
@@ -20,10 +20,38 @@ pub struct TailHandle {
     pub thread: JoinHandle<()>,
 }
 
+/// 열려 있는 문서의 종류: 단일 로그 파일 또는 여러 파일의 시간순 병합 뷰
+#[derive(Clone)]
+pub enum Doc {
+    /// 단일 로그 파일
+    File(Arc<LogFile>),
+    /// 병합 뷰. 희소 병합 인덱스가 원본 LogFile들을 Arc로 계속 보유하므로
+    /// 원본 탭이 닫혀도 병합 탭은 동작한다.
+    Merge(Arc<MergeDoc>),
+}
+
+impl Doc {
+    /// 단일 파일 문서면 LogFile을 반환한다 (병합 문서면 None).
+    pub fn as_file(&self) -> Option<&Arc<LogFile>> {
+        match self {
+            Doc::File(f) => Some(f),
+            Doc::Merge(_) => None,
+        }
+    }
+}
+
+/// 병합 문서: 희소 병합 인덱스와 원본 표시 경로 스냅샷
+pub struct MergeDoc {
+    /// 희소 병합 인덱스 (원본 Arc<LogFile> 보유)
+    pub index: MergeIndex,
+    /// 원본별 표시 경로 (merge_sources 응답용, open_merge 시점 스냅샷)
+    pub source_paths: Vec<String>,
+}
+
 /// 열려 있는 단일 로그 파일의 상태 정보
 pub struct OpenFile {
-    /// 로그 파일 코어 핸들
-    pub file: Arc<LogFile>,
+    /// 문서 핸들 (단일 파일 또는 병합 뷰)
+    pub doc: Doc,
     /// 인덱싱/작업 취소 플래그
     pub cancel: Arc<AtomicBool>,
     /// 파일 경로 (tail 감시 대상 디렉터리 결정용)
@@ -196,7 +224,7 @@ impl AppState {
         files.insert(
             id,
             OpenFile {
-                file,
+                doc: Doc::File(file),
                 cancel,
                 path,
                 tail: None,
@@ -207,13 +235,51 @@ impl AppState {
         id
     }
 
-    /// ID에 해당하는 파일 핸들을 조회한다.
-    pub fn get_file(&self, id: u32) -> Result<Arc<LogFile>, String> {
+    /// 새 병합 문서를 상태에 등록하고 고유 ID를 반환한다.
+    /// 병합 인덱스가 원본 LogFile을 Arc로 보유하므로 원본 탭이 닫혀도 유지된다.
+    pub fn insert_merge(&self, merge: MergeDoc, cancel: Arc<AtomicBool>) -> u32 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        files.insert(
+            id,
+            OpenFile {
+                doc: Doc::Merge(Arc::new(merge)),
+                cancel,
+                path: PathBuf::from(format!("merge://{id}")),
+                tail: None,
+                compressed: false,
+                columns: Arc::new(Mutex::new(None)),
+            },
+        );
+        id
+    }
+
+    /// ID에 해당하는 문서 핸들을 조회한다 (단일 파일과 병합 뷰 모두).
+    pub fn get_doc(&self, id: u32) -> Result<Doc, String> {
         let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
         files
             .get(&id)
-            .map(|f| f.file.clone())
+            .map(|f| f.doc.clone())
             .ok_or_else(|| format!("ID {}에 해당하는 열린 파일을 찾을 수 없습니다.", id))
+    }
+
+    /// ID에 해당하는 병합 문서를 조회한다. 없거나 단일 파일이면 Err.
+    pub fn get_merge(&self, id: u32) -> Result<Arc<MergeDoc>, String> {
+        match self.get_doc(id)? {
+            Doc::Merge(m) => Ok(m),
+            Doc::File(_) => Err(format!("ID {id}는 병합 파일이 아닙니다.")),
+        }
+    }
+
+    /// ID에 해당하는 파일 핸들을 조회한다. 병합 문서에는 단일 파일 전용
+    /// 동작(tail, 북마크 등)을 적용할 수 없으므로 Err를 반환한다.
+    pub fn get_file(&self, id: u32) -> Result<Arc<LogFile>, String> {
+        match self.get_doc(id)? {
+            Doc::File(f) => Ok(f),
+            Doc::Merge(_) => Err(format!(
+                "ID {id}는 병합 파일이라 이 동작을 지원하지 않습니다."
+            )),
+        }
     }
 
     /// ID에 해당하는 파일 핸들과 식별 경로를 함께 조회한다.
@@ -222,20 +288,31 @@ impl AppState {
     /// 북마크처럼 파일을 경로/URI로 식별하는 기능에 사용한다.
     pub fn get_file_with_path(&self, id: u32) -> Result<(Arc<LogFile>, String), String> {
         let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        files
+        let open_file = files
             .get(&id)
-            .map(|f| (f.file.clone(), f.path.to_string_lossy().into_owned()))
-            .ok_or_else(|| format!("ID {}에 해당하는 열린 파일을 찾을 수 없습니다.", id))
+            .ok_or_else(|| format!("ID {}에 해당하는 열린 파일을 찾을 수 없습니다.", id))?;
+        match open_file.doc.as_file() {
+            Some(f) => Ok((f.clone(), open_file.path.to_string_lossy().into_owned())),
+            None => Err(format!(
+                "ID {id}는 병합 파일이라 이 동작을 지원하지 않습니다."
+            )),
+        }
     }
 
     /// ID에 해당하는 파일 핸들과 컬럼 캐시를 함께 반환한다.
     /// spawn_blocking 안에서 detect_columns_cached로 감지할 때 사용한다.
+    /// 병합 문서는 컬럼 감지를 지원하지 않으므로 Err를 반환한다.
     pub fn get_columns_handle(&self, id: u32) -> Result<(Arc<LogFile>, ColumnsCache), String> {
         let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        files
+        let open_file = files
             .get(&id)
-            .map(|f| (f.file.clone(), f.columns.clone()))
-            .ok_or_else(|| format!("ID {id}에 해당하는 열린 파일을 찾을 수 없습니다."))
+            .ok_or_else(|| format!("ID {id}에 해당하는 열린 파일을 찾을 수 없습니다."))?;
+        match open_file.doc.as_file() {
+            Some(f) => Ok((f.clone(), open_file.columns.clone())),
+            None => Err(format!(
+                "ID {id}는 병합 파일이라 이 동작을 지원하지 않습니다."
+            )),
+        }
     }
 
     /// 파일을 닫고 취소 플래그를 설정한 뒤 맵에서 제거한다.
@@ -489,7 +566,7 @@ mod tests {
         state.files.lock().unwrap().insert(
             id,
             OpenFile {
-                file: log,
+                doc: Doc::File(log),
                 cancel: Arc::new(AtomicBool::new(false)),
                 path: path.clone(),
                 tail: None,

@@ -175,6 +175,23 @@ impl Source {
         Ok(read)
     }
 
+    /// 수정 시각(unix 초)을 반환한다. 로컬 파일만 지원한다
+    /// (syslog처럼 연도가 없는 타임스탬프의 기본 연도 계산용).
+    pub(crate) fn mtime_secs(&self) -> Option<u64> {
+        let SourceInner::Local(local) = &self.inner else {
+            return None;
+        };
+        local
+            .file
+            .metadata()
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
     /// 소스의 현재 크기를 반환한다 (로컬은 fstat, 원격은 stat_len 네트워크 호출).
     /// append를 즉시 반영한다.
     pub(crate) fn file_len(&self) -> Result<u64> {
