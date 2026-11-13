@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "riffle"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "notify",
  "riffle-core",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "riffle-agent"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "riffle-core",
  "serde",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "riffle-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "criterion",
  "flate2",
@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "riffle-remote"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
