@@ -35,6 +35,22 @@ jobs:
                       exit 1
                   fi
 
+            # CHANGELOG.md 에서 이 버전의 절을 꺼내 릴리스 노트(=앱 업데이트 알림 내용)로 쓴다
+            - name: 변경 내역 추출
+              id: changelog
+              run: |
+                  VERSION="${GITHUB_REF_NAME#v}"
+                  NOTES=$(awk -v v="$VERSION" '/^## \[/ { f = (index($0, "## [" v "]") == 1); next } f' CHANGELOG.md)
+                  if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
+                      echo "CHANGELOG.md 에 [${VERSION}] 절이 없습니다."
+                      exit 1
+                  fi
+                  {
+                      echo "notes<<RIFFLE_NOTES_EOF"
+                      echo "$NOTES"
+                      echo "RIFFLE_NOTES_EOF"
+                  } >> "$GITHUB_OUTPUT"
+
             - uses: pnpm/action-setup@v6
               with:
                   version: 11
@@ -65,22 +81,11 @@ jobs:
                   tagName: ${{ github.ref_name }}
                   releaseName: Riffle ${{ github.ref_name }}
                   releaseBody: |
-                      ## 다운로드
+                      ${{ steps.changelog.outputs.notes }}
 
-                      - **Apple Silicon (M1 이후)**: `Riffle_<버전>_aarch64.dmg`
-                      - **Intel Mac**: `Riffle_<버전>_x64.dmg`
-
-                      ## 설치
-
-                      1. DMG 를 열고 `Riffle.app` 을 `Applications` 폴더로 드래그합니다.
-                      2. 아직 Apple 코드 서명·공증 전이라 처음 실행 시 "확인되지 않은 개발자" 경고가 나옵니다.
-                         Finder 에서 `Riffle.app` 을 **우클릭 → 열기** 로 한 번 실행하거나, 아래 명령을 실행하세요.
-
-                         ```bash
-                         xattr -dr com.apple.quarantine /Applications/Riffle.app
-                         ```
-
-                      사용법은 [README](https://github.com/${{ github.repository }}#사용법) 를 참고하세요.
+                      ---
+                      **새로 설치:** Apple Silicon 은 `Riffle_<버전>_aarch64.dmg`, Intel 은 `Riffle_<버전>_x64.dmg` 를 받아 `Applications` 로 드래그하세요.
+                      코드 서명 전이라 처음 실행 시 경고가 나오면 **우클릭 → 열기** 로 실행합니다. 자세한 내용은 [README](https://github.com/${{ github.repository }}#설치) 를 참고하세요.
                   releaseDraft: false
                   prerelease: false
                   # CI에서만 업데이터 산출물(.app.tar.gz + .sig)을 만들어 latest.json을 생성한다.

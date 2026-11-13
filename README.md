@@ -166,17 +166,18 @@ ditto target/release/bundle/macos/Riffle.app /Applications/Riffle.app
 - `TAURI_SIGNING_PRIVATE_KEY`: `pnpm tauri signer generate`로 만든 개인키 내용
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: 개인키 비밀번호
 
-공개키는 `src-tauri/tauri.conf.json`의 `plugins.updater.pubkey`에 넣습니다(현재 자리표시자). 키를 새로 만들면 함께 갱신해야 합니다. Secrets가 없으면 릴리스 워크플로가 실패합니다.
+공개키는 `src-tauri/tauri.conf.json`의 `plugins.updater.pubkey`에 들어 있습니다. 키를 새로 만들면 함께 갱신해야 합니다. Secrets가 없으면 릴리스 워크플로가 실패합니다.
 
-1. `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`의 `version`을 새 버전으로 올리고 커밋합니다.
-2. 같은 버전의 태그를 만들어 push합니다. 태그와 `tauri.conf.json` 버전이 다르면 워크플로가 실패합니다.
+1. `CHANGELOG.md`에 `## [새 버전] - 날짜` 절을 추가합니다. 이 내용이 릴리스 노트와 앱 내 업데이트 알림에 그대로 표시되며, 절이 없으면 워크플로가 실패합니다.
+2. `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`의 `version`을 새 버전으로 올리고 커밋합니다.
+3. 같은 버전의 태그를 만들어 push합니다. 태그와 `tauri.conf.json` 버전이 다르면 워크플로가 실패합니다.
 
     ```bash
     git tag v0.2.0
     git push origin main v0.2.0
     ```
 
-3. 진행 상황은 저장소의 **Actions** 탭에서 확인합니다. 빌드가 끝나면 **Releases**에 DMG가 올라갑니다.
+4. 진행 상황은 저장소의 **Actions** 탭에서 확인합니다. 빌드가 끝나면 **Releases**에 DMG가 올라갑니다.
 
 ## 개발
 
