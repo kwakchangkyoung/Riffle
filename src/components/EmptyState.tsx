@@ -6,6 +6,7 @@ interface EmptyStateProps {
     onOpenDialog: () => void;
     onOpenRemote: () => void;
     onOpenPath: (path: string) => void;
+    onShowShortcuts: () => void;
 }
 
 /**
@@ -17,6 +18,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
     onOpenDialog,
     onOpenRemote,
     onOpenPath,
+    onShowShortcuts,
 }) => {
     return (
         <div
@@ -58,6 +60,17 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
                     className="mt-1 px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
                 >
                     원격 파일 열기 (⌘⇧O)
+                </button>
+                {/* 단축키 도움말 링크 */}
+                <button
+                    type="button"
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        onShowShortcuts();
+                    }}
+                    className="text-[11px] text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 hover:underline cursor-pointer"
+                >
+                    단축키 보기 ⌘/
                 </button>
             </div>
 

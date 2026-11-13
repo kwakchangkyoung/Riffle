@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 
 interface GotoLineDialogProps {
     totalLines: number;
+    indexing?: boolean; // 아직 인덱싱 중 (totalLines는 지금까지 확인된 줄 수)
     onClose: () => void;
     onNavigate: (lineNo: number) => void; // 1-based 줄 번호
 }
@@ -12,6 +13,7 @@ interface GotoLineDialogProps {
  */
 export const GotoLineDialog: React.FC<GotoLineDialogProps> = ({
     totalLines,
+    indexing = false,
     onClose,
     onNavigate,
 }) => {
@@ -33,7 +35,9 @@ export const GotoLineDialog: React.FC<GotoLineDialogProps> = ({
         const lineNo = Number(trimmed);
         if (lineNo < 1 || lineNo > totalLines) {
             setError(
-                `1 – ${totalLines.toLocaleString("ko-KR")} 범위의 줄 번호를 입력하세요`,
+                indexing && lineNo > totalLines
+                    ? `아직 인덱싱 중입니다 (현재 ${totalLines.toLocaleString("ko-KR")}줄까지 확인됨)`
+                    : `1 – ${totalLines.toLocaleString("ko-KR")} 범위의 줄 번호를 입력하세요`,
             );
             return;
         }

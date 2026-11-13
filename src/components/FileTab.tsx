@@ -26,6 +26,7 @@ import {
 } from "@/lib/ipc";
 import { LineCache } from "@/lib/lineCache";
 import { useTauriListener } from "@/lib/useTauriListener";
+import { loadScrollPos, saveScrollPos } from "@/lib/scrollPos";
 import { rowHeightFor } from "@/lib/fontSize";
 import { formatBytes } from "@/lib/format";
 import { LogViewport } from "@/components/viewer/LogViewport";
@@ -93,6 +94,8 @@ interface FileTabProps {
     onProgress: (tabId: string, progress: IndexProgress | null) => void;
     /** tail 모드 상태 보고 (탭 표시용) */
     onTailChange: (tabId: string, enabled: boolean) => void;
+    /** 글자 크기 조절 (+1/-1 단계) — 트랙패드 핀치 줌 */
+    onFontSizeAdjust?: (delta: number) => void;
 }
 
 /**
@@ -109,6 +112,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         onFileInfo,
         onProgress,
         onTailChange,
+        onFontSizeAdjust,
     }) => {
         const [file, setFile] = useState<FileInfo | null>(null);
         // tail appended 이벤트의 totalBytes로 갱신되는 표시용 파일 크기 (null이면 file.size 사용)
@@ -212,6 +216,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             capped: boolean;
         } | null>(null);
         const topLineRef = useRef(0);
+        // 탭별 스크롤 위치 기억: 복원 대기 위치와 복원 완료 여부 (완료 전엔 저장하지 않는다)
+        const pendingPosRef = useRef<number | null>(null);
+        const restoreSettledRef = useRef(false);
 
         // tail 모드 관련 ref
         const tailEnabledRef = useRef(false);
@@ -364,6 +371,35 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             atBottomRef.current = topLine >= maxTop - 0.5;
         }, [topLine, displayLineCount, viewportHeight, rowHeight]);
 
+        // 기억된 스크롤 위치 적용: 인덱싱이 해당 위치까지 진행되거나 끝나면 한 번만 적용한다.
+        // 파일이 그 사이 줄어 위치가 범위를 벗어나면 maxTop에 clamp된다.
+        useEffect(() => {
+            const pending = pendingPosRef.current;
+            if (pending === null) return;
+            const maxTop = Math.max(0, lineCount - viewportHeight / rowHeight);
+            if (pending <= maxTop || indexProgress?.done === true) {
+                pendingPosRef.current = null;
+                restoreSettledRef.current = true;
+                handleTopLineChange(Math.min(pending, maxTop));
+            }
+        }, [
+            lineCount,
+            indexProgress?.done,
+            viewportHeight,
+            rowHeight,
+            handleTopLineChange,
+        ]);
+
+        // 스크롤 위치 저장: 복원이 끝난 뒤 topLine 변경을 디바운스로 기록한다
+        useEffect(() => {
+            if (file === null || !restoreSettledRef.current) return;
+            const path = file.path;
+            const timer = setTimeout(() => {
+                saveScrollPos(path, topLine);
+            }, 400);
+            return () => clearTimeout(timer);
+        }, [file, topLine]);
+
         // tail IPC 커맨드는 순차 실행해 enable/disable 순서가 뒤바뀌지 않게 한다
         const tailQueueRef = useRef<Promise<void>>(Promise.resolve());
         const queueTailCommand = useCallback(
@@ -390,6 +426,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 setErrorMessage(null);
                 latestProgressRef.current = null;
                 lastProgressErrorRef.current = null;
+                pendingPosRef.current = null;
+                restoreSettledRef.current = false;
                 onProgressRef.current(tabId, null);
 
                 // 진행 중이던 tail appended 배치 취소 (이전 파일 기준 이벤트는 폐기)
@@ -487,6 +525,18 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     normalLineCache.setFile(info.id);
                     onFileInfoRef.current(tabId, info);
 
+                    // 이전에 보던 스크롤 위치 복원 예약 (로테이션 재오픈은 맨 아래로 가므로 제외)
+                    if (!options?.preserveTail) {
+                        const saved = loadScrollPos(info.path);
+                        if (saved !== null) {
+                            pendingPosRef.current = saved;
+                        } else {
+                            restoreSettledRef.current = true;
+                        }
+                    } else {
+                        restoreSettledRef.current = true;
+                    }
+
                     // openFile resolve 전 도착한 진행률이 있다면 확정 적용
                     const progress =
                         latestProgressRef.current as IndexProgress | null;
@@ -498,6 +548,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     }
                 } catch (err) {
                     if (openSeqRef.current === seq) {
+                        restoreSettledRef.current = true;
                         const msg =
                             typeof err === "string"
                                 ? err
@@ -537,6 +588,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 }
                 const current = currentFileRef.current;
                 if (current !== null) {
+                    // 탭이 닫혀도 마지막 위치가 남도록 즉시 저장한다
+                    if (restoreSettledRef.current) {
+                        saveScrollPos(current.path, topLineRef.current);
+                    }
                     closeFile(current.id).catch((err) => {
                         console.warn("파일 닫기 실패:", err);
                     });
@@ -1348,6 +1403,44 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             },
         );
 
+        // Cmd+A: 일반 보기에서 전체 줄 선택 (인덱스 기반 보기는 줄 선택을 지원하지 않는다)
+        useEffect(() => {
+            const handleKeyDown = (e: KeyboardEvent) => {
+                if (!isActiveRef.current) return;
+                if (
+                    !e.metaKey ||
+                    e.ctrlKey ||
+                    e.altKey ||
+                    e.shiftKey ||
+                    (e.key !== "a" && e.key !== "A")
+                ) {
+                    return;
+                }
+                const active = document.activeElement;
+                if (
+                    active instanceof HTMLInputElement ||
+                    active instanceof HTMLTextAreaElement
+                ) {
+                    return;
+                }
+                if (
+                    document.querySelector('[aria-modal="true"]') !== null ||
+                    gotoLineOpen
+                ) {
+                    return;
+                }
+                if (isFilterModeRef.current || filterViewActiveRef.current) {
+                    return;
+                }
+                const count = lineCountRef.current;
+                if (count <= 0) return;
+                e.preventDefault();
+                setLineSelection({ anchor: 0, focus: count - 1 });
+            };
+            window.addEventListener("keydown", handleKeyDown);
+            return () => window.removeEventListener("keydown", handleKeyDown);
+        }, [gotoLineOpen]);
+
         // Esc: 줄 선택 해제 (모달/패널/입력창에서는 각 컴포넌트가 우선 처리)
         useEffect(() => {
             const handleKeyDown = (e: KeyboardEvent) => {
@@ -1524,10 +1617,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     </div>
                 )}
 
-                {/* 에러 메시지 알림 바 */}
+                {/* 에러 메시지 알림 바 (텍스트 선택 가능) */}
                 {errorMessage && (
                     <div className="px-4 py-2 bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-300 text-xs flex items-center justify-between border-b border-rose-200 dark:border-rose-900">
-                        <span>{errorMessage}</span>
+                        <span className="select-text">{errorMessage}</span>
                         <button
                             type="button"
                             onClick={() => setErrorMessage(null)}
@@ -1562,6 +1655,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 selectedRange={selectedRange}
                                 onGutterLineClick={handleGutterLineClick}
                                 onTruncatedLineClick={handleTruncatedLineClick}
+                                onPinchZoom={onFontSizeAdjust}
                                 isActive={isActive}
                             />
                             {isActive &&
@@ -1614,20 +1708,26 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     tailOn={tailEnabled && file !== null}
                     tailPaused={tailEnabled && !isAtBottomNow}
                     copying={copying}
+                    selectionLines={
+                        selectedRange !== null
+                            ? selectedRange.end - selectedRange.start + 1
+                            : 0
+                    }
                 />
 
                 {/* 줄 번호 이동 모달 (Cmd+L) — 활성 탭에서만 표시 */}
                 {isActive && gotoLineOpen && file && (
                     <GotoLineDialog
                         totalLines={lineCount}
+                        indexing={indexProgress?.done !== true}
                         onClose={() => setGotoLineOpen(false)}
                         onNavigate={handleGotoNavigate}
                     />
                 )}
 
-                {/* 복사 완료 토스트 */}
+                {/* 복사 완료 토스트 (텍스트 선택 가능) */}
                 {toast && (
-                    <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-md bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-medium shadow-lg pointer-events-none">
+                    <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-md bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-medium shadow-lg select-text">
                         {toast}
                     </div>
                 )}

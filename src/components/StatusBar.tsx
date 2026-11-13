@@ -33,6 +33,7 @@ interface StatusBarProps {
     tailOn?: boolean; // tail 모드 활성 여부
     tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
     copying?: boolean; // 줄 범위 복사 진행 중 여부
+    selectionLines?: number; // 줄 단위 선택된 줄 수 (0이면 미표시)
 }
 
 /**
@@ -53,6 +54,7 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         tailOn,
         tailPaused,
         copying,
+        selectionLines = 0,
     }) => {
         if (!file) {
             return (
@@ -182,6 +184,20 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
                 {/* 우측: 검색 결과, 크기, 줄 수, 진행률, 현재 줄 위치 */}
                 <div className="flex items-center space-x-4 shrink-0">
+                    {selectionLines > 0 && (
+                        <>
+                            <span
+                                className="text-sky-700 dark:text-sky-300 font-medium"
+                                title="선택된 줄 범위 (Esc로 해제)"
+                            >
+                                선택: {selectionLines.toLocaleString("ko-KR")}줄
+                                · ⌘C 복사
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
                     {copying && (
                         <>
                             <span className="text-sky-600 dark:text-sky-400 font-medium">

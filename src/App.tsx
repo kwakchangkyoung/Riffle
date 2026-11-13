@@ -24,6 +24,7 @@ import {
 import { FileTab } from "@/components/FileTab";
 import { TabBar, type TabMeta } from "@/components/TabBar";
 import { EmptyState } from "@/components/EmptyState";
+import { ShortcutsDialog } from "@/components/ShortcutsDialog";
 import { RemoteOpenDialog } from "@/components/remote/RemoteOpenDialog";
 import {
     UpdateDialog,
@@ -213,6 +214,8 @@ export default function App() {
     const [recentFiles, setRecentFiles] = useState<string[]>([]);
     // 원격 파일 열기 대화상자 표시 여부
     const [remoteDialogOpen, setRemoteDialogOpen] = useState(false);
+    // 단축키 도움말 모달 표시 여부 (⌘/)
+    const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
     // 업데이트 다이얼로그 상태 (null이면 닫힘)와 관련 ref들
     const [updateDialog, setUpdateDialog] = useState<UpdateDialogState | null>(
@@ -533,6 +536,18 @@ export default function App() {
                 }
             }
 
+            // ⌘/ (또는 ⌘?): 단축키 도움말 토글 (탭 유무와 무관하게 동작)
+            if (
+                e.metaKey &&
+                !e.ctrlKey &&
+                !e.altKey &&
+                (e.key === "/" || e.key === "?")
+            ) {
+                e.preventDefault();
+                setShortcutsOpen((v) => !v);
+                return;
+            }
+
             const count = tabsRef.current.length;
             if (count === 0) return;
 
@@ -577,6 +592,7 @@ export default function App() {
                     onOpenDialog={() => void handleOpenDialog()}
                     onOpenRemote={() => setRemoteDialogOpen(true)}
                     onOpenPath={(path) => openPaths([path])}
+                    onShowShortcuts={() => setShortcutsOpen(true)}
                 />
             ) : (
                 tabs.map((tab) => (
@@ -589,6 +605,7 @@ export default function App() {
                         onFileInfo={handleTabFileInfo}
                         onProgress={handleTabProgress}
                         onTailChange={handleTabTailChange}
+                        onFontSizeAdjust={adjustFontSize}
                     />
                 ))
             )}
@@ -617,6 +634,11 @@ export default function App() {
                     state={updateDialog}
                     onClose={handleUpdateDialogClose}
                 />
+            )}
+
+            {/* 단축키 도움말 모달 (⌘/) */}
+            {shortcutsOpen && (
+                <ShortcutsDialog onClose={() => setShortcutsOpen(false)} />
             )}
         </div>
     );

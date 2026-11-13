@@ -124,9 +124,10 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
             thumbTop = ratio * availableTrack;
         }
 
-        // 트랙 클릭 시 해당 위치로 점프
+        // 트랙 클릭 시 해당 위치로 점프한 뒤, 마우스를 떼지 않고 움직이면 그대로 드래그가 이어진다
         const handleTrackMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
             if (e.target !== trackRef.current || availableTrack <= 0) return;
+            e.preventDefault();
             const rect = trackRef.current.getBoundingClientRect();
             const clickY = e.clientY - rect.top;
             const targetThumbTop = Math.max(
@@ -139,6 +140,12 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                     ? maxTopLine
                     : fraction * maxTopLine;
             onScroll(targetLine);
+            setIsDragging(true);
+            onDraggingChange?.(true);
+            dragStartRef.current = {
+                clientY: e.clientY,
+                startTopLine: targetLine,
+            };
         };
 
         // Thumb 드래그 시작
@@ -215,7 +222,14 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                 ref={trackRef}
                 onMouseDown={handleTrackMouseDown}
                 className="relative w-3.5 shrink-0 select-none bg-zinc-100 dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800 cursor-pointer overflow-hidden"
-                title="스크롤바"
+                role="scrollbar"
+                aria-orientation="vertical"
+                aria-valuemin={1}
+                aria-valuemax={Math.max(1, lineCount)}
+                aria-valuenow={Math.min(
+                    Math.max(1, lineCount),
+                    Math.floor(topLine) + 1,
+                )}
             >
                 {/* 검색 밀도 캔버스 */}
                 <canvas

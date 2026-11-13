@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+    useCallback,
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from "react";
 import type { FileInfo, Line } from "@/lib/ipc";
 import type { LineCache } from "@/lib/lineCache";
 import { Gutter } from "./Gutter";
@@ -157,7 +163,8 @@ interface LogViewportProps {
     rowHeight: number; // 행 높이 (px)
     selectedRange?: { start: number; end: number } | null; // 줄 단위 선택 범위 (0-based, 일반 모드만)
     onGutterLineClick?: (index: number, shiftKey: boolean) => void;
-    onTruncatedLineClick?: (lineNo: number) => void; // 잘린 줄의 "…" 클릭 시 원문 줄 번호(0-based)
+    onTruncatedLineClick?: (lineNo: number) => void; // 잘린 줄 표시 클릭 시 원문 줄 번호(0-based)
+    onPinchZoom?: (delta: number) => void; // 트랙패드 핀치로 글자 크기 조절 (+1/-1 단계)
     isActive?: boolean; // 활성 탭 여부 — false이면 뷰어 단축키를 무시한다
 }
 
@@ -185,10 +192,12 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         selectedRange,
         onGutterLineClick,
         onTruncatedLineClick,
+        onPinchZoom,
         isActive = true,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyScrollRef = useRef<HTMLDivElement>(null);
+        const contentRef = useRef<HTMLDivElement>(null);
 
         const [viewportHeight, setViewportHeight] = useState(0);
 
@@ -228,6 +237,18 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             });
         }, [lineCache]);
 
+        // 가로 스크롤 안정화: 지금까지 렌더된 행 중 가장 넓은 폭을 min-width로 유지한다.
+        // 세로 스크롤로 짧은 줄만 보일 때 scrollWidth가 줄어 scrollLeft가 튀는 것을 막는다.
+        const [minContentWidth, setMinContentWidth] = useState(0);
+
+        // 최대 폭 재설정: 파일/보기(캐시)/글자 크기가 바뀔 때만 초기화한다
+        useLayoutEffect(() => {
+            setMinContentWidth(0);
+            if (bodyScrollRef.current) {
+                bodyScrollRef.current.scrollLeft = 0;
+            }
+        }, [file.id, lineCache, fontSize]);
+
         // 서브픽셀 렌더링 계산
         const intTopLine = Math.floor(topLine);
         const frac = topLine - intTopLine;
@@ -239,6 +260,28 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             intTopLine + Math.ceil(visibleRows) + OVERSCAN,
         );
         const rowCount = Math.max(0, renderEnd - renderStart);
+
+        // 렌더 후 실제 행 폭을 측정해 최대값을 누적한다 (단조 증가).
+        // 행 내용이 바뀌는 조건(보이는 구간/캐시/행 높이)이 변할 때만 측정한다.
+        useLayoutEffect(() => {
+            const el = contentRef.current;
+            if (!el) return;
+            let max = 0;
+            for (const child of Array.from(el.children)) {
+                const w = (child as HTMLElement).scrollWidth;
+                if (w > max) max = w;
+            }
+            if (max > 0) {
+                setMinContentWidth((prev) => (max > prev ? max : prev));
+            }
+        }, [
+            renderStart,
+            renderEnd,
+            cacheVersion,
+            rowHeight,
+            file.id,
+            lineCache,
+        ]);
 
         // 컨테이너 이동값: 행의 서브픽셀 오프셋 반영
         const translateY = -(overscanAbove + frac) * rowHeight;
@@ -271,6 +314,14 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         const flushScrollRef = useRef(flushScroll);
         flushScrollRef.current = flushScroll;
 
+        // 핀치 줌 콜백/누적 상태: 제스처당 단계 변화를 만들기 위해 deltaY를 누적한다
+        const pinchZoomRef = useRef(onPinchZoom);
+        pinchZoomRef.current = onPinchZoom;
+        const pinchAccRef = useRef(0);
+        const pinchResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+            null,
+        );
+
         // 휠 이벤트 등록 (passive: false)
         useEffect(() => {
             const container = containerRef.current;
@@ -278,6 +329,30 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
 
             const handleWheel = (e: WheelEvent) => {
                 e.preventDefault();
+
+                // Ctrl+휠: macOS 트랙패드 핀치 제스처 → 스크롤 대신 글자 크기 조절.
+                // 누적 deltaY가 임계값을 넘을 때마다 한 단계씩 바꾼다.
+                if (e.ctrlKey) {
+                    const PINCH_STEP = 60;
+                    pinchAccRef.current += e.deltaY;
+                    while (pinchAccRef.current <= -PINCH_STEP) {
+                        pinchAccRef.current += PINCH_STEP;
+                        pinchZoomRef.current?.(1);
+                    }
+                    while (pinchAccRef.current >= PINCH_STEP) {
+                        pinchAccRef.current -= PINCH_STEP;
+                        pinchZoomRef.current?.(-1);
+                    }
+                    // 제스처가 끝나면 잔여 누적값을 버려 다음 핀치가 튀지 않게 한다
+                    if (pinchResetTimerRef.current !== null) {
+                        clearTimeout(pinchResetTimerRef.current);
+                    }
+                    pinchResetTimerRef.current = setTimeout(() => {
+                        pinchResetTimerRef.current = null;
+                        pinchAccRef.current = 0;
+                    }, 300);
+                    return;
+                }
 
                 // 가로 스크롤: 본문 영역만 가로 스크롤
                 if (bodyScrollRef.current && e.deltaX !== 0) {
@@ -309,6 +384,10 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 if (rafIdRef.current !== null) {
                     cancelAnimationFrame(rafIdRef.current);
                     rafIdRef.current = null;
+                }
+                if (pinchResetTimerRef.current !== null) {
+                    clearTimeout(pinchResetTimerRef.current);
+                    pinchResetTimerRef.current = null;
                 }
             };
         }, [viewportHeight, rowHeight]);
@@ -390,14 +469,6 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             [lineCache],
         );
 
-        // 잘린 줄 "전체 보기" 배지: 가로 스크롤 영역 밖 오버레이에 행 위치별로 표시
-        const truncatedBadges: {
-            index: number;
-            top: number;
-            lineNo: number;
-        }[] = [];
-        const badgeHeight = Math.min(16, rowHeight);
-
         // 인덱스 기반 보기(검색 결과만 / 다중 필터) 여부
         const indexView = isFilterMode || filterViewActive;
 
@@ -417,18 +488,6 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 selectedRange != null &&
                 index >= selectedRange.start &&
                 index <= selectedRange.end;
-
-            if (
-                line !== undefined &&
-                line.truncated &&
-                onTruncatedLineClick !== undefined
-            ) {
-                truncatedBadges.push({
-                    index,
-                    top: translateY + i * rowHeight,
-                    lineNo: line.no,
-                });
-            }
 
             rows.push(
                 <div
@@ -475,19 +534,6 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                             ""
                         )}
                     </span>
-                    {line !== undefined && line.truncated && (
-                        <button
-                            type="button"
-                            onClick={(e) => {
-                                e.stopPropagation();
-                                onTruncatedLineClick?.(line.no);
-                            }}
-                            className="ml-1 text-zinc-400 dark:text-zinc-600 hover:text-zinc-700 dark:hover:text-zinc-300 font-bold cursor-pointer"
-                            title="줄이 잘림 — 클릭하면 전체 줄 보기"
-                        >
-                            …
-                        </button>
-                    )}
                 </div>,
             );
         }
@@ -497,7 +543,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 ref={containerRef}
                 className="relative flex-1 flex h-full w-full overflow-hidden select-none bg-white dark:bg-zinc-950"
             >
-                {/* 줄 번호 거터 */}
+                {/* 줄 번호 거터 (잘린 줄 표시·줄 선택 강조 포함) */}
                 <Gutter
                     startLine={renderStart}
                     rowCount={rowCount}
@@ -509,6 +555,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     getLine={getLineCallback}
                     cacheVersion={cacheVersion}
                     onLineClick={onGutterLineClick}
+                    selectedRange={selectedRange}
+                    onTruncatedClick={onTruncatedLineClick}
                 />
 
                 {/* 본문 영역 (가로 스크롤 가능) */}
@@ -518,8 +566,11 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     style={{ scrollbarWidth: "thin" }}
                 >
                     <div
-                        className="inline-block min-w-full"
+                        ref={contentRef}
+                        className="inline-block"
                         style={{
+                            // 렌더된 최장 폭을 유지해 가로 스크롤 위치가 튀지 않게 한다
+                            minWidth: `max(100%, ${minContentWidth}px)`,
                             transform: `translateY(${translateY}px)`,
                             willChange: "transform",
                         }}
@@ -538,33 +589,6 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     onTrackHeightChange={onTrackHeightChange}
                     onDraggingChange={handleScrollbarDragging}
                 />
-
-                {/* 잘린 줄 "전체 보기" 배지: 가로 스크롤과 무관하게
-                    뷰포트 오른쪽 끝(세로 스크롤바 왼쪽)에 행 위치별로 고정 */}
-                {truncatedBadges.length > 0 && (
-                    <div className="absolute inset-0 z-10 pointer-events-none">
-                        {truncatedBadges.map((badge) => (
-                            <button
-                                key={badge.index}
-                                type="button"
-                                onClick={() =>
-                                    onTruncatedLineClick?.(badge.lineNo)
-                                }
-                                className="absolute right-[18px] px-1.5 rounded bg-zinc-900/60 hover:bg-zinc-900/90 text-white dark:bg-zinc-100/60 dark:hover:bg-zinc-100/90 dark:text-zinc-900 text-[10px] font-medium cursor-pointer pointer-events-auto whitespace-nowrap"
-                                style={{
-                                    top:
-                                        badge.top +
-                                        (rowHeight - badgeHeight) / 2,
-                                    height: badgeHeight,
-                                    lineHeight: `${badgeHeight}px`,
-                                }}
-                                title="잘린 줄 — 클릭하면 전체 줄 보기"
-                            >
-                                전체 보기
-                            </button>
-                        ))}
-                    </div>
-                )}
             </div>
         );
     },
