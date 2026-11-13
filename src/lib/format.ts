@@ -16,3 +16,18 @@ export function formatBytes(bytes: number): string {
 
     return `${value.toFixed(2)} ${units[u]}`;
 }
+
+/**
+ * unix 초를 짧은 로컬 시각 문자열로 변환합니다.
+ */
+export function formatMtime(mtime: number | null): string {
+    if (mtime === null) return "-";
+    const d = new Date(mtime * 1000);
+    if (Number.isNaN(d.getTime())) return "-";
+    return d.toLocaleString("ko-KR", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+    });
+}

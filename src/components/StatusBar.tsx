@@ -1,7 +1,7 @@
 import React from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
 import { formatBytes } from "@/lib/format";
-import { remoteHostOf } from "@/lib/remote";
+import { remoteHostOf, s3BucketOf } from "@/lib/remote";
 
 export interface SearchStatusInfo {
     currentHitIndex: number | null;
@@ -67,6 +67,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         const indexView = isFilterMode || filterViewActive;
         // 원격 파일의 호스트 (로컬 파일이면 null)
         const remoteHost = file.remote ? remoteHostOf(file.path) : null;
+        // S3 객체의 버킷 (S3가 아니면 null)
+        const s3Bucket = file.remote ? s3BucketOf(file.path) : null;
         const normalCurrentLine =
             lineCount === 0 ? 0 : Math.min(lineCount, Math.floor(topLine) + 1);
         const displayCurrentLine = indexView
@@ -150,6 +152,14 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                             title={`원격 호스트: ${remoteHost}`}
                         >
                             원격: {remoteHost}
+                        </span>
+                    )}
+                    {s3Bucket !== null && (
+                        <span
+                            className="px-1.5 py-0.2 rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 font-semibold text-[10px] shrink-0"
+                            title={`S3 버킷: ${s3Bucket}`}
+                        >
+                            S3: {s3Bucket}
                         </span>
                     )}
                     {isFilterMode && (

@@ -7,6 +7,7 @@ pub mod opened;
 pub mod presets;
 pub mod recent;
 pub mod remote;
+pub mod s3;
 pub mod session;
 pub mod settings;
 pub mod state;
@@ -21,6 +22,10 @@ use commands::{
     search_hit_at, search_nav, start_filter, take_pending_open, validate_filter, validate_query,
 };
 use remote::{list_remote_dir, list_ssh_hosts, remote_home};
+use s3::{
+    get_s3_bookmarks, list_aws_profiles, s3_head, s3_list_buckets, s3_list_prefix,
+    set_s3_bookmarks, set_s3_profile,
+};
 use session::{load_session, save_session};
 use settings::{get_settings, set_auto_check_updates};
 use state::AppState;
@@ -67,7 +72,14 @@ pub fn run() {
             delete_filter_preset,
             list_ssh_hosts,
             list_remote_dir,
-            remote_home
+            remote_home,
+            list_aws_profiles,
+            s3_list_buckets,
+            s3_list_prefix,
+            s3_head,
+            set_s3_profile,
+            get_s3_bookmarks,
+            set_s3_bookmarks
         ])
         .setup(|app| {
             // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)
@@ -76,6 +88,9 @@ pub fn run() {
             let handle = app.handle().clone();
             let recent = recent::load_recent(&handle).unwrap_or_default();
             app.state::<AppState>().set_recent_files(recent.clone());
+            // 마지막으로 선택한 AWS 프로필을 설정에서 복원한다 (없으면 기본 체인)
+            let s3_profile = settings::load_settings(&handle).s3_profile;
+            app.state::<AppState>().set_s3_profile(s3_profile);
             menu::apply_menu(&handle, &recent)?;
             Ok(())
         })

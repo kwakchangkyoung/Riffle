@@ -13,6 +13,8 @@ pub struct Settings {
     pub auto_check_updates: bool,
     /// 시작 시 이전 탭 세션 복원 여부 (기본 true)
     pub restore_session: bool,
+    /// 마지막으로 선택한 AWS 프로필 (None이면 기본 자격 증명 체인)
+    pub s3_profile: Option<String>,
 }
 
 impl Default for Settings {
@@ -20,6 +22,7 @@ impl Default for Settings {
         Self {
             auto_check_updates: true,
             restore_session: true,
+            s3_profile: None,
         }
     }
 }
@@ -127,9 +130,13 @@ mod tests {
         let settings = Settings {
             auto_check_updates: false,
             restore_session: false,
+            s3_profile: Some("work".to_string()),
         };
         let json = serde_json::to_string(&settings).unwrap();
-        assert_eq!(json, r#"{"autoCheckUpdates":false,"restoreSession":false}"#);
+        assert_eq!(
+            json,
+            r#"{"autoCheckUpdates":false,"restoreSession":false,"s3Profile":"work"}"#
+        );
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, settings);
     }
@@ -140,11 +147,27 @@ mod tests {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.auto_check_updates);
         assert!(parsed.restore_session);
+        assert_eq!(parsed.s3_profile, None);
 
         // restore_session이 없는 기존 settings.json도 호환된다
         let parsed: Settings = serde_json::from_str(r#"{"autoCheckUpdates":false}"#).unwrap();
         assert!(!parsed.auto_check_updates);
         assert!(parsed.restore_session);
+        assert_eq!(parsed.s3_profile, None);
+    }
+
+    #[test]
+    fn test_settings_s3_profile_missing_is_none() {
+        // s3Profile 필드가 없는 기존 settings.json과 하위 호환된다
+        let parsed: Settings =
+            serde_json::from_str(r#"{"autoCheckUpdates":true,"restoreSession":false}"#).unwrap();
+        assert_eq!(parsed.s3_profile, None);
+    }
+
+    #[test]
+    fn test_settings_s3_profile_null_is_none() {
+        let parsed: Settings = serde_json::from_str(r#"{"s3Profile":null}"#).unwrap();
+        assert_eq!(parsed.s3_profile, None);
     }
 
     #[test]
@@ -167,6 +190,7 @@ mod tests {
         let settings = Settings {
             auto_check_updates: false,
             restore_session: false,
+            s3_profile: Some("work".to_string()),
         };
         write_settings_file(&path, &settings).unwrap();
         assert_eq!(read_settings_file(&path), settings);

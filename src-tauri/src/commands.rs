@@ -19,13 +19,15 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 pub struct FileInfo {
     pub id: u32,
-    /// 파일 경로. 원격 파일이면 "sftp://호스트/경로" 형태의 URI
+    /// 파일 경로. 원격 파일이면 "sftp://호스트/경로" 또는 "s3://버킷/키" 형태의 URI
     pub path: String,
     pub size: u64,
     /// gzip 압축 파일 여부
     pub compressed: bool,
-    /// 원격(SFTP) 파일 여부
+    /// 원격(sftp://, s3://) 파일 여부
     pub remote: bool,
+    /// 파일 출처: "local" | "sftp" | "s3"
+    pub source: String,
 }
 
 /// 인덱싱/해제 진행률 DTO
@@ -390,11 +392,20 @@ pub struct OpenedFile {
     pub gz_writer: Option<riffle_core::GzWriter>,
 }
 
+/// 경로가 원격(sftp://, s3://) URI인지 반환한다.
+/// open_file 라우팅과 canonicalize 우회 판별에 공통으로 사용한다.
+pub fn is_remote_uri(path: &str) -> bool {
+    path.starts_with("sftp://") || path.starts_with("s3://")
+}
+
 /// 파일 열기 내부 로직: 파일을 열고(필요시 gzip 해제 준비) AppState에 등록한다.
-/// path가 "sftp://"로 시작하면 원격(SFTP) 파일로 라우팅한다.
+/// path가 "sftp://"로 시작하면 원격(SFTP), "s3://"로 시작하면 S3 객체로 라우팅한다.
 pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, String> {
     if path.starts_with("sftp://") {
         return crate::remote::open_remote_internal(state, path);
+    }
+    if path.starts_with("s3://") {
+        return crate::s3::open_s3_internal(state, path);
     }
     let file_path = Path::new(path);
     let gz = riffle_core::is_gzip(file_path)
@@ -430,6 +441,7 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
             size,
             compressed,
             remote: false,
+            source: "local".to_string(),
         },
         file,
         cancel,
@@ -596,12 +608,12 @@ pub async fn open_file(
     // AppHandle을 통해 블로킹 스레드 안에서 AppState를 다시 얻는다.
     // 탭 중복 판별과 최근 파일 기록에 쓸 수 있게 canonical 경로로 변환한다
     // (심볼릭 링크 등으로 같은 파일을 가리키는 경로를 하나로 맞춤, 실패 시 원래 경로).
-    // sftp:// 원격 URI는 로컬 경로가 아니므로 canonicalize하지 않는다.
+    // sftp://, s3:// 원격 URI는 로컬 경로가 아니므로 canonicalize하지 않는다.
     let open_app = app.clone();
     let open_path = path;
     let opened = tauri::async_runtime::spawn_blocking(move || {
         let st = open_app.state::<AppState>();
-        let target = if open_path.starts_with("sftp://") {
+        let target = if is_remote_uri(&open_path) {
             open_path
         } else {
             std::fs::canonicalize(&open_path)

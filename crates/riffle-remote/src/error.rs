@@ -2,6 +2,7 @@
 
 use std::io;
 
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::StatusCode;
 
@@ -33,6 +34,20 @@ pub enum RemoteError {
     /// SFTP 프로토콜 수준의 오류.
     #[error("SFTP 오류: {0}")]
     Sftp(String),
+    /// S3 접근 권한 부족 (HTTP 403).
+    #[error("권한이 없습니다(403). 프로필/버킷 정책을 확인하세요: {0}")]
+    S3AccessDenied(String),
+    /// S3 버킷·객체가 없다 (HTTP 404).
+    #[error("찾을 수 없습니다: {0}")]
+    S3NotFound(String),
+    /// AWS 자격 증명을 찾지 못했다.
+    #[error(
+        "자격 증명을 찾을 수 없습니다. `aws login` 또는 `aws sso login --profile …` 후 다시 시도하세요 ({0})"
+    )]
+    S3Credentials(String),
+    /// 그 외 S3 오류 요약.
+    #[error("S3 오류: {0}")]
+    S3(String),
     /// 그 외 I/O 오류.
     #[error("I/O 오류: {0}")]
     Io(#[from] io::Error),
@@ -65,7 +80,7 @@ fn summarize_stderr(stderr: &str) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -128,6 +143,52 @@ pub(crate) fn sftp_to_io(e: SftpError) -> io::Error {
     }
 }
 
+/// S3 SDK 오류를 RemoteError 로 분류한다. `what` 은 대상(s3 URI, 버킷명 등).
+pub(crate) fn map_s3_error<E: ProvideErrorMetadata>(e: &SdkError<E>, what: &str) -> RemoteError {
+    if let Some(resp) = e.raw_response() {
+        let status = resp.status().as_u16();
+        let code = e
+            .as_service_error()
+            .and_then(|se| se.meta().code().map(str::to_string));
+        return match (status, code.as_deref()) {
+            (403, _) | (_, Some("AccessDenied")) => RemoteError::S3AccessDenied(what.to_string()),
+            (404, _) | (_, Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "404")) => {
+                RemoteError::S3NotFound(what.to_string())
+            }
+            _ => {
+                let detail = code.map(|c| format!(" ({c})")).unwrap_or_default();
+                RemoteError::S3(truncate(&format!("{what}: HTTP {status}{detail}"), 300))
+            }
+        };
+    }
+    // 응답 자체가 없는 오류: 자격 증명 해석 실패는 안내 문구로 분류한다.
+    let msg = e.to_string();
+    if msg.to_lowercase().contains("credential") {
+        return RemoteError::S3Credentials(what.to_string());
+    }
+    RemoteError::S3(truncate(&format!("{what}: {msg}"), 300))
+}
+
+/// 오류가 리전 리다이렉트(301/PermanentRedirect)면 응답 헤더의 올바른 리전을 반환한다.
+/// 그 외엔 `None` — 호출자가 원래 오류로 처리한다.
+pub(crate) fn s3_redirect_region<E: ProvideErrorMetadata>(e: &SdkError<E>) -> Option<String> {
+    let resp = e.raw_response()?;
+    let is_redirect = resp.status().as_u16() == 301
+        || e.as_service_error().and_then(|se| se.meta().code()) == Some("PermanentRedirect");
+    if !is_redirect {
+        return None;
+    }
+    resp.headers()
+        .get("x-amz-bucket-region")
+        .map(str::to_string)
+}
+
+/// 범위 오류(416 / InvalidRange) 여부. 요청 범위가 전부 객체 밖일 때 온다.
+pub(crate) fn s3_is_invalid_range<E: ProvideErrorMetadata>(e: &SdkError<E>) -> bool {
+    e.as_service_error().and_then(|se| se.meta().code()) == Some("InvalidRange")
+        || e.raw_response().is_some_and(|r| r.status().as_u16() == 416)
+}
+
 /// 풀 작업 실패(RemoteError)를 RandomRead 의 io::Result 로 변환한다.
 pub(crate) fn remote_to_io(e: RemoteError) -> io::Error {
     match e {
@@ -135,6 +196,8 @@ pub(crate) fn remote_to_io(e: RemoteError) -> io::Error {
         RemoteError::PermissionDenied(path) => {
             io::Error::new(io::ErrorKind::PermissionDenied, path)
         }
+        RemoteError::S3AccessDenied(what) => io::Error::new(io::ErrorKind::PermissionDenied, what),
+        RemoteError::S3NotFound(what) => io::Error::new(io::ErrorKind::NotFound, what),
         RemoteError::Timeout(secs) => io::Error::new(
             io::ErrorKind::TimedOut,
             format!("연결 시간 초과 ({secs}초)"),

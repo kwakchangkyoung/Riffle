@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
-import { remoteHostOf } from "@/lib/remote";
+import { remoteHostOf, s3BucketOf } from "@/lib/remote";
 
 /** App이 관리하는 탭 메타데이터 (TabBar 표시용) */
 export interface TabMeta {
@@ -74,8 +74,9 @@ export const TabBar: React.FC<TabBarProps> = ({
                     const active = tab.id === activeId;
                     const pct = progressPct(tab.progress);
                     const fullPath = tab.file?.path ?? tab.path;
-                    // 원격(sftp://) 탭은 호스트 배지를 표시한다
+                    // 원격 탭 배지: sftp는 호스트, s3는 s3:버킷을 표시한다
                     const remoteHost = remoteHostOf(fullPath);
+                    const s3Bucket = s3BucketOf(fullPath);
                     return (
                         <div
                             key={tab.id}
@@ -126,6 +127,14 @@ export const TabBar: React.FC<TabBarProps> = ({
                                     title={`원격 호스트: ${remoteHost}`}
                                 >
                                     {remoteHost}:
+                                </span>
+                            )}
+                            {s3Bucket !== null && (
+                                <span
+                                    className="mr-1 text-[9px] font-bold px-1 py-px rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 shrink-0"
+                                    title={`S3 버킷: ${s3Bucket}`}
+                                >
+                                    s3:{s3Bucket}
                                 </span>
                             )}
                             <span className="truncate">{tabName(tab)}</span>

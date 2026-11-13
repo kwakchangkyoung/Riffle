@@ -1,12 +1,17 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+/** 파일을 연 소스 종류 */
+export type FileSource = "local" | "sftp" | "s3";
+
 export interface FileInfo {
     id: number;
     path: string;
     size: number;
     compressed: boolean;
-    /** SSH/SFTP 원격 파일 여부 (path는 "sftp://host/path" 형태) */
+    /** 원격 파일 여부 (path는 "sftp://host/path" 또는 "s3://bucket/key" 형태) */
     remote: boolean;
+    /** 파일 소스 종류 */
+    source: FileSource;
 }
 
 export interface IndexProgress {
@@ -401,6 +406,8 @@ export interface Settings {
     autoCheckUpdates: boolean;
     /** 시작 시 이전 탭 세션 복원 여부 (기본 true) */
     restoreSession: boolean;
+    /** 마지막으로 선택한 AWS 프로필 (없으면 기본 자격 증명 체인) */
+    s3Profile: string | null;
 }
 
 /**
@@ -457,4 +464,71 @@ export function listRemoteDir(
  */
 export function remoteHome(host: string): Promise<string> {
     return invoke<string>("remote_home", { host });
+}
+
+// ===== S3 객체 열기 (Phase 13) =====
+
+/** S3 접두사 목록의 한 항목 (폴더 또는 객체) */
+export interface S3Entry {
+    /** 접두사 기준 상대 이름 (폴더는 끝에 "/" 없음) */
+    name: string;
+    isDir: boolean;
+    size: number;
+    /** 수정 시각 (unix 초), 없으면 null */
+    mtime: number | null;
+}
+
+/**
+ * ~/.aws/config, ~/.aws/credentials 에 정의된 프로필 이름 목록을 조회합니다.
+ * 키 값 등 다른 내용은 읽지 않습니다.
+ */
+export function listAwsProfiles(): Promise<string[]> {
+    return invoke<string[]>("list_aws_profiles");
+}
+
+/**
+ * 선택한 프로필(없으면 기본 체인)로 버킷 목록을 조회합니다.
+ * ListBuckets 권한이 없으면 에러를 반환합니다.
+ */
+export function s3ListBuckets(profile: string | null): Promise<string[]> {
+    return invoke<string[]>("s3_list_buckets", { profile });
+}
+
+/**
+ * 버킷의 접두사 아래 항목을 "/" 구분으로 조회합니다 (폴더 먼저, 이름순).
+ */
+export function s3ListPrefix(
+    profile: string | null,
+    bucket: string,
+    prefix: string,
+): Promise<S3Entry[]> {
+    return invoke<S3Entry[]>("s3_list_prefix", { profile, bucket, prefix });
+}
+
+/**
+ * S3 객체의 크기(바이트)를 조회합니다. uri는 "s3://bucket/key" 형식입니다.
+ */
+export function s3Head(profile: string | null, uri: string): Promise<number> {
+    return invoke<number>("s3_head", { profile, uri });
+}
+
+/**
+ * S3 프로필 선택을 설정에 저장합니다. null이면 기본 자격 증명 체인을 사용합니다.
+ */
+export function setS3Profile(profile: string | null): Promise<void> {
+    return invoke<void>("set_s3_profile", { profile });
+}
+
+/**
+ * 버킷 즐겨찾기 목록을 조회합니다. 각 항목은 "bucket" 또는 "bucket/prefix/" 형식입니다.
+ */
+export function getS3Bookmarks(): Promise<string[]> {
+    return invoke<string[]>("get_s3_bookmarks");
+}
+
+/**
+ * 버킷 즐겨찾기 목록을 저장합니다.
+ */
+export function setS3Bookmarks(items: string[]): Promise<void> {
+    return invoke<void>("set_s3_bookmarks", { items });
 }

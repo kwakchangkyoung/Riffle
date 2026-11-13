@@ -5,7 +5,6 @@
 //! - 캐시는 `stat_len` 이 바뀌면 경계 블록만 무효화한다 (append 시 tail 만 stale).
 //! - 연결 단절이 감지되면 1회 재연결 후 재시도한다.
 
-use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -16,6 +15,7 @@ use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::StatusCode;
 use tokio::task::JoinSet;
 
+use crate::block_cache::BlockCache;
 use crate::conn::SftpConn;
 use crate::error::{
     RemoteError, map_sftp_error, remote_to_io, sftp_is_conn_error, sftp_is_timeout, sftp_to_io,
@@ -60,64 +60,6 @@ struct FileState {
     handle: String,
 }
 
-/// 256KiB 블록 LRU 캐시. 키는 블록 시작 오프셋, 값은 블록 시작부터의 실제 바이트다
-/// (EOF 에 걸린 블록은 256KiB 보다 짧을 수 있다).
-struct Cache {
-    map: HashMap<u64, Vec<u8>>,
-    /// 앞이 가장 오래된 LRU 순서.
-    order: VecDeque<u64>,
-    bytes: usize,
-}
-
-impl Cache {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-            bytes: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.map.clear();
-        self.order.clear();
-        self.bytes = 0;
-    }
-
-    fn touch(&mut self, bs: u64) {
-        if let Some(pos) = self.order.iter().position(|&k| k == bs) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(bs);
-    }
-
-    fn insert(&mut self, bs: u64, data: Vec<u8>) {
-        self.remove_key(bs);
-        self.bytes += data.len();
-        self.map.insert(bs, data);
-        self.order.push_back(bs);
-        while self.bytes > CACHE_MAX_BYTES {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.remove_key(oldest);
-        }
-    }
-
-    fn remove_key(&mut self, bs: u64) {
-        if let Some(d) = self.map.remove(&bs) {
-            self.bytes = self.bytes.saturating_sub(d.len());
-        }
-        self.order.retain(|&k| k != bs);
-    }
-
-    fn invalidate(&mut self, keys: impl IntoIterator<Item = u64>) {
-        for k in keys {
-            self.remove_key(k);
-        }
-    }
-}
-
 pub(crate) struct RemoteFile {
     inner: Arc<PoolInner>,
     host: String,
@@ -127,7 +69,7 @@ pub(crate) struct RemoteFile {
     state: StdMutex<FileState>,
     /// 마지막으로 확인한 파일 크기. UNKNOWN_SIZE 면 모르는 상태.
     size: AtomicU64,
-    cache: StdMutex<Cache>,
+    cache: StdMutex<BlockCache>,
 }
 
 impl RemoteFile {
@@ -151,7 +93,7 @@ impl RemoteFile {
             uri,
             state: StdMutex::new(FileState { conn, handle }),
             size: AtomicU64::new(size.unwrap_or(UNKNOWN_SIZE)),
-            cache: StdMutex::new(Cache::new()),
+            cache: StdMutex::new(BlockCache::new(CACHE_MAX_BYTES)),
         }
     }
 
@@ -321,9 +263,7 @@ impl RemoteFile {
         {
             let mut cache = self.cache.lock().unwrap();
             for (i, p) in pieces.iter().enumerate() {
-                if cache.map.contains_key(&p.bs) {
-                    cache.touch(p.bs);
-                    let block = cache.map.get(&p.bs).expect("contains_key 직후 get 실패");
+                if let Some(block) = cache.get(p.bs) {
                     apply_block(&mut covered, &mut gaps, i, p, block, work, offset);
                 } else {
                     missing.push(p.bs);

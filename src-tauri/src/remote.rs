@@ -100,6 +100,7 @@ fn open_remote_inner(state: &AppState, path: &str, uri: &RemoteUri) -> Result<Op
             size,
             compressed,
             remote: true,
+            source: "sftp".to_string(),
         },
         file,
         cancel,

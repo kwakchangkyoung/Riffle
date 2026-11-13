@@ -547,8 +547,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
         const handleToggleTail = useCallback(() => {
             const current = currentFileRef.current;
-            // 압축 파일(.gz)은 임시 파일 해제 방식이라 tail 모드를 지원하지 않는다
-            if (!current || current.compressed) return;
+            // 압축 파일(.gz)은 임시 파일 해제 방식이고, S3 객체는 불변이라 tail 모드를 지원하지 않는다
+            if (!current || current.compressed || current.source === "s3")
+                return;
             const next = !tailEnabledRef.current;
             tailEnabledRef.current = next;
             setTailEnabled(next);
@@ -1459,20 +1460,24 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         <button
                             type="button"
                             onClick={handleToggleTail}
-                            disabled={!file || file.compressed}
+                            disabled={
+                                !file || file.compressed || file.source === "s3"
+                            }
                             title={
-                                file?.compressed
-                                    ? "압축 파일은 tail 을 지원하지 않습니다"
-                                    : file?.remote
-                                      ? "tail 모드 토글 (⌘T) — 원격: 1초 간격으로 확인합니다"
-                                      : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                                file?.source === "s3"
+                                    ? "S3 객체는 불변이므로 tail 을 지원하지 않습니다"
+                                    : file?.compressed
+                                      ? "압축 파일은 tail 을 지원하지 않습니다"
+                                      : file?.remote
+                                        ? "tail 모드 토글 (⌘T) — 원격: 1초 간격으로 확인합니다"
+                                        : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
                             }
                             className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 ${
                                 tailEnabled
                                     ? "bg-emerald-600 text-white hover:bg-emerald-500 shadow-xs"
                                     : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
                             } ${
-                                file && !file.compressed
+                                file && !file.compressed && file.source !== "s3"
                                     ? "cursor-pointer"
                                     : "opacity-40 cursor-not-allowed"
                             }`}

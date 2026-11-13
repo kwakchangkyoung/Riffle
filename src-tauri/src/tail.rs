@@ -270,6 +270,14 @@ where
     if open_file.compressed {
         return Err("압축 파일은 tail 모드를 지원하지 않습니다".to_string());
     }
+    // S3 객체는 불변이므로 추가분 감시(tail)를 지원하지 않는다
+    if open_file
+        .path
+        .to_str()
+        .is_some_and(|p| p.starts_with("s3://"))
+    {
+        return Err("S3 객체는 tail 을 지원하지 않습니다".to_string());
+    }
     // 이미 감시 중이고 스레드가 살아 있으면 재사용
     if let Some(handle) = open_file.tail.as_ref()
         && !handle.thread.is_finished()

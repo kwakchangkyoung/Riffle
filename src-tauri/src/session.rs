@@ -76,8 +76,8 @@ pub(crate) fn filter_session(
 
 /// 파일 존재 여부 확인 클로저 (없는 경로는 세션에서 제외하기 위해 사용)
 fn path_exists(path: &str) -> bool {
-    // 원격(sftp://) 경로는 로컬에서 존재 여부를 확인할 수 없으므로 유지한다
-    if path.starts_with("sftp://") {
+    // 원격(sftp://, s3://) 경로는 로컬에서 존재 여부를 확인할 수 없으므로 유지한다
+    if crate::commands::is_remote_uri(path) {
         return true;
     }
     Path::new(path).try_exists().unwrap_or(false)

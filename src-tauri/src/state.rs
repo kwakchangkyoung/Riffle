@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use riffle_core::{FilterSet, LineSet, LogFile};
-use riffle_remote::{SftpPool, Transport};
+use riffle_remote::{S3Pool, SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
 use crate::tail::TailLoopMsg;
@@ -137,6 +137,12 @@ pub struct AppState {
     /// 원격(SFTP) 연결 풀. 앱 전역으로 하나만 두고 호스트별 참조 카운트로 관리한다.
     /// 테스트에서는 Transport::Command로 교체할 수 있다.
     pub remote_pool: SftpPool,
+    /// S3 객체 읽기 풀. 앱 전역으로 하나만 두고 (프로필, 리전)별 클라이언트를 캐시한다.
+    /// 테스트에서는 S3Pool::with_endpoint로 가짜 서버를 지정할 수 있다.
+    pub s3_pool: S3Pool,
+    /// 마지막으로 선택한 AWS 프로필 (None이면 기본 자격 증명 체인).
+    /// set_s3_profile이 settings.json 저장과 함께 갱신한다.
+    pub s3_profile: Mutex<Option<String>>,
 }
 
 impl Default for AppState {
@@ -152,6 +158,8 @@ impl Default for AppState {
             pending_open: Mutex::new(Vec::new()),
             front_ready: AtomicBool::new(false),
             remote_pool: SftpPool::new(Transport::Ssh),
+            s3_pool: S3Pool::new(),
+            s3_profile: Mutex::new(None),
         }
     }
 }
@@ -410,6 +418,19 @@ impl AppState {
     /// 프론트가 준비 완료(take_pending_open 호출)했는지 반환한다.
     pub fn is_front_ready(&self) -> bool {
         self.front_ready.load(Ordering::Relaxed)
+    }
+
+    /// 현재 선택된 AWS 프로필을 반환한다 (None이면 기본 체인).
+    pub fn s3_profile(&self) -> Option<String> {
+        self.s3_profile
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 선택된 AWS 프로필을 갱신한다 (set_s3_profile이 설정 저장 후 호출).
+    pub fn set_s3_profile(&self, profile: Option<String>) {
+        *self.s3_profile.lock().unwrap_or_else(|p| p.into_inner()) = profile;
     }
 }
 
