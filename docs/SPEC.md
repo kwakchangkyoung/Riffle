@@ -75,6 +75,7 @@ riffle/
 - 인코딩: UTF-8을 가정하고, 잘못된 바이트는 `String::from_utf8_lossy`로 대체 문자 처리한다.
 - 줄바꿈: `\n` 기준으로 나누고, 줄 끝의 `\r`은 표시 시 제거한다 (CRLF 지원).
 - 마지막 줄에 개행이 없어도 한 줄로 인정한다.
+- (Phase 12) 원격 파일은 `RandomRead` trait(동기 random-access, 구현체가 내부에서 비동기 처리) 뒤에 숨긴다. `Source`는 로컬 File / 익명 File(gz 임시) / `Arc<dyn RandomRead>` 세 종류를 가지며, 인덱싱·검색·필터의 read_at 파이프라인은 그대로 재사용한다. 구현체(SFTP over ssh)는 riffle-remote가 제공한다. `refresh()`는 stat_len 증가→Appended, 감소→Truncated로 판정하고 inode가 없어 Replaced는 판정하지 않는다. 원격 .gz는 `open_gzip_remote`가 순차 읽기로 기존 임시파일 해제 경로에 태운다.
 
 ### 3.2 희소 줄 인덱스
 
@@ -140,7 +141,7 @@ pub struct Line {
 
 | 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
-| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로 |
+| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP)으로 열기 (Phase 12) |
 | `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`                                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용               |
 | `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
 | `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
@@ -159,6 +160,9 @@ pub struct Line {
 | `take_pending_open`  | -                                                                                                      | `string[]`                    | Finder 연결 대기 경로 목록 (콜드 스타트, 1회 수령)        |
 | `save_session`       | `session: { paths, activeIndex }`                                                                      | `()`                          | 탭 세션을 session.json에 원자적 저장                      |
 | `load_session`       | -                                                                                                      | `Session \| null`             | 탭 세션 로드. `restoreSession` 꺼짐/파일 없음/경로 전멸 시 null |
+| `list_ssh_hosts`     | -                                                                                                      | `Vec<SshHost>`                 | `~/.ssh/config`의 Host 별칭 목록 (Phase 12)              |
+| `list_remote_dir`    | `host`, `path`                                                                                         | `Vec<RemoteEntry>`             | 원격 디렉터리 목록. 이름순, 디렉터리 먼저 (Phase 12)      |
+| `remote_home`        | `host`                                                                                                 | `string`                       | 원격 홈 디렉터리 절대 경로 (Phase 12)                     |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
 - (Phase 11) Finder "다음으로 열기"·다중 선택·드래그 앤 드롭으로 열린 파일은 `"open-files"` 이벤트(`string[]`, 순서 유지)로 프론트에 전달한다. 콜드 스타트처럼 프론트 준비 전에 도착한 경로는 Rust가 `pending_open`에 누적하고 `take_pending_open`으로 한 번에 수령한다. 파일 열기·드래그 앤 드롭·최근 파일·세션 복원은 모두 새 탭으로 열고, 이미 열린 같은 경로(canonical `FileInfo.path` 기준)면 해당 탭으로 전환한다.
@@ -167,6 +171,8 @@ pub struct Line {
 - `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다.
 - `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다.
 - `TailEvent::Appended`에는 `filterCount`(활성 필터의 보이는 줄 수, 없으면 null)가 추가된다.
+- (Phase 12) 원격(SFTP) 파일: `open_file`의 `path`가 `sftp://호스트/경로`이면 `SftpPool`(시스템 `ssh` + russh-sftp, 앱 전역 하나, 호스트별 참조 카운트)로 연다. `FileInfo.remote`는 true이고 `path`는 URI 그대로 보관해 최근 파일·세션 복원이 그대로 동작한다. `close_file`은 원격이면 `pool.release(host)`를 호출한다. 원격 파일의 tail은 notify 대신 1초 폴링 `refresh`를 사용한다. 연결 오류는 탭 에러 바로 표시하고 재연결은 RandomRead 구현체가 read 시 1회 시도한다.
+- (Phase 12) `SshHost { alias, hostname?, user? }`, `RemoteEntry { name, isDir, size, mtime? }`(mtime은 unix 초). 모든 원격 호출은 `spawn_blocking`에서 수행한다. `list_ssh_hosts`는 `~/.ssh/config`(Include·~ 확장, 와일드카드/부정 별칭 제외)의 Host 목록을 반환한다.
 - (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(검색 필터 모드), `validate_query`로 필요한 만큼만 조회한다. 다중 필터의 보이는 줄도 `LineSet`으로 Rust에만 보관하고 `get_filter_lines`/`filter_index_of`/`filter_density`로 필요한 만큼만 조회한다.
 - 열린 파일은 `State<AppState>` 안의 `HashMap<FileId, Arc<LogFile>>`로 관리한다.
 - `capabilities/default.json`에는 실제로 쓰는 권한(dialog, clipboard 등)만 최소로 허용한다.
@@ -197,6 +203,7 @@ pub struct Line {
 | 키                  | 동작                     |
 | ------------------- | ------------------------ |
 | Cmd+O               | 파일 열기 (새 탭)        |
+| Cmd+Shift+O         | 원격 파일 열기 (Phase 12) |
 | Cmd+W               | 탭 닫기                  |
 | Cmd+Shift+W         | 창 닫기                  |
 | Cmd+Shift+] / [     | 다음 / 이전 탭           |
@@ -214,6 +221,8 @@ pub struct Line {
 ### 5.5 UI 구성
 
 상단 검색바, 중앙 뷰포트(줄 번호 거터 + 본문 + 커스텀 스크롤바), 하단 상태바(파일 경로, 크기, 줄 수, 인덱싱 진행률, 검색 결과 n/N, 현재 줄). 시스템 라이트/다크 모드를 따른다.
+
+- (Phase 12) 원격 파일 열기 대화상자(`Cmd+Shift+O`, 메뉴 `파일 > 원격 파일 열기…`, 빈 화면 버튼): `list_ssh_hosts` 호스트 목록 + 직접 입력 자동완성, `remote_home`으로 시작 경로 설정, `list_remote_dir` 디렉터리 탐색(이름/크기/수정 시각, 디렉터리 더블클릭 진입, 상위 이동, 파일 더블클릭/열기로 탭 오픈, 다중 선택), 로딩/에러(재시도) 표시, 최근 원격 위치(호스트+디렉터리, 최대 10개)를 localStorage에 저장한다. 원격 탭은 호스트 배지(예: `myhost:`)와 전체 URI 툴팁, 상태바에 `원격: host`를 표시하고, tail 버튼 툴팁에 `원격: 1초 간격 확인`을 표시한다.
 
 ## 6. 단계별 작업 계획
 

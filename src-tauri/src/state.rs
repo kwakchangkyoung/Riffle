@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use riffle_core::{FilterSet, LineSet, LogFile};
+use riffle_remote::{SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
 use crate::tail::TailLoopMsg;
@@ -133,6 +134,9 @@ pub struct AppState {
     pub pending_open: Mutex<Vec<String>>,
     /// 프론트가 take_pending_open을 호출했는지 여부 (호출 = 프론트 준비 완료)
     pub front_ready: AtomicBool,
+    /// 원격(SFTP) 연결 풀. 앱 전역으로 하나만 두고 호스트별 참조 카운트로 관리한다.
+    /// 테스트에서는 Transport::Command로 교체할 수 있다.
+    pub remote_pool: SftpPool,
 }
 
 impl Default for AppState {
@@ -147,6 +151,7 @@ impl Default for AppState {
             recent_files: Mutex::new(Vec::new()),
             pending_open: Mutex::new(Vec::new()),
             front_ready: AtomicBool::new(false),
+            remote_pool: SftpPool::new(Transport::Ssh),
         }
     }
 }
@@ -188,19 +193,26 @@ impl AppState {
     /// 해당 파일에 연결된 모든 검색 세션도 취소하고 제거한다.
     pub fn close_file(&self, id: u32) {
         // 1. 파일 닫기, 인덱싱 취소, tail 핸들 회수 (join은 lock 밖에서 수행)
-        let tail_handle = {
+        let (tail_handle, remote_host) = {
             let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
             let mut tail = None;
+            let mut remote_host = None;
             if let Some(open_file) = files.remove(&id) {
                 open_file.cancel.store(true, Ordering::Relaxed);
+                remote_host = crate::remote::remote_host_of_path(&open_file.path);
                 tail = open_file.tail;
             }
-            tail
+            (tail, remote_host)
         };
         if let Some(handle) = tail_handle {
             handle.stop.store(true, Ordering::Relaxed);
             let _ = handle.wake.send(TailLoopMsg::Stop);
             let _ = handle.thread.join();
+        }
+
+        // 원격(sftp://) 파일이면 SFTP 연결의 참조를 반환한다
+        if let Some(host) = remote_host {
+            self.remote_pool.release(&host);
         }
 
         // 2. 해당 파일의 활성 검색 세션 모두 취소 및 제거

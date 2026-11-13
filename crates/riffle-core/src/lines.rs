@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use crate::filter::FilterSet;
 use crate::index::{IndexProgress, LineIndex};
+use crate::remote::RandomRead;
 use crate::search::{Matcher, utf16_ranges};
-use crate::source::Source;
+use crate::source::{Source, SourceKind};
 use crate::{Error, Result};
 
 /// 표시용 한 줄 최대 바이트 크기 (16KB)
@@ -255,6 +256,20 @@ impl LogFile {
     /// 로그 파일을 열어 LogFile 인스턴스를 생성한다. 인덱싱은 시작하지 않는다.
     pub fn open(path: &Path) -> Result<LogFile> {
         Ok(Self::from_source(Source::open(path)?))
+    }
+
+    /// 원격(또는 임의의) 랜덤 액세스 소스로 LogFile을 연다.
+    /// 초기 길이는 stat_len()으로 조회한다 (네트워크 호출 가능).
+    /// 인덱싱은 시작하지 않으며, 이후 refresh()가 stat_len 증가분만 Appended로
+    /// 반영한다. inode가 없어 Replaced 판정은 없고 길이 감소는 Truncated다.
+    pub fn open_remote(r: Arc<dyn RandomRead>) -> Result<LogFile> {
+        Ok(Self::from_source(Source::from_remote(r)?))
+    }
+
+    /// 원격 소스의 URI(예: "sftp://host/path")를 반환한다.
+    /// 로컬 파일·익명 소스는 None.
+    pub fn uri(&self) -> Option<String> {
+        self.source.uri()
     }
 
     /// 이미 열린 파일 핸들(익명 소스)로부터 LogFile을 생성한다.
@@ -580,22 +595,35 @@ impl LogFile {
         let file_len = self.source.file_len()?;
         let known_len = self.source.len();
 
-        if self.source.has_path() {
-            // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
-            if !self.source.path_matches()? {
-                self.line_start_cache.lock().unwrap().clear();
-                return Ok(RefreshOutcome::Replaced);
-            }
+        match self.source.kind() {
+            SourceKind::LocalPath => {
+                // 경로가 같은 파일을 가리키는지 먼저 확인 (rename 로테이션/삭제 감지)
+                if !self.source.path_matches()? {
+                    self.line_start_cache.lock().unwrap().clear();
+                    return Ok(RefreshOutcome::Replaced);
+                }
 
-            // 열린 파일 핸들의 현재 크기가 확인된 길이보다 작으면 truncate
-            if file_len < known_len {
-                self.line_start_cache.lock().unwrap().clear();
-                return Ok(RefreshOutcome::Truncated);
+                // 열린 파일 핸들의 현재 크기가 확인된 길이보다 작으면 truncate
+                if file_len < known_len {
+                    self.line_start_cache.lock().unwrap().clear();
+                    return Ok(RefreshOutcome::Truncated);
+                }
             }
-        } else if file_len <= known_len {
-            // 익명 소스(해제 임시 파일 등)는 경로 비교·truncate 판정 없이
-            // 핸들의 길이 증가만 Appended로 반영한다
-            return Ok(RefreshOutcome::Unchanged);
+            SourceKind::Remote => {
+                // 원격 소스는 inode가 없어 교체 판정이 불가하다.
+                // 길이가 줄면 truncate로 보고, 증가는 아래 공통 로직에서 Appended로 반영한다.
+                if file_len < known_len {
+                    self.line_start_cache.lock().unwrap().clear();
+                    return Ok(RefreshOutcome::Truncated);
+                }
+            }
+            SourceKind::LocalAnonymous => {
+                // 익명 소스(해제 임시 파일 등)는 경로 비교·truncate 판정 없이
+                // 핸들의 길이 증가만 Appended로 반영한다
+                if file_len <= known_len {
+                    return Ok(RefreshOutcome::Unchanged);
+                }
+            }
         }
 
         // 최초 인덱싱이 끝나기 전에는 추가분을 반영할 수 없다

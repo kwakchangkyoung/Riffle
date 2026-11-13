@@ -5,6 +5,8 @@ export interface FileInfo {
     path: string;
     size: number;
     compressed: boolean;
+    /** SSH/SFTP 원격 파일 여부 (path는 "sftp://host/path" 형태) */
+    remote: boolean;
 }
 
 export interface IndexProgress {
@@ -413,4 +415,46 @@ export function getSettings(): Promise<Settings> {
  */
 export function setAutoCheckUpdates(enabled: boolean): Promise<void> {
     return invoke<void>("set_auto_check_updates", { enabled });
+}
+
+// ===== 원격 파일 (SSH/SFTP, Phase 12) =====
+
+/** ~/.ssh/config 의 Host 항목 */
+export interface SshHost {
+    alias: string;
+    hostname: string | null;
+    user: string | null;
+}
+
+/** 원격 디렉터리 목록의 한 항목 */
+export interface RemoteEntry {
+    name: string;
+    isDir: boolean;
+    size: number;
+    /** 수정 시각 (unix 초), 없으면 null */
+    mtime: number | null;
+}
+
+/**
+ * ~/.ssh/config 의 Host 별칭 목록을 조회합니다.
+ */
+export function listSshHosts(): Promise<SshHost[]> {
+    return invoke<SshHost[]>("list_ssh_hosts");
+}
+
+/**
+ * 원격 호스트의 디렉터리 목록을 조회합니다 (이름순, 디렉터리 먼저).
+ */
+export function listRemoteDir(
+    host: string,
+    path: string,
+): Promise<RemoteEntry[]> {
+    return invoke<RemoteEntry[]>("list_remote_dir", { host, path });
+}
+
+/**
+ * 원격 호스트의 홈 디렉터리 절대 경로를 조회합니다.
+ */
+export function remoteHome(host: string): Promise<string> {
+    return invoke<string>("remote_home", { host });
 }

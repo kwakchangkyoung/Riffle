@@ -16,6 +16,7 @@ use flate2::bufread::MultiGzDecoder;
 
 use crate::error::{Error, Result};
 use crate::lines::LogFile;
+use crate::remote::RandomRead;
 use crate::source::Source;
 
 /// 해제 입/출력 버퍼 크기 (1MB)
@@ -54,10 +55,25 @@ pub fn is_gzip(path: &Path) -> Result<bool> {
     }
 }
 
-/// 원본 .gz 파일에서 실제로 읽어들인 바이트 수를 세는 래퍼.
+/// RandomRead 소스의 앞 2바이트가 gzip 매직(1f 8b)인지 확인한다 (확장자 무관).
+/// 짧은 읽기가 섞여도 2바이트를 모을 때까지 반복 호출한다.
+pub fn is_gzip_reader(r: &dyn RandomRead) -> Result<bool> {
+    let mut magic = [0u8; 2];
+    let mut got = 0usize;
+    while got < magic.len() {
+        match r.read_at(&mut magic[got..], got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(got == magic.len() && magic == [0x1f, 0x8b])
+}
+
+/// 원본 압축 소스에서 실제로 읽어들인 바이트 수를 세는 래퍼.
 /// 진행률의 compressed_read를 구하기 위해 디코더 입력 측에 둔다.
 struct ByteCounter {
-    inner: File,
+    inner: Box<dyn Read + Send>,
     count: Arc<AtomicU64>,
 }
 
@@ -65,6 +81,28 @@ impl Read for ByteCounter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// RandomRead를 순차 Read로 어댑트한다 (gzip 스트리밍 해제용).
+/// read_at의 offset을 내부에서 전진시키며 짧은 읽기도 그대로 반환한다
+/// (BufReader가 버퍼를 채울 때까지 반복 호출한다).
+struct RemoteReader {
+    inner: Arc<dyn RandomRead>,
+    pos: u64,
+}
+
+impl RemoteReader {
+    fn new(inner: Arc<dyn RandomRead>) -> Self {
+        RemoteReader { inner, pos: 0 }
+    }
+}
+
+impl Read for RemoteReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read_at(buf, self.pos)?;
+        self.pos += n as u64;
         Ok(n)
     }
 }
@@ -85,21 +123,22 @@ pub struct GzWriter {
     temp_path: PathBuf,
 }
 
-/// .gz 파일을 열어 해제 대상 LogFile과 GzWriter를 만든다.
-///
-/// 임시 파일을 temp_dir()/riffle-gz/ 아래에 만들고 즉시 unlink한다.
-/// 반환된 LogFile은 길이 0, 인덱스 완료 상태로 시작하며 이후
-/// GzWriter::run 안의 refresh() 호출로 커진다.
-/// `display_path` 개념은 호출 측(IPC)이 원본 경로를 그대로 쓰므로 여기서는 다루지 않는다.
-pub fn open_gzip(path: &Path) -> Result<(LogFile, GzWriter)> {
-    let src = File::open(path)?;
-    let compressed_total = src.metadata()?.len();
+/// gzip 해제 결과를 쓸 임시 파일 소스 묶음
+struct TempSink {
+    log_file: LogFile,
+    write_file: File,
+    /// 임시 파일 경로. 생성 직후 unlink되므로 존재하지 않으며 테스트용이다.
+    #[cfg(test)]
+    temp_path: PathBuf,
+}
 
+/// temp_dir()/riffle-gz/ 아래에 임시 파일을 만들고 즉시 unlink한 뒤
+/// (읽기용 LogFile, 쓰기용 파일 핸들)을 반환한다.
+/// 읽기/쓰기 핸들은 unlink 전에 열어 두므로 이후에도 유효하다.
+fn temp_sink() -> Result<TempSink> {
     let dir = std::env::temp_dir().join(TEMP_DIR_NAME);
     std::fs::create_dir_all(&dir)?;
 
-    // 고유 이름의 임시 파일을 만들고 즉시 unlink 한다.
-    // 읽기/쓰기 핸들은 unlink 전에 열어 두므로 이후에도 유효하다.
     let temp_path = unique_temp_path(&dir);
     let write_file = OpenOptions::new()
         .write(true)
@@ -116,16 +155,35 @@ pub fn open_gzip(path: &Path) -> Result<(LogFile, GzWriter)> {
 
     let log_file = LogFile::from_source(Source::from_file(read_file)?);
 
+    Ok(TempSink {
+        log_file,
+        write_file,
+        #[cfg(test)]
+        temp_path,
+    })
+}
+
+/// .gz 파일을 열어 해제 대상 LogFile과 GzWriter를 만든다.
+///
+/// 임시 파일을 temp_dir()/riffle-gz/ 아래에 만들고 즉시 unlink한다.
+/// 반환된 LogFile은 길이 0, 인덱스 완료 상태로 시작하며 이후
+/// GzWriter::run 안의 refresh() 호출로 커진다.
+/// `display_path` 개념은 호출 측(IPC)이 원본 경로를 그대로 쓰므로 여기서는 다루지 않는다.
+pub fn open_gzip(path: &Path) -> Result<(LogFile, GzWriter)> {
+    let src = File::open(path)?;
+    let compressed_total = src.metadata()?.len();
+    let sink = temp_sink()?;
+
     let compressed_read = Arc::new(AtomicU64::new(0));
     let counted = ByteCounter {
-        inner: src,
+        inner: Box::new(src),
         count: Arc::clone(&compressed_read),
     };
     let decoder = MultiGzDecoder::new(BufReader::with_capacity(IO_BUF_SIZE, counted));
-    let out = BufWriter::with_capacity(IO_BUF_SIZE, write_file);
+    let out = BufWriter::with_capacity(IO_BUF_SIZE, sink.write_file);
 
     Ok((
-        log_file,
+        sink.log_file,
         GzWriter {
             decoder,
             out,
@@ -133,7 +191,36 @@ pub fn open_gzip(path: &Path) -> Result<(LogFile, GzWriter)> {
             compressed_read,
             decompressed: 0,
             #[cfg(test)]
-            temp_path,
+            temp_path: sink.temp_path,
+        },
+    ))
+}
+
+/// 원격(또는 임의의) 랜덤 액세스 소스의 gzip을 순차적으로 읽어 해제한다.
+/// 로컬 .gz와 동일하게 임시 파일에 해제한 뒤 "점점 커지는 파일"로 인덱싱한다.
+/// 반환된 LogFile은 길이 0으로 시작하며 GzWriter::run 안의 refresh()로 커진다.
+pub fn open_gzip_remote(r: Arc<dyn RandomRead>) -> Result<(LogFile, GzWriter)> {
+    let compressed_total = r.stat_len()?;
+    let sink = temp_sink()?;
+
+    let compressed_read = Arc::new(AtomicU64::new(0));
+    let counted = ByteCounter {
+        inner: Box::new(RemoteReader::new(r)),
+        count: Arc::clone(&compressed_read),
+    };
+    let decoder = MultiGzDecoder::new(BufReader::with_capacity(IO_BUF_SIZE, counted));
+    let out = BufWriter::with_capacity(IO_BUF_SIZE, sink.write_file);
+
+    Ok((
+        sink.log_file,
+        GzWriter {
+            decoder,
+            out,
+            compressed_total,
+            compressed_read,
+            decompressed: 0,
+            #[cfg(test)]
+            temp_path: sink.temp_path,
         },
     ))
 }

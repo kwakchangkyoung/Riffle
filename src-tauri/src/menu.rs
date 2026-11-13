@@ -32,8 +32,15 @@ pub fn apply_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<()> {
 
 /// 앱 메뉴바 전체를 구성한다.
 fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
-    // 파일 메뉴: 열기, 최근 파일, 탭 닫기, 창 닫기
+    // 파일 메뉴: 열기, 원격 파일 열기, 최근 파일, 탭 닫기, 창 닫기
     let open_item = MenuItem::with_id(app, "open", "열기…", true, Some("CmdOrCtrl+O"))?;
+    let open_remote_item = MenuItem::with_id(
+        app,
+        "open_remote",
+        "원격 파일 열기…",
+        true,
+        Some("CmdOrCtrl+Shift+O"),
+    )?;
     let close_tab_item = MenuItem::with_id(app, "close_tab", "탭 닫기", true, Some("CmdOrCtrl+W"))?;
     // PredefinedMenuItem::close_window는 macOS에서 단축키가 ⌘W로 고정되어
     // 탭 닫기(⌘W)와 충돌하므로, 일반 항목 + 네이티브 close로 ⌘⇧W를 지원한다.
@@ -85,6 +92,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
         true,
         &[
             &open_item,
+            &open_remote_item,
             &recent_menu,
             &PredefinedMenuItem::separator(app)?,
             &close_tab_item,

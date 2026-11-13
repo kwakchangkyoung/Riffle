@@ -1463,7 +1463,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             title={
                                 file?.compressed
                                     ? "압축 파일은 tail 을 지원하지 않습니다"
-                                    : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                                    : file?.remote
+                                      ? "tail 모드 토글 (⌘T) — 원격: 1초 간격으로 확인합니다"
+                                      : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
                             }
                             className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 ${
                                 tailEnabled

@@ -214,6 +214,40 @@ pub fn run_tail_loop(
     }
 }
 
+/// 원격(sftp://) 파일 tail 폴링 루프.
+/// notify는 원격 파일에 쓸 수 없으므로 1초 간격으로 refresh()를 폴링한다.
+/// 연결 오류는 Error 이벤트로 전달하고 루프는 계속된다
+/// (RandomRead 구현체가 다음 read에서 1회 재연결을 시도한다).
+pub fn run_poll_tail_loop(
+    file: Arc<LogFile>,
+    stop: Arc<AtomicBool>,
+    rx: std::sync::mpsc::Receiver<TailLoopMsg>,
+    filter_ctx: TailFilterCtx,
+    mut on_event: impl FnMut(TailEvent),
+) {
+    // 시작 시 한 번 즉시 확인 (열기 이후 변경분 반영)
+    if !refresh_once(&file, &filter_ctx, &mut on_event) {
+        return;
+    }
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Stop 수신 또는 1초 타임아웃까지 대기
+        match rx.recv_timeout(POLL_INTERVAL) {
+            Ok(TailLoopMsg::Event) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(TailLoopMsg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if !refresh_once(&file, &filter_ctx, &mut on_event) {
+            break; // 로테이션(크기 감소) 감지 → 감시 종료
+        }
+    }
+}
+
 /// 파일 경로의 부모 디렉터리를 반환한다. 부모가 없으면 현재 디렉터리.
 fn watch_dir_of(path: &Path) -> PathBuf {
     path.parent()
@@ -243,6 +277,11 @@ where
         return Ok(());
     }
     let file = open_file.file.clone();
+    // 원격(sftp://) 파일은 notify 대신 1초 폴링으로 refresh한다
+    let is_remote = open_file
+        .path
+        .to_str()
+        .is_some_and(|p| p.starts_with("sftp://"));
     let watch_dir = watch_dir_of(&open_file.path);
     // Appended 시 활성 필터의 LineSet을 갱신하기 위해 필터 맵을 공유한다
     let filter_ctx = TailFilterCtx {
@@ -256,18 +295,24 @@ where
     let wake_tx = tx.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    let thread_tx = tx;
-    let thread = std::thread::spawn(move || {
-        run_tail_loop(
-            file,
-            &watch_dir,
-            thread_stop,
-            thread_tx,
-            rx,
-            filter_ctx,
-            on_event,
-        );
-    });
+    let thread = if is_remote {
+        // 폴링 루프는 tx를 쓰지 않으므로 원본 송신자는 여기서 버린다
+        // (wake_tx가 채널을 열어 두므로 Stop 수신은 유지된다)
+        std::thread::spawn(move || run_poll_tail_loop(file, thread_stop, rx, filter_ctx, on_event))
+    } else {
+        let thread_tx = tx;
+        std::thread::spawn(move || {
+            run_tail_loop(
+                file,
+                &watch_dir,
+                thread_stop,
+                thread_tx,
+                rx,
+                filter_ctx,
+                on_event,
+            );
+        })
+    };
     open_file.tail = Some(TailHandle {
         stop,
         wake: wake_tx,

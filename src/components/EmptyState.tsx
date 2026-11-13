@@ -1,8 +1,10 @@
 import React from "react";
+import { isRemotePath } from "@/lib/remote";
 
 interface EmptyStateProps {
     recentFiles: string[];
     onOpenDialog: () => void;
+    onOpenRemote: () => void;
     onOpenPath: (path: string) => void;
 }
 
@@ -13,6 +15,7 @@ interface EmptyStateProps {
 export const EmptyState: React.FC<EmptyStateProps> = ({
     recentFiles,
     onOpenDialog,
+    onOpenRemote,
     onOpenPath,
 }) => {
     return (
@@ -45,6 +48,17 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
                         대용량 텍스트 로그 파일을 빠르게 탐색할 수 있습니다
                     </p>
                 </div>
+                {/* 원격(SFTP) 파일 열기 — 카드 클릭(로컬 파일 열기)과 분리 */}
+                <button
+                    type="button"
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenRemote();
+                    }}
+                    className="mt-1 px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
+                >
+                    원격 파일 열기 (⌘⇧O)
+                </button>
             </div>
 
             {/* 최근 파일 목록 */}
@@ -65,7 +79,13 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
                                 className="w-full px-3 py-1.5 text-left text-xs font-mono text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 truncate cursor-pointer"
                                 title={path}
                             >
-                                {path}
+                                {isRemotePath(path) ? (
+                                    <span className="text-sky-600 dark:text-sky-400">
+                                        {path}
+                                    </span>
+                                ) : (
+                                    path
+                                )}
                             </button>
                         ))}
                     </div>

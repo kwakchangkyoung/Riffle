@@ -19,10 +19,13 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 pub struct FileInfo {
     pub id: u32,
+    /// 파일 경로. 원격 파일이면 "sftp://호스트/경로" 형태의 URI
     pub path: String,
     pub size: u64,
     /// gzip 압축 파일 여부
     pub compressed: bool,
+    /// 원격(SFTP) 파일 여부
+    pub remote: bool,
 }
 
 /// 인덱싱/해제 진행률 DTO
@@ -388,7 +391,11 @@ pub struct OpenedFile {
 }
 
 /// 파일 열기 내부 로직: 파일을 열고(필요시 gzip 해제 준비) AppState에 등록한다.
+/// path가 "sftp://"로 시작하면 원격(SFTP) 파일로 라우팅한다.
 pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, String> {
+    if path.starts_with("sftp://") {
+        return crate::remote::open_remote_internal(state, path);
+    }
     let file_path = Path::new(path);
     let gz = riffle_core::is_gzip(file_path)
         .map_err(|e| format!("파일을 열 수 없습니다 ('{path}'): {e}"))?;
@@ -422,6 +429,7 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
             path: path.to_string(),
             size,
             compressed,
+            remote: false,
         },
         file,
         cancel,
@@ -588,14 +596,19 @@ pub async fn open_file(
     // AppHandle을 통해 블로킹 스레드 안에서 AppState를 다시 얻는다.
     // 탭 중복 판별과 최근 파일 기록에 쓸 수 있게 canonical 경로로 변환한다
     // (심볼릭 링크 등으로 같은 파일을 가리키는 경로를 하나로 맞춤, 실패 시 원래 경로).
+    // sftp:// 원격 URI는 로컬 경로가 아니므로 canonicalize하지 않는다.
     let open_app = app.clone();
     let open_path = path;
     let opened = tauri::async_runtime::spawn_blocking(move || {
         let st = open_app.state::<AppState>();
-        let canonical = std::fs::canonicalize(&open_path)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(open_path);
-        open_file_internal(st.inner(), &canonical)
+        let target = if open_path.starts_with("sftp://") {
+            open_path
+        } else {
+            std::fs::canonicalize(&open_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(open_path)
+        };
+        open_file_internal(st.inner(), &target)
     })
     .await
     .map_err(|e| format!("파일 열기 비동기 태스크 실패: {e}"))??;

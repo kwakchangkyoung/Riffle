@@ -24,6 +24,7 @@ import {
 import { FileTab } from "@/components/FileTab";
 import { TabBar, type TabMeta } from "@/components/TabBar";
 import { EmptyState } from "@/components/EmptyState";
+import { RemoteOpenDialog } from "@/components/remote/RemoteOpenDialog";
 import {
     UpdateDialog,
     type UpdateDialogState,
@@ -210,6 +211,8 @@ export default function App() {
     const [fontSize, setFontSize] = useState<number>(loadFontSize);
     const [isDragOver, setIsDragOver] = useState(false);
     const [recentFiles, setRecentFiles] = useState<string[]>([]);
+    // 원격 파일 열기 대화상자 표시 여부
+    const [remoteDialogOpen, setRemoteDialogOpen] = useState(false);
 
     // 업데이트 다이얼로그 상태 (null이면 닫힘)와 관련 ref들
     const [updateDialog, setUpdateDialog] = useState<UpdateDialogState | null>(
@@ -346,6 +349,9 @@ export default function App() {
             switch (id) {
                 case "open":
                     void handleOpenDialog();
+                    break;
+                case "open_remote":
+                    setRemoteDialogOpen(true);
                     break;
                 case "open_recent":
                     if (path) openPaths([path]);
@@ -517,6 +523,16 @@ export default function App() {
     // 여기서 중복 처리하지 않는다 (비멱등 동작의 이중 실행 방지).
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
+            // Cmd+Shift+O: 원격 파일 열기 (탭 유무와 무관하게 동작).
+            // 네이티브 메뉴 accelerator가 먼저 가로채면 menu 이벤트로도 도착하므로 둘 다 처리한다.
+            if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey) {
+                if (e.code === "KeyO") {
+                    e.preventDefault();
+                    setRemoteDialogOpen(true);
+                    return;
+                }
+            }
+
             const count = tabsRef.current.length;
             if (count === 0) return;
 
@@ -559,6 +575,7 @@ export default function App() {
                 <EmptyState
                     recentFiles={recentFiles}
                     onOpenDialog={() => void handleOpenDialog()}
+                    onOpenRemote={() => setRemoteDialogOpen(true)}
                     onOpenPath={(path) => openPaths([path])}
                 />
             ) : (
@@ -583,6 +600,14 @@ export default function App() {
                         여기에 놓아 파일 열기
                     </div>
                 </div>
+            )}
+
+            {/* 원격 파일 열기 모달 */}
+            {remoteDialogOpen && (
+                <RemoteOpenDialog
+                    onClose={() => setRemoteDialogOpen(false)}
+                    onOpenPaths={(paths) => openPaths(paths)}
+                />
             )}
 
             {/* 앱 업데이트 모달 (status가 바뀌면 리마운트해 설치 상태를 초기화) */}

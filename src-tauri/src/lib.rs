@@ -6,6 +6,7 @@ pub mod menu;
 pub mod opened;
 pub mod presets;
 pub mod recent;
+pub mod remote;
 pub mod session;
 pub mod settings;
 pub mod state;
@@ -19,6 +20,7 @@ use commands::{
     get_recent_files, list_filter_presets, open_file, save_filter_preset, search, search_density,
     search_hit_at, search_nav, start_filter, take_pending_open, validate_filter, validate_query,
 };
+use remote::{list_remote_dir, list_ssh_hosts, remote_home};
 use session::{load_session, save_session};
 use settings::{get_settings, set_auto_check_updates};
 use state::AppState;
@@ -62,7 +64,10 @@ pub fn run() {
             filter_density,
             list_filter_presets,
             save_filter_preset,
-            delete_filter_preset
+            delete_filter_preset,
+            list_ssh_hosts,
+            list_remote_dir,
+            remote_home
         ])
         .setup(|app| {
             // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)

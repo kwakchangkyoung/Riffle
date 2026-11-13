@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
+import { remoteHostOf } from "@/lib/remote";
 
 /** App이 관리하는 탭 메타데이터 (TabBar 표시용) */
 export interface TabMeta {
@@ -73,6 +74,8 @@ export const TabBar: React.FC<TabBarProps> = ({
                     const active = tab.id === activeId;
                     const pct = progressPct(tab.progress);
                     const fullPath = tab.file?.path ?? tab.path;
+                    // 원격(sftp://) 탭은 호스트 배지를 표시한다
+                    const remoteHost = remoteHostOf(fullPath);
                     return (
                         <div
                             key={tab.id}
@@ -115,6 +118,14 @@ export const TabBar: React.FC<TabBarProps> = ({
                                     title="gzip 압축 파일"
                                 >
                                     gz
+                                </span>
+                            )}
+                            {remoteHost !== null && (
+                                <span
+                                    className="mr-1 text-[9px] font-bold px-1 py-px rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 shrink-0"
+                                    title={`원격 호스트: ${remoteHost}`}
+                                >
+                                    {remoteHost}:
                                 </span>
                             )}
                             <span className="truncate">{tabName(tab)}</span>

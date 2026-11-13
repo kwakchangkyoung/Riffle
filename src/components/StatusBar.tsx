@@ -1,6 +1,7 @@
 import React from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
 import { formatBytes } from "@/lib/format";
+import { remoteHostOf } from "@/lib/remote";
 
 export interface SearchStatusInfo {
     currentHitIndex: number | null;
@@ -64,6 +65,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
         // 현재 보이는 줄 (일반 모드: 1-based topLine, 인덱스 기반 보기: 화면 상단 행의 실제 파일 줄 번호)
         const indexView = isFilterMode || filterViewActive;
+        // 원격 파일의 호스트 (로컬 파일이면 null)
+        const remoteHost = file.remote ? remoteHostOf(file.path) : null;
         const normalCurrentLine =
             lineCount === 0 ? 0 : Math.min(lineCount, Math.floor(topLine) + 1);
         const displayCurrentLine = indexView
@@ -141,6 +144,14 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                     <span className="truncate" title={file.path}>
                         {file.path}
                     </span>
+                    {remoteHost !== null && (
+                        <span
+                            className="px-1.5 py-0.2 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 font-semibold text-[10px] shrink-0"
+                            title={`원격 호스트: ${remoteHost}`}
+                        >
+                            원격: {remoteHost}
+                        </span>
+                    )}
                     {isFilterMode && (
                         <span
                             className="px-1.5 py-0.2 rounded bg-indigo-100 dark:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 font-semibold text-[10px]"
