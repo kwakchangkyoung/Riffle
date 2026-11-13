@@ -152,6 +152,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             useState<IndexProgress | null>(null);
         const [topLine, setTopLine] = useState(0);
         const [errorMessage, setErrorMessage] = useState<string | null>(null);
+        // 인덱싱 진행 이벤트에 실려 온 1회성 안내 (에이전트 폴백 사유 등, 닫기 전까지 유지)
+        const [indexNotice, setIndexNotice] = useState<string | null>(null);
 
         // 검색 및 필터 모드 관련 상태
         const [isFilterMode, setIsFilterMode] = useState(false);
@@ -559,6 +561,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             async (openPath: string, options?: { preserveTail?: boolean }) => {
                 const seq = ++openSeqRef.current;
                 setErrorMessage(null);
+                setIndexNotice(null);
                 latestProgressRef.current = null;
                 lastProgressErrorRef.current = null;
                 pendingPosRef.current = null;
@@ -654,6 +657,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             progress.lineCount,
                             progress.done,
                         );
+                        // 에이전트 폴백 사유 등 1회성 안내 (Rust가 첫 진행 이벤트에만 싣는다)
+                        if (progress.notice) {
+                            setIndexNotice(progress.notice);
+                        }
                         // gzip 해제 실패/병합 구축 실패 등: 그 전까지 확정된 내용은 계속 사용 가능
                         if (
                             progress.error !== null &&
@@ -2401,6 +2408,20 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 닫기
                             </button>
                         </div>
+                    </div>
+                )}
+
+                {/* 인덱싱 안내 바 (에이전트 폴백 사유 등, 중립 색·닫기 전까지 유지) */}
+                {indexNotice && (
+                    <div className="px-4 py-2 bg-zinc-50 text-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300 text-xs flex items-center justify-between border-b border-zinc-200 dark:border-zinc-700">
+                        <span className="select-text">{indexNotice}</span>
+                        <button
+                            type="button"
+                            onClick={() => setIndexNotice(null)}
+                            className="font-bold hover:underline cursor-pointer ml-4"
+                        >
+                            닫기
+                        </button>
                     </div>
                 )}
 

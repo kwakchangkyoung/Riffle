@@ -12,6 +12,8 @@ export interface FileInfo {
     remote: boolean;
     /** 파일 소스 종류 */
     source: FileSource;
+    /** 서버 측 에이전트로 인덱싱·검색·필터를 처리 중인지 여부 (sftp 파일만) */
+    agent: boolean;
 }
 
 export interface IndexProgress {
@@ -22,6 +24,8 @@ export interface IndexProgress {
     contentBytes: number;
     decompressing: boolean;
     error: string | null;
+    /** 에이전트를 쓰지 못해 일반 방식으로 폴백할 때의 안내 문구 (한 번만 채워 보낸다) */
+    notice?: string | null;
 }
 
 export interface QueryOptions {
@@ -454,6 +458,8 @@ export interface Settings {
     restoreSession: boolean;
     /** 마지막으로 선택한 AWS 프로필 (없으면 기본 자격 증명 체인) */
     s3Profile: string | null;
+    /** 서버 측 가속(에이전트)을 사용할 원격 호스트 목록 (기본 빈 목록) */
+    agentHosts: string[];
 }
 
 /**
@@ -623,6 +629,23 @@ export function mergePositionAtTime(id: number, tsMs: number): Promise<number> {
  */
 export function mergeSources(id: number): Promise<MergeSource[]> {
     return invoke<MergeSource[]>("merge_sources", { id });
+}
+
+// ===== 서버 측 가속 (원격 에이전트, Phase 18) =====
+
+/**
+ * 서버 측 가속(에이전트) 사용이 켜진 원격 호스트 목록을 조회합니다.
+ * 켠 호스트의 sftp:// 파일을 열 때 원격 서버에서 인덱싱·검색·필터를 실행합니다.
+ */
+export function getAgentHosts(): Promise<string[]> {
+    return invoke<string[]>("get_agent_hosts");
+}
+
+/**
+ * 호스트별 서버 측 가속(에이전트) 사용을 켜거나 끄고 settings.json에 저장합니다.
+ */
+export function setAgentEnabled(host: string, enabled: boolean): Promise<void> {
+    return invoke<void>("set_agent_enabled", { host, enabled });
 }
 
 // ===== 줄 북마크 (Phase 15) =====

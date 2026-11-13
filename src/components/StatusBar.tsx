@@ -193,6 +193,14 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                             원격: {remoteHost}
                         </span>
                     )}
+                    {file.agent && (
+                        <span
+                            className="px-1.5 py-0.2 rounded bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 font-semibold text-[10px] shrink-0"
+                            title="원격 서버에서 인덱싱·검색 실행 중"
+                        >
+                            에이전트
+                        </span>
+                    )}
                     {s3Bucket !== null && (
                         <span
                             className="px-1.5 py-0.2 rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 font-semibold text-[10px] shrink-0"

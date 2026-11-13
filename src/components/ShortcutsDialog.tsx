@@ -59,6 +59,20 @@ const GROUPS: { title: string; rows: [string, string][] }[] = [
         ],
     },
     {
+        title: "서버 측 가속 (에이전트)",
+        rows: [
+            [
+                "켜기",
+                "원격 열기(⌘⇧O) SSH 탭에서 호스트 선택 후 체크박스로 호스트별 opt-in (기본 꺼짐)",
+            ],
+            [
+                "설치 위치",
+                "원격 ~/.cache/riffle/ 에 실행 파일(약 2MB) 업로드 — Linux x86_64/aarch64만 지원",
+            ],
+            ["제거", "원격에서 rm -rf ~/.cache/riffle"],
+        ],
+    },
+    {
         title: "기타",
         rows: [["⌘/", "이 단축키 도움말"]],
     },

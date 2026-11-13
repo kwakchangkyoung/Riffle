@@ -150,6 +150,15 @@ export const TabBar: React.FC<TabBarProps> = ({
                                     {remoteHost}:
                                 </span>
                             )}
+                            {remoteHost !== null &&
+                                tab.file?.agent === true && (
+                                    <span
+                                        className="mr-1 text-[10px] leading-none text-sky-600 dark:text-sky-400 shrink-0"
+                                        title="서버 측 가속(에이전트) 사용 중 — 원격 서버에서 인덱싱·검색 실행"
+                                    >
+                                        ⚡
+                                    </span>
+                                )}
                             {s3Bucket !== null && (
                                 <span
                                     className="mr-1 text-[9px] font-bold px-1 py-px rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 shrink-0"

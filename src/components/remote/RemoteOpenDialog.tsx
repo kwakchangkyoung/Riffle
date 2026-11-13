@@ -6,9 +6,11 @@ import React, {
     useState,
 } from "react";
 import {
+    getAgentHosts,
     listRemoteDir,
     listSshHosts,
     remoteHome,
+    setAgentEnabled,
     type RemoteEntry,
     type SshHost,
 } from "@/lib/ipc";
@@ -92,6 +94,8 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
     const [hostInput, setHostInput] = useState("");
     const [hostFocused, setHostFocused] = useState(false);
     const [connectedHost, setConnectedHost] = useState<string | null>(null);
+    // 서버 측 가속(에이전트)이 켜진 호스트 목록 (settings.json의 agentHosts)
+    const [agentHosts, setAgentHosts] = useState<Set<string>>(new Set());
 
     const [dirInput, setDirInput] = useState("");
     const [dir, setDir] = useState<string | null>(null);
@@ -118,6 +122,13 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
             })
             .catch((err) => {
                 console.warn("SSH 호스트 목록 조회 실패:", err);
+            });
+        getAgentHosts()
+            .then((list) => {
+                if (!cancelled) setAgentHosts(new Set(list));
+            })
+            .catch((err) => {
+                console.warn("에이전트 호스트 목록 조회 실패:", err);
             });
         return () => {
             cancelled = true;
@@ -194,6 +205,31 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
             await loadDir(connectedHost, path);
         },
         [connectedHost, connect, hostInput, loadDir],
+    );
+
+    // 서버 측 가속(에이전트) 체크 변경: 체크 상태를 먼저 반영하고 저장한다.
+    // 저장에 실패하면 체크 상태를 되돌린다.
+    const handleAgentToggle = useCallback(
+        (enabled: boolean) => {
+            const host = connectedHost;
+            if (host === null) return;
+            setAgentHosts((prev) => {
+                const next = new Set(prev);
+                if (enabled) next.add(host);
+                else next.delete(host);
+                return next;
+            });
+            setAgentEnabled(host, enabled).catch((err) => {
+                console.warn("에이전트 설정 저장 실패:", err);
+                setAgentHosts((prev) => {
+                    const next = new Set(prev);
+                    if (enabled) next.delete(host);
+                    else next.add(host);
+                    return next;
+                });
+            });
+        },
+        [connectedHost],
     );
 
     // 에러 시 재시도: 접속된 호스트가 있으면 현재 경로를 다시 읽고,
@@ -396,6 +432,33 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                                 </div>
                             )}
                         </div>
+
+                        {/* 서버 측 가속(에이전트) — 호스트에 접속하면 표시 */}
+                        {connectedHost !== null && (
+                            <div className="px-4 pt-3">
+                                <label className="flex items-center gap-2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={agentHosts.has(connectedHost)}
+                                        onChange={(e) =>
+                                            handleAgentToggle(e.target.checked)
+                                        }
+                                        className="accent-zinc-900 dark:accent-zinc-100"
+                                    />
+                                    <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                                        서버 측 가속(에이전트) 사용
+                                    </span>
+                                </label>
+                                <p className="mt-1 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
+                                    켜면 원격 ~/.cache/riffle 에 Riffle 에이전트
+                                    실행 파일(약 2MB, Linux x86_64/aarch64)을
+                                    올리고 서버에서 인덱싱·검색·필터를
+                                    실행합니다. 대용량 원격 로그가 훨씬
+                                    빨라집니다. 원격의 다른 파일은 수정하지
+                                    않습니다.
+                                </p>
+                            </div>
+                        )}
 
                         {/* 경로 입력 + 이동/상위로 */}
                         <div className="px-4 pt-3 flex items-end gap-2">
