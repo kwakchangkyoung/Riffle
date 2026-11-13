@@ -245,3 +245,24 @@ export interface MenuEvent {
     id: string;
     path?: string;
 }
+
+/**
+ * 앱 설정 (Rust Settings와 1:1).
+ */
+export interface Settings {
+    autoCheckUpdates: boolean;
+}
+
+/**
+ * 현재 앱 설정을 조회합니다.
+ */
+export function getSettings(): Promise<Settings> {
+    return invoke<Settings>("get_settings");
+}
+
+/**
+ * 시작 시 업데이트 자동 확인 설정을 변경합니다.
+ */
+export function setAutoCheckUpdates(enabled: boolean): Promise<void> {
+    return invoke<void>("set_auto_check_updates", { enabled });
+}

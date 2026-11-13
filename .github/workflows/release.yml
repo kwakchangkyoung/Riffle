@@ -15,6 +15,9 @@ jobs:
     build:
         strategy:
             fail-fast: false
+            # 두 job 이 같은 릴리스의 latest.json 을 읽고-병합-재업로드하므로
+            # 동시에 끝나면 한쪽 플랫폼이 누락될 수 있다. 순차 실행으로 경합을 막는다.
+            max-parallel: 1
             matrix:
                 include:
                     - target: aarch64-apple-darwin # Apple Silicon
@@ -54,6 +57,10 @@ jobs:
             - uses: tauri-apps/tauri-action@v1
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  # 업데이터 산출물(.app.tar.gz.sig) 서명용 키.
+                  # Secrets에 등록하지 않으면 업데이터 산출물 생성이 실패한다.
+                  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+                  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
               with:
                   tagName: ${{ github.ref_name }}
                   releaseName: Riffle ${{ github.ref_name }}
@@ -76,4 +83,6 @@ jobs:
                       사용법은 [README](https://github.com/${{ github.repository }}#사용법) 를 참고하세요.
                   releaseDraft: false
                   prerelease: false
-                  args: --target ${{ matrix.target }}
+                  # CI에서만 업데이터 산출물(.app.tar.gz + .sig)을 만들어 latest.json을 생성한다.
+                  # 로컬 빌드는 서명 키 없이도 되도록 tauri.conf.json에는 두지 않는다.
+                  args: --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":true}}'

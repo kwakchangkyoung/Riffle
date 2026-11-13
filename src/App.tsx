@@ -6,6 +6,7 @@ import {
     closeFile,
     copyLines,
     getRecentFiles,
+    getSettings,
     openFile,
     searchDensity,
     setTail,
@@ -17,6 +18,7 @@ import {
     type SearchHit,
     type TailEvent,
 } from "@/lib/ipc";
+import { checkForUpdate } from "@/lib/updater";
 import { LineCache } from "@/lib/lineCache";
 import { useTauriListener } from "@/lib/useTauriListener";
 import {
@@ -30,6 +32,10 @@ import { formatBytes } from "@/lib/format";
 import { LogViewport } from "@/components/viewer/LogViewport";
 import { FullLinePanel } from "@/components/viewer/FullLinePanel";
 import { GotoLineDialog } from "@/components/GotoLineDialog";
+import {
+    UpdateDialog,
+    type UpdateDialogState,
+} from "@/components/UpdateDialog";
 import { SearchBar } from "@/components/search/SearchBar";
 import { StatusBar, type SearchStatusInfo } from "@/components/StatusBar";
 
@@ -79,6 +85,16 @@ export default function App() {
     } | null>(null);
     const [recentFiles, setRecentFiles] = useState<string[]>([]);
     const [findSignal, setFindSignal] = useState(0);
+
+    // 업데이트 다이얼로그 상태 (null이면 닫힘)와 관련 ref들
+    const [updateDialog, setUpdateDialog] = useState<UpdateDialogState | null>(
+        null,
+    );
+    const updateDialogRef = useRef<UpdateDialogState | null>(null);
+    // 확인 요청 시퀀스: 다이얼로그를 닫으면 진행 중이던 확인 결과를 폐기한다
+    const updateCheckSeqRef = useRef(0);
+    // 같은 세션에서 "나중에"로 닫은 뒤 자동 확인이 다시 띄우지 않게 하는 플래그
+    const suppressAutoUpdateRef = useRef(false);
 
     const rowHeight = rowHeightFor(fontSize);
     // 최신 rowHeight를 ref로 유지해 안정적인 콜백(tail 핸들러 등)에서 참조한다
@@ -142,6 +158,11 @@ export default function App() {
     useEffect(() => {
         isFilterModeRef.current = isFilterMode;
     }, [isFilterMode]);
+
+    // 비동기 업데이트 확인 콜백에서 최신 다이얼로그 상태를 읽기 위한 ref 동기화
+    useEffect(() => {
+        updateDialogRef.current = updateDialog;
+    }, [updateDialog]);
 
     useEffect(() => {
         viewportHeightRef.current = viewportHeight;
@@ -856,6 +877,83 @@ export default function App() {
         setFullLinePanel(null);
     }, []);
 
+    // ===== 앱 업데이트 =====
+
+    // 업데이트 확인 실행.
+    // visible=true(메뉴 수동 확인)는 결과를 항상 다이얼로그로 표시하고,
+    // visible=false(시작 시 자동 확인)는 새 버전이 있을 때만 조용히 표시한다.
+    const runUpdateCheck = useCallback((visible: boolean) => {
+        const seq = ++updateCheckSeqRef.current;
+        if (visible) {
+            setUpdateDialog({ status: "checking" });
+        }
+        checkForUpdate()
+            .then((update) => {
+                const stale = seq !== updateCheckSeqRef.current;
+                if (update === null) {
+                    if (!stale && visible) {
+                        setUpdateDialog({ status: "upToDate" });
+                    }
+                    return;
+                }
+                // 표시하지 않기로 한 업데이트는 Rust 측 리소스를 해제한다
+                const suppress =
+                    !visible &&
+                    (updateDialogRef.current !== null ||
+                        suppressAutoUpdateRef.current);
+                if (stale || suppress) {
+                    update.close().catch(() => {});
+                    return;
+                }
+                setUpdateDialog({ status: "available", update });
+            })
+            .catch((err: unknown) => {
+                if (seq !== updateCheckSeqRef.current) return;
+                if (visible) {
+                    const msg =
+                        err instanceof Error
+                            ? err.message
+                            : typeof err === "string"
+                              ? err
+                              : "업데이트 확인에 실패했습니다.";
+                    setUpdateDialog({ status: "error", message: msg });
+                } else {
+                    // 자동 확인의 오류는 조용히 콘솔에만 남긴다
+                    console.warn("업데이트 자동 확인 실패:", err);
+                }
+            });
+    }, []);
+
+    // 업데이트 다이얼로그 닫기 ("나중에"/Esc/배경 클릭 공통)
+    const handleUpdateDialogClose = useCallback(() => {
+        // 진행 중인 확인의 늦은 결과가 다이얼로그를 다시 열지 못하게 무효화한다
+        updateCheckSeqRef.current += 1;
+        suppressAutoUpdateRef.current = true;
+        const current = updateDialogRef.current;
+        if (current?.status === "available") {
+            current.update.close().catch(() => {});
+        }
+        setUpdateDialog(null);
+    }, []);
+
+    // 시작 시 자동 업데이트 확인: 로드 3초 후, 설정이 켜져 있고 dev 모드가 아닐 때만.
+    // 업데이트가 없거나 네트워크 오류면 아무것도 표시하지 않는다.
+    useEffect(() => {
+        if (import.meta.env.DEV) return;
+        const timer = setTimeout(() => {
+            getSettings()
+                .then((settings) => {
+                    if (settings.autoCheckUpdates) {
+                        runUpdateCheck(false);
+                    }
+                })
+                .catch((err) => {
+                    console.warn("설정 조회 실패:", err);
+                });
+        }, 3000);
+        return () => clearTimeout(timer);
+    }, [runUpdateCheck]);
+
     // 뷰포트에 전달할 정규화된 선택 범위 (일반 모드에서만)
     const selectedRange = useMemo(() => {
         if (isFilterMode || lineSelection === null) return null;
@@ -896,6 +994,9 @@ export default function App() {
                 case "toggle_tail":
                     handleToggleTail();
                     break;
+                case "check_updates":
+                    runUpdateCheck(true);
+                    break;
                 case "font_inc":
                     adjustFontSize(1);
                     break;
@@ -922,12 +1023,13 @@ export default function App() {
             ) {
                 return;
             }
-            if (gotoLineOpen || fullLinePanel !== null) return;
+            if (gotoLineOpen || fullLinePanel !== null || updateDialog !== null)
+                return;
             setLineSelection(null);
         };
         window.addEventListener("keydown", handleKeyDown);
         return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [gotoLineOpen, fullLinePanel]);
+    }, [gotoLineOpen, fullLinePanel, updateDialog]);
 
     // 토스트 메시지는 2초 후 자동으로 사라진다
     useEffect(() => {
@@ -1241,6 +1343,15 @@ export default function App() {
                     totalLines={lineCount}
                     onClose={() => setGotoLineOpen(false)}
                     onNavigate={handleGotoNavigate}
+                />
+            )}
+
+            {/* 앱 업데이트 모달 (status가 바뀌면 리마운트해 설치 상태를 초기화) */}
+            {updateDialog !== null && (
+                <UpdateDialog
+                    key={updateDialog.status}
+                    state={updateDialog}
+                    onClose={handleUpdateDialogClose}
                 />
             )}
 

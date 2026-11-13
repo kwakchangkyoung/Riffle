@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use serde::Serialize;
-use tauri::menu::{AboutMetadata, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{
+    AboutMetadata, CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
 use crate::state::AppState;
@@ -129,12 +131,26 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
             authors: app.config().bundle.publisher.clone().map(|p| vec![p]),
             ..Default::default()
         };
+        // 업데이트 확인 항목과 시작 시 자동 확인 체크 항목 (About 바로 아래)
+        let check_updates_item =
+            MenuItem::with_id(app, "check_updates", "업데이트 확인…", true, None::<&str>)?;
+        let auto_update_item = CheckMenuItem::with_id(
+            app,
+            "toggle_auto_update",
+            "시작 시 업데이트 자동 확인",
+            true,
+            crate::settings::load_settings(app).auto_check_updates,
+            None::<&str>,
+        )?;
         Submenu::with_items(
             app,
             app.package_info().name.clone(),
             true,
             &[
                 &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
+                &PredefinedMenuItem::separator(app)?,
+                &check_updates_item,
+                &auto_update_item,
                 &PredefinedMenuItem::separator(app)?,
                 &PredefinedMenuItem::services(app, None)?,
                 &PredefinedMenuItem::separator(app)?,
@@ -157,6 +173,17 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
 /// (PredefinedMenuItem은 네이티브 동작만 수행하고 이벤트를 발생시키지 않는다.)
 pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id().0.as_str();
+
+    // 자동 업데이트 확인 토글은 설정 저장과 메뉴 갱신까지 Rust에서 완결한다
+    // (프론트엔드에는 이벤트를 보내지 않는다)
+    if id == "toggle_auto_update" {
+        let current = crate::settings::load_settings(app).auto_check_updates;
+        if let Err(e) = crate::settings::update_auto_check_setting(app, !current) {
+            eprintln!("업데이트 설정 변경 실패: {e}");
+        }
+        return;
+    }
+
     let payload = match id.strip_prefix(RECENT_ID_PREFIX) {
         Some(index_str) => {
             let Ok(index) = index_str.parse::<usize>() else {

@@ -133,9 +133,27 @@ ditto target/release/bundle/macos/Riffle.app /Applications/Riffle.app
 | Cmd+= / Cmd+- / Cmd+0      | 글자 크게 / 작게 / 기본 크기         |
 | Esc                        | 검색창 해제, 줄 선택 해제, 패널 닫기 |
 
+## 자동 업데이트
+
+앱이 GitHub Releases의 `latest.json`을 확인해 새 버전을 알려줍니다.
+
+- **시작 시 자동 확인:** 앱 실행 후 3초 뒤 백그라운드에서 확인합니다. 새 버전이 있을 때만 다이얼로그가 표시되고, 최신 버전이거나 네트워크 오류면 아무 표시 없이 지나갑니다.
+- **수동 확인:** 메뉴 **Riffle → 업데이트 확인…** 을 누르면 결과(최신 버전 / 새 버전 / 오류)가 항상 표시됩니다.
+- **끄기:** 메뉴 **Riffle → 시작 시 업데이트 자동 확인** 의 체크를 해제합니다.
+- 다이얼로그에서 **업데이트**를 누르면 다운로드와 설치가 진행됩니다. 완료 후 **지금 재시작**을 누르면 새 버전으로 다시 시작합니다.
+
+참고: 자동 업데이트는 이 기능이 포함된 릴리스부터 동작합니다. v0.2.0 이하 버전을 쓰고 있다면 한 번은 DMG를 수동으로 설치해 새 버전으로 올린 뒤부터 자동 업데이트를 사용할 수 있습니다.
+
 ## 릴리스 방법 (메인테이너용)
 
-버전 태그를 push하면 GitHub Actions(`.github/workflows/release.yml`)가 Apple Silicon과 Intel용 DMG를 빌드해 릴리스에 첨부합니다.
+버전 태그를 push하면 GitHub Actions(`.github/workflows/release.yml`)가 Apple Silicon과 Intel용 DMG를 빌드해 릴리스에 첨부합니다. 자동 업데이트용 업데이터 산출물(`.app.tar.gz` + `.sig`, `latest.json`)도 함께 만들어집니다.
+
+업데이터 산출물을 서명하려면 저장소 Secrets에 서명 키 2개가 필요합니다.
+
+- `TAURI_SIGNING_PRIVATE_KEY`: `pnpm tauri signer generate`로 만든 개인키 내용
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: 개인키 비밀번호
+
+공개키는 `src-tauri/tauri.conf.json`의 `plugins.updater.pubkey`에 넣습니다(현재 자리표시자). 키를 새로 만들면 함께 갱신해야 합니다. Secrets가 없으면 릴리스 워크플로가 실패합니다.
 
 1. `src-tauri/tauri.conf.json`, `package.json`, `src-tauri/Cargo.toml`의 `version`을 새 버전으로 올리고 커밋합니다.
 2. 같은 버전의 태그를 만들어 push합니다. 태그와 `tauri.conf.json` 버전이 다르면 워크플로가 실패합니다.

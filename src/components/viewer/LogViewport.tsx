@@ -278,6 +278,11 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         // 키보드 내비게이션
         useEffect(() => {
             const handleKeyDown = (e: KeyboardEvent) => {
+                // 모달(aria-modal)이 열려 있으면 뷰어 단축키를 무시한다
+                // (SearchBar의 전역 Enter 핸들러와 같은 가드)
+                if (document.querySelector('[aria-modal="true"]') !== null) {
+                    return;
+                }
                 if (
                     document.activeElement instanceof HTMLInputElement ||
                     document.activeElement instanceof HTMLTextAreaElement

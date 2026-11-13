@@ -1,7 +1,7 @@
 {
     "$schema": "https://schema.tauri.app/config/2",
     "productName": "Riffle",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "identifier": "com.gajago.riffle",
     "build": {
         "beforeDevCommand": "pnpm dev",
@@ -20,6 +20,14 @@
         ],
         "security": {
             "csp": null
+        }
+    },
+    "plugins": {
+        "updater": {
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEyMjVDNTYxOTk1RjM3REMKUldUY04xK1pZY1VsRW9xRWs5T1pLb3daalZRN2VrbzRPRjlUOWl3eVd1SDNWNHNMUWVTcjJhQ24K",
+            "endpoints": [
+                "https://github.com/kwakchangkyoung/Riffle/releases/latest/download/latest.json"
+            ]
         }
     },
     "bundle": {

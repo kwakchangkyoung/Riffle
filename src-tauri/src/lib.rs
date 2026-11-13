@@ -5,6 +5,7 @@ pub mod menu;
 #[cfg(target_os = "macos")]
 pub mod opened;
 pub mod recent;
+pub mod settings;
 pub mod state;
 pub mod tail;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use commands::{
     get_recent_files, open_file, search, search_density, search_hit_at, search_nav,
     take_pending_open, validate_query,
 };
+use settings::{get_settings, set_auto_check_updates};
 use state::AppState;
 use tail::set_tail;
 use tauri::Manager;
@@ -24,6 +26,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -40,7 +44,9 @@ pub fn run() {
             copy_lines,
             get_full_line,
             get_recent_files,
-            take_pending_open
+            take_pending_open,
+            get_settings,
+            set_auto_check_updates
         ])
         .setup(|app| {
             // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)
