@@ -26,6 +26,10 @@ use crate::uri::RemoteUri;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 유휴 연결을 검사하는 주기.
 const REAPER_INTERVAL: Duration = Duration::from_secs(15);
+/// 연결성 오류 발생 시 총 시도 횟수 (최초 1회 + 재시도 2회).
+const OP_ATTEMPTS: usize = 3;
+/// 재시도 사이의 대기 시간 (transport 종료 전파 경합 흡수용).
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 
 /// 원격 디렉터리 항목.
 #[derive(Debug, Clone)]
@@ -58,10 +62,21 @@ pub(crate) struct PoolInner {
     rt: Runtime,
     transport: Transport,
     hosts: StdMutex<HashMap<String, Arc<HostSlot>>>,
+    /// 호스트별 에이전트 설치 직렬화 락.
+    /// 값은 uname 확인에 성공한 아키텍처 캐시다 (두 번째 설치 요청은
+    /// uname 없이 바로 업로드 경로로 진행한다).
+    agent_locks: StdMutex<HashMap<String, Arc<StdMutex<Option<&'static str>>>>>,
+    /// ssh 계열 명령(SFTP 접속·uname·에이전트 실행)에 쓰는 프로그램.
+    /// 테스트에서 가짜 ssh 로 바꿔치기한다.
+    ssh_program: String,
 }
 
 impl PoolInner {
     fn new(transport: Transport) -> Arc<PoolInner> {
+        Self::new_with(transport, "ssh")
+    }
+
+    fn new_with(transport: Transport, ssh_program: &str) -> Arc<PoolInner> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -71,6 +86,8 @@ impl PoolInner {
             rt,
             transport,
             hosts: StdMutex::new(HashMap::new()),
+            agent_locks: StdMutex::new(HashMap::new()),
+            ssh_program: ssh_program.to_string(),
         });
         // 유휴 연결 회수 태스크. 풀이 죽으면 Weak 업그레이드에 실패해 스스로 종료된다.
         let weak = Arc::downgrade(&inner);
@@ -86,6 +103,23 @@ impl PoolInner {
     /// 이 풀의 전송 방식을 반환한다 (에이전트 실행 경로 분기용).
     pub(crate) fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    /// ssh 계열 명령에 쓰는 프로그램 이름(또는 경로)을 반환한다.
+    pub(crate) fn ssh_program(&self) -> &str {
+        &self.ssh_program
+    }
+
+    /// 호스트별 에이전트 설치 락을 반환한다.
+    /// 여러 파일이 같은 호스트에 동시에 열릴 때 uname 확인과 업로드가
+    /// 겹치지 않게 하려고 잡는다.
+    pub(crate) fn agent_install_lock(&self, host: &str) -> Arc<StdMutex<Option<&'static str>>> {
+        self.agent_locks
+            .lock()
+            .unwrap()
+            .entry(host.to_string())
+            .or_default()
+            .clone()
     }
 
     fn entry(&self, host: &str) -> Arc<HostSlot> {
@@ -134,7 +168,7 @@ impl PoolInner {
         }
         // 여기 도달하면 conn 은 없거나 dead 뿐이다. dead 연결 참조를 정리한다.
         let _ = slot.inner.lock().unwrap().conn.take();
-        let conn = Arc::new(connect(&self.transport, host).await?);
+        let conn = Arc::new(connect(&self.transport, host, &self.ssh_program).await?);
         {
             let mut inner = slot.inner.lock().unwrap();
             inner.conn = Some(conn.clone());
@@ -162,22 +196,26 @@ impl PoolInner {
         }
     }
 
-    /// 연결을 얻어 작업 `f` 를 실행한다. 연결 단절성 오류면 1회 재연결 후 재시도한다.
+    /// 연결을 얻어 작업 `f` 를 실행한다. 연결 단절·타임아웃 오류면
+    /// 연결을 교체하고 짧은 백오프 뒤 최대 OP_ATTEMPTS 회까지 재시도한다.
+    /// 죽은 연결은 transport 종료가 전파되기 전에 보낸 요청이 뒤늦게
+    /// Timeout 으로 드러나기도 하므로 타임아웃도 재연결 대상이다.
     /// `path` 는 NotFound/PermissionDenied 메시지에 사용한다.
     async fn with_conn<F, Fut, T>(&self, host: &str, path: &str, f: F) -> Result<T, RemoteError>
     where
         F: Fn(Arc<SftpConn>) -> Fut,
         Fut: Future<Output = Result<T, SftpError>>,
     {
-        for attempt in 0..2 {
+        for attempt in 0..OP_ATTEMPTS {
             let conn = self.ensure_conn(host).await?;
             match f(conn.clone()).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if attempt == 0 && (sftp_is_conn_error(&e) || sftp_is_timeout(&e)) {
-                        if sftp_is_conn_error(&e) {
-                            self.drop_conn_if_current(host, &conn).await;
-                        }
+                    if attempt < OP_ATTEMPTS - 1 && (sftp_is_conn_error(&e) || sftp_is_timeout(&e))
+                    {
+                        self.drop_conn_if_current(host, &conn).await;
+                        tokio::time::sleep(RETRY_BACKOFF[attempt.min(RETRY_BACKOFF.len() - 1)])
+                            .await;
                         continue;
                     }
                     return Err(map_sftp_error(e, path));
@@ -360,6 +398,15 @@ impl SftpPool {
     pub fn new(transport: Transport) -> SftpPool {
         SftpPool {
             inner: PoolInner::new(transport),
+        }
+    }
+
+    /// 테스트용: ssh 계열 명령을 `ssh_program` 으로 실행하는 풀.
+    /// `Transport::Ssh` 경로를 실제 ssh 없이 가짜 프로그램으로 탈 수 있다.
+    #[cfg(test)]
+    pub(crate) fn new_with_ssh(transport: Transport, ssh_program: &str) -> SftpPool {
+        SftpPool {
+            inner: PoolInner::new_with(transport, ssh_program),
         }
     }
 

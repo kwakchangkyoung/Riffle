@@ -3,11 +3,12 @@
 //! - 큰 읽기(1MiB 이상): 256KiB 단위 요청을 최대 32개까지 파이프라이닝한다.
 //! - 작은 읽기: 256KiB 블록 단위 LRU 캐시(최대 64MiB)를 거친다.
 //! - 캐시는 `stat_len` 이 바뀌면 경계 블록만 무효화한다 (append 시 tail 만 stale).
-//! - 연결 단절이 감지되면 1회 재연결 후 재시도한다.
+//! - 연결 단절·타임아웃이 감지되면 짧은 백오프를 두고 최대 2회 재연결·재시도한다.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use riffle_core::RandomRead;
 use russh_sftp::client::RawSftpSession;
@@ -35,6 +36,11 @@ const READ_PARALLEL: usize = 32;
 const FILL_LOOP_MAX: u32 = 16;
 /// 크기를 모를 때 쓰는 센티널.
 const UNKNOWN_SIZE: u64 = u64::MAX;
+/// 연결성 오류 발생 시 총 시도 횟수 (최초 1회 + 재시도 2회).
+const OP_ATTEMPTS: usize = 3;
+/// 재시도 사이의 대기 시간. transport 종료 감지가 뒤늦게 전파되는
+/// 경합(죽은 연결 위 타임아웃)을 흡수하기 위한 짧은 백오프다.
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 
 /// 작업 범위를 블록 경계로 자른 조각.
 struct Piece {
@@ -124,10 +130,13 @@ impl RemoteFile {
         self.cache.lock().unwrap().invalidate(keys);
     }
 
-    /// 연결 단절 후 재연결하고 파일 핸들을 다시 연다.
-    async fn reconnect(&self) -> Result<(), RemoteError> {
-        let old = self.current().0;
-        self.inner.drop_conn_if_current(&self.host, &old).await;
+    /// `failed` 연결을 버리고 재연결한 뒤 파일 핸들을 다시 연다.
+    /// 다른 작업이 이미 새 세대로 교체해 두었다면 그대로 둔다.
+    async fn reconnect(&self, failed: &Arc<SftpConn>) -> Result<(), RemoteError> {
+        if !Arc::ptr_eq(&self.current().0, failed) {
+            return Ok(());
+        }
+        self.inner.drop_conn_if_current(&self.host, failed).await;
         let conn = self.inner.ensure_conn(&self.host).await?;
         let (handle, size) = open_remote_file(&conn, &self.path)
             .await
@@ -135,15 +144,43 @@ impl RemoteFile {
         // 새 연결에서는 파일 내용이 달라졌을 수 있으므로 캐시를 비운다.
         self.cache.lock().unwrap().clear();
         self.size.store(UNKNOWN_SIZE, Ordering::Relaxed);
-        *self.state.lock().unwrap() = FileState { conn, handle };
+        // ensure_conn 대기 사이 다른 작업이 먼저 교체했으면 방금 연 핸들만 닫는다.
+        let replaced = {
+            let mut s = self.state.lock().unwrap();
+            if Arc::ptr_eq(&s.conn, failed) {
+                *s = FileState {
+                    conn: conn.clone(),
+                    handle: handle.clone(),
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if !replaced {
+            let _ = conn.session.close(handle).await;
+        }
         if let Some(s) = size {
             self.note_size(s);
         }
         Ok(())
     }
 
+    /// 재시도 가능 오류(연결 단절·요청 타임아웃)인지 판정한다.
+    /// 죽은 연결은 transport 종료가 전파되기 전에 보낸 요청이 뒤늦게
+    /// Timeout 으로 드러나기도 하므로 타임아웃도 재연결 대상이다.
+    fn is_retryable(e: &SftpError) -> bool {
+        sftp_is_conn_error(e) || sftp_is_timeout(e)
+    }
+
+    /// `attempt` 번째 재시도 전의 백오프를 기다린다.
+    async fn backoff(attempt: usize) {
+        tokio::time::sleep(RETRY_BACKOFF[attempt.min(RETRY_BACKOFF.len() - 1)]).await;
+    }
+
     async fn stat_len_async(&self) -> io::Result<u64> {
-        for attempt in 0..2 {
+        let mut attempt = 0;
+        loop {
             let (conn, handle) = self.current();
             match conn.session.fstat(handle.as_str()).await {
                 Ok(attrs) => {
@@ -152,39 +189,36 @@ impl RemoteFile {
                     return Ok(s);
                 }
                 Err(e) => {
-                    if attempt == 0 && (sftp_is_conn_error(&e) || sftp_is_timeout(&e)) {
-                        if sftp_is_conn_error(&e) {
-                            self.reconnect().await.map_err(remote_to_io)?;
-                        }
-                        continue;
+                    if attempt >= OP_ATTEMPTS - 1 || !Self::is_retryable(&e) {
+                        return Err(sftp_to_io(e));
                     }
-                    return Err(sftp_to_io(e));
+                    self.reconnect(&conn).await.map_err(remote_to_io)?;
+                    Self::backoff(attempt).await;
+                    attempt += 1;
                 }
             }
         }
-        unreachable!()
     }
 
     async fn read_at_async(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         // 크기 힌트로 클램프하지 않는다: 파일이 자란 뒤 stat_len 이 갱신되기 전에도
         // 새 데이터를 읽을 수 있어야 하므로 EOF 판정은 서버 응답에 맡긴다.
         let work = buf;
-        for attempt in 0..2 {
+        let mut attempt = 0;
+        loop {
             let (conn, handle) = self.current();
             match self.dispatch(&conn, &handle, work, offset).await {
                 Ok(n) => return Ok(n),
                 Err(e) => {
-                    if attempt == 0 && (sftp_is_conn_error(&e) || sftp_is_timeout(&e)) {
-                        if sftp_is_conn_error(&e) {
-                            self.reconnect().await.map_err(remote_to_io)?;
-                        }
-                        continue;
+                    if attempt >= OP_ATTEMPTS - 1 || !Self::is_retryable(&e) {
+                        return Err(sftp_to_io(e));
                     }
-                    return Err(sftp_to_io(e));
+                    self.reconnect(&conn).await.map_err(remote_to_io)?;
+                    Self::backoff(attempt).await;
+                    attempt += 1;
                 }
             }
         }
-        unreachable!()
     }
 
     async fn dispatch(

@@ -24,8 +24,14 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// 서버가 read 길이 제한을 알려주지 않을 때 사용하는 요청 크기.
 /// russh-sftp 기본 max_packet_len(256KiB)에서 패킷 오버헤드를 뺀 값.
 const DEFAULT_READ_CHUNK: u64 = 256 * 1024 - 13;
+/// 서버가 write 길이 제한을 알려주지 않을 때 사용하는 데이터 크기.
+/// OpenSSH sftp-server 는 수신 패킷 전체가 256KiB 를 넘으면 세션을 끊으므로
+/// 한도를 모를 때는 보수적인 32KiB 를 쓴다.
+const DEFAULT_WRITE_CHUNK: u64 = 32 * 1024;
 /// limits 확장으로 받은 packet_len/read_len 에서 뺄 패킷 오버헤드.
 const READ_PACKET_OVERHEAD: u64 = 13;
+/// write 패킷에서 데이터 외의 프레임(핸들 문자열·오프셋·길이 필드) 여유분.
+const WRITE_PACKET_OVERHEAD: u64 = 64;
 /// stderr 에 보관하는 최대 바이트 수 (최근 내용만 유지).
 const STDERR_CAP: usize = 32 * 1024;
 
@@ -48,6 +54,8 @@ pub(crate) struct SftpConn {
     pub child: Mutex<Child>,
     /// 서버 한도와 패킷 크기를 반영한 SSH_FXP_READ 1회 요청 최대 바이트.
     pub read_chunk: u32,
+    /// 서버 한도와 패킷 크기를 반영한 SSH_FXP_WRITE 1회 데이터 최대 바이트.
+    pub write_chunk: u32,
     /// shutdown 이 시작됐는지 여부.
     pub dead: AtomicBool,
 }
@@ -86,10 +94,14 @@ pub(crate) const SSH_ARGS: &[&str] = &[
 ];
 
 /// 전송 계층의 연결 수립 로직. `PoolInner` 가 호스트별로 호출한다.
-pub(crate) async fn connect(transport: &Transport, host: &str) -> Result<SftpConn, RemoteError> {
+pub(crate) async fn connect(
+    transport: &Transport,
+    host: &str,
+    ssh_program: &str,
+) -> Result<SftpConn, RemoteError> {
     let mut cmd = match transport {
         Transport::Ssh => {
-            let mut c = Command::new("ssh");
+            let mut c = Command::new(ssh_program);
             c.args(SSH_ARGS).arg("-s").arg(host).arg("sftp");
             c
         }
@@ -150,7 +162,7 @@ pub(crate) async fn connect(transport: &Transport, host: &str) -> Result<SftpCon
 
     let init = tokio::time::timeout(CONNECT_TIMEOUT, async {
         let version = session.init().await?;
-        let mut read_chunk = DEFAULT_READ_CHUNK;
+        let (mut read_chunk, mut write_chunk) = (DEFAULT_READ_CHUNK, DEFAULT_WRITE_CHUNK);
         if version
             .extensions
             .get(extensions::LIMITS)
@@ -159,22 +171,26 @@ pub(crate) async fn connect(transport: &Transport, host: &str) -> Result<SftpCon
         {
             // 서버가 광고하는 한도를 읽어 요청 크기를 줄인다.
             // (set_limits 는 &mut 이 필요해 Arc 뒤에서는 쓸 수 없으므로
-            //  클라이언트 측 사전 검증 없이 read_chunk 계산에만 반영한다.)
+            //  클라이언트 측 사전 검증 없이 read/write_chunk 계산에만 반영한다.)
             if let Ok(lim_ext) = session.limits().await {
                 let lim = Limits::from(lim_ext);
                 if let Some(read_len) = lim.read_len {
                     read_chunk = read_chunk.min(read_len);
                 }
+                if let Some(write_len) = lim.write_len {
+                    write_chunk = write_chunk.min(write_len);
+                }
                 if let Some(packet_len) = lim.packet_len {
                     read_chunk = read_chunk.min(packet_len.saturating_sub(READ_PACKET_OVERHEAD));
+                    write_chunk = write_chunk.min(packet_len.saturating_sub(WRITE_PACKET_OVERHEAD));
                 }
             }
         }
-        Ok::<u64, SftpError>(read_chunk)
+        Ok::<(u64, u64), SftpError>((read_chunk, write_chunk))
     })
     .await;
 
-    let read_chunk = match init {
+    let (read_chunk, write_chunk) = match init {
         Err(_) => {
             let _ = child.kill().await;
             return Err(RemoteError::Timeout(CONNECT_TIMEOUT.as_secs()));
@@ -194,13 +210,14 @@ pub(crate) async fn connect(transport: &Transport, host: &str) -> Result<SftpCon
                 )),
             });
         }
-        Ok(Ok(chunk)) => chunk,
+        Ok(Ok(chunks)) => chunks,
     };
 
     Ok(SftpConn {
         session,
         child: Mutex::new(child),
         read_chunk: read_chunk.clamp(1, u32::MAX as u64) as u32,
+        write_chunk: write_chunk.clamp(1, u32::MAX as u64) as u32,
         dead: AtomicBool::new(false),
     })
 }

@@ -40,8 +40,6 @@ const LOCAL_ARCH: &str = "local";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 작업 중 취소 플래그 폴링 간격.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// SFTP 업로드 시 한 번에 쓰는 크기.
-const WRITE_CHUNK: usize = 256 * 1024;
 /// stderr 꼬리 보관 최대 바이트.
 const STDERR_CAP: usize = 8 * 1024;
 
@@ -105,8 +103,13 @@ impl AgentSession {
 
     /// ssh 로 원격 명령을 실행해 세션을 연다.
     /// `remote_cmd` 는 원격 셸이 해석할 명령 문자열이다 ($HOME 확장 포함).
-    fn spawn_ssh(host: &str, remote_cmd: &str, path: &str) -> Result<AgentSession, RemoteError> {
-        let child = Command::new("ssh")
+    fn spawn_ssh(
+        ssh: &str,
+        host: &str,
+        remote_cmd: &str,
+        path: &str,
+    ) -> Result<AgentSession, RemoteError> {
+        let child = Command::new(ssh)
             .args(SSH_ARGS)
             .arg(host)
             .arg(remote_cmd)
@@ -448,8 +451,8 @@ fn range_vec(v: &Value) -> Vec<(u64, u64)> {
 
 /// `ssh <host> uname -sm` 으로 원격 아키텍처를 확인한다.
 /// Linux x86_64 / aarch64 만 지원하며 그 외는 Err(→ SFTP 폴백)다.
-fn remote_arch(host: &str) -> Result<&'static str, RemoteError> {
-    let out = Command::new("ssh")
+fn remote_arch(ssh: &str, host: &str) -> Result<&'static str, RemoteError> {
+    let out = Command::new(ssh)
         .args(SSH_ARGS)
         .arg(host)
         .arg("uname -sm")
@@ -497,7 +500,14 @@ pub(crate) async fn upload_agent_conn(
     }
     let _ = session.mkdir(remote_dir, FileAttributes::empty()).await;
 
-    let tmp = format!("{remote_path}.tmp-{}", std::process::id());
+    // 임시 이름에 pid 와 프로세스 내 일련번호를 넣어 동시 업로드와
+    // 충돌하지 않게 한다 (다른 프로세스는 pid 가 다르다).
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        "{remote_path}.tmp-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let _ = session.remove(tmp.as_str()).await;
     let handle = session
         .open(
@@ -510,7 +520,7 @@ pub(crate) async fn upload_agent_conn(
 
     let mut write_result = Ok(());
     let mut off = 0u64;
-    for chunk in data.chunks(WRITE_CHUNK) {
+    for chunk in data.chunks(conn.write_chunk as usize) {
         if let Err(e) = session
             .write(handle.handle.clone(), off, chunk.to_vec())
             .await
@@ -538,6 +548,13 @@ pub(crate) async fn upload_agent_conn(
 
     // rename 이 덮어쓰기를 거부하는 서버를 위해 실패 시 기존 파일을 지우고 재시도한다.
     if session.rename(tmp.as_str(), remote_path).await.is_err() {
+        // 다른 설치가 먼저 끝낸 경우: 목표가 같은 크기면 성공으로 본다.
+        if let Ok(attrs) = session.stat(remote_path).await
+            && attrs.attrs.size == Some(data.len() as u64)
+        {
+            let _ = session.remove(tmp.as_str()).await;
+            return Ok(());
+        }
         let _ = session.remove(remote_path).await;
         session
             .rename(tmp.as_str(), remote_path)
@@ -580,21 +597,37 @@ impl SftpPool {
         path: &str,
         agent_dir: &Path,
     ) -> Result<AgentSession, RemoteError> {
-        let arch = remote_arch(host)?;
-        let local_bin: PathBuf = agent_dir.join(format!("riffle-agent-{arch}"));
-        if !local_bin.is_file() {
-            return Err(RemoteError::Agent(format!(
-                "에이전트 바이너리가 없습니다: {}",
-                local_bin.display()
-            )));
-        }
-        let home = self.home_dir(host)?;
-        let remote_dir = format!("{}/{REMOTE_AGENT_DIR}", home.trim_end_matches('/'));
-        let remote_name = format!("riffle-agent-{AGENT_VERSION}-{arch}");
-        let remote_path = format!("{remote_dir}/{remote_name}");
-        self.upload_agent(host, &remote_dir, &remote_path, &local_bin)?;
+        let ssh = self.inner.ssh_program().to_string();
+        // 같은 호스트로의 동시 설치(uname 확인 + 업로드)를 직렬화한다.
+        // 두 번째 호출은 캐시된 arch 와 "같은 크기 존재" 경로로 통과한다.
+        let lock = self.inner.agent_install_lock(host);
+        let remote_name = {
+            let mut arch_cache = lock.lock().unwrap();
+            let arch = match *arch_cache {
+                Some(a) => a,
+                None => {
+                    let a = remote_arch(&ssh, host)?;
+                    *arch_cache = Some(a);
+                    a
+                }
+            };
+            let local_bin: PathBuf = agent_dir.join(format!("riffle-agent-{arch}"));
+            if !local_bin.is_file() {
+                return Err(RemoteError::Agent(format!(
+                    "에이전트 바이너리가 없습니다: {}",
+                    local_bin.display()
+                )));
+            }
+            let home = self.home_dir(host)?;
+            let remote_dir = format!("{}/{REMOTE_AGENT_DIR}", home.trim_end_matches('/'));
+            let remote_name = format!("riffle-agent-{AGENT_VERSION}-{arch}");
+            let remote_path = format!("{remote_dir}/{remote_name}");
+            self.upload_agent(host, &remote_dir, &remote_path, &local_bin)?;
+            remote_name
+        };
         // ~ 확장은 원격 셸에 맡긴다 ($HOME/… 형태로 전달).
         AgentSession::spawn_ssh(
+            &ssh,
             host,
             &format!("\"$HOME/{REMOTE_AGENT_DIR}/{remote_name}\" --stdio"),
             path,
@@ -1096,5 +1129,155 @@ mod tests {
             ))
             .expect("재업로드 실패");
         assert_eq!(fs::read(&remote_path).unwrap(), other);
+
+        // 실제 에이전트 바이너리(수 MB) 업로드 — 쓰기 청크가 서버 패킷
+        // 한도를 넘어 세션이 죽는 회귀를 검증한다.
+        let bin = fs::read(agent_bin()).expect("에이전트 바이너리 읽기 실패");
+        inner
+            .block_on(upload_agent_conn(
+                &conn,
+                &remote_dir_s,
+                &remote_path_s,
+                &bin,
+            ))
+            .expect("대형 업로드 실패");
+        assert_eq!(fs::read(&remote_path).unwrap(), bin);
+    }
+
+    /// sftp-server 로 가는 가짜 ssh 를 작성한다.
+    /// `-s` 호출은 sftp-server, `uname -sm` 은 "Linux x86_64",
+    /// 그 외 마지막 인자는 원격 셸처럼 `sh -c` 로 실행한다.
+    /// HOME 을 `fake_home` 으로 바꿔 업로드·실행 경로를 맞추고,
+    /// 매 호출의 인자를 `log` 에 한 줄씩 기록한다.
+    fn write_fake_ssh(dir: &Path, fake_home: &Path, log: &Path) -> PathBuf {
+        let ssh = dir.join("fake-ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> '{l}'\n\
+                 export HOME='{h}'\n\
+                 cd \"$HOME\" || exit 1\n\
+                 for last; do :; done\n\
+                 case \" $* \" in *\" -s \"*) exec /usr/libexec/sftp-server ;; esac\n\
+                 case \"$last\" in\n\
+                 \"uname -sm\") echo \"Linux x86_64\" ;;\n\
+                 *) exec sh -c \"$last\" ;;\n\
+                 esac\n",
+                h = fake_home.display(),
+                l = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        ssh
+    }
+
+    #[test]
+    fn test_start_agent_ssh_path() {
+        // 앱의 start_agent_ssh 와 같은 순서를 가짜 ssh 로 재현한다:
+        // uname 확인 → SFTP 업로드(실제 수 MB 바이너리) → 원격 exec → index.
+        let dir = tempdir("sshpath");
+        let fake_home = dir.join("home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let file = dir.join("app.log");
+        gen_log(&file, 50_000);
+        let agent_dir = dir.join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::copy(agent_bin(), agent_dir.join("riffle-agent-x86_64")).unwrap();
+        let ssh = write_fake_ssh(&dir, &fake_home, &dir.join("ssh.log"));
+        let ssh_s = ssh.to_string_lossy().to_string();
+
+        // 풀 연결은 가짜 ssh 의 -s 경로로 연다 (Command argv 를 그대로 실행).
+        let pool = SftpPool::new(Transport::Command(vec![
+            ssh_s.clone(),
+            "-s".into(),
+            "fakehost".into(),
+            "sftp".into(),
+        ]));
+
+        let arch = remote_arch(&ssh_s, "fakehost").expect("uname 실패");
+        assert_eq!(arch, "x86_64");
+        let home = pool.home_dir("fakehost").expect("home_dir 실패");
+        let remote_dir = format!("{}/{REMOTE_AGENT_DIR}", home.trim_end_matches('/'));
+        let remote_name = format!("riffle-agent-{AGENT_VERSION}-{arch}");
+        let remote_path = format!("{remote_dir}/{remote_name}");
+        let local_bin = agent_dir.join(format!("riffle-agent-{arch}"));
+        pool.upload_agent("fakehost", &remote_dir, &remote_path, &local_bin)
+            .expect("업로드 실패");
+
+        let session = AgentSession::spawn_ssh(
+            &ssh_s,
+            "fakehost",
+            &format!("\"$HOME/{REMOTE_AGENT_DIR}/{remote_name}\" --stdio"),
+            file.to_str().unwrap(),
+        )
+        .expect("세션 실패");
+        let (total, lines, cps) = session.index(&mut |_| {}).expect("index 실패");
+        assert_eq!(lines, 50_000);
+        assert_eq!(total as usize, fs::metadata(&file).unwrap().len() as usize);
+        assert_eq!(cps.first(), Some(&0));
+
+        // 업로드된 파일이 같은 크기·0755 권한으로 존재해야 한다.
+        let uploaded = fake_home.join(format!("{REMOTE_AGENT_DIR}/{remote_name}"));
+        let meta = fs::metadata(&uploaded).expect("업로드 파일 없음");
+        assert_eq!(meta.len(), fs::metadata(&local_bin).unwrap().len());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn test_start_agent_concurrent() {
+        // 같은 호스트에 대한 동시 start_agent 는 설치를 한 번만 수행하고
+        // 모든 호출이 각자의 세션을 얻어야 한다 (동시 설치 경합 회귀).
+        let dir = tempdir("sshconc");
+        let fake_home = dir.join("home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let file = dir.join("app.log");
+        gen_log(&file, 50_000);
+        let agent_dir = dir.join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::copy(agent_bin(), agent_dir.join("riffle-agent-x86_64")).unwrap();
+        let log = dir.join("ssh.log");
+        let ssh = write_fake_ssh(&dir, &fake_home, &log);
+        let ssh_s = ssh.to_string_lossy().to_string();
+
+        // Transport::Ssh 경로를 가짜 ssh 로 탄다 (SFTP 접속·uname·실행 모두).
+        let pool = SftpPool::new_with_ssh(Transport::Ssh, &ssh_s);
+        let path = file.to_str().unwrap().to_string();
+        let sessions: Vec<AgentSession> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| pool.start_agent("fakehost", &path, &agent_dir)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap().expect("start_agent 실패"))
+                .collect()
+        });
+        assert_eq!(sessions.len(), 4);
+        for session in &sessions {
+            let (_, lines, _) = session.index(&mut |_| {}).expect("index 실패");
+            assert_eq!(lines, 50_000);
+        }
+        drop(sessions);
+
+        // 설치가 직렬화됐다면 uname 확인은 1회다 (arch 캐시).
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("uname -sm").count(),
+            1,
+            "설치 중복 수행: {log_text}"
+        );
+
+        // 설치 파일이 0755 로 존재하고 임시 파일은 남지 않아야 한다.
+        let remote_dir = fake_home.join(REMOTE_AGENT_DIR);
+        let installed = remote_dir.join(format!("riffle-agent-{AGENT_VERSION}-x86_64"));
+        let meta = fs::metadata(&installed).expect("설치 파일 없음");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        let leftovers: Vec<_> = fs::read_dir(&remote_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "임시 파일 잔존: {leftovers:?}");
     }
 }
