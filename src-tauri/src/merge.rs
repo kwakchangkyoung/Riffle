@@ -183,6 +183,7 @@ fn run_merge_build(
                 content_bytes: p.total_lines,
                 decompressing: false,
                 error: None,
+                notice: None,
             };
             if let Err(e) = on_progress.send(dto) {
                 eprintln!("병합 진행률 채널 전송 오류: {e}");
@@ -215,6 +216,7 @@ fn run_merge_build(
             content_bytes: p.total_lines,
             decompressing: false,
             error: Some(msg),
+            notice: None,
         });
     }
 }
@@ -312,6 +314,7 @@ pub async fn open_merge(
         compressed: false,
         remote: false,
         source: "merge".to_string(),
+        agent: false,
     })
 }
 

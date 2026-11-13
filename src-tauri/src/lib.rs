@@ -32,7 +32,7 @@ use s3::{
     set_s3_bookmarks, set_s3_profile,
 };
 use session::{load_session, save_session};
-use settings::{get_settings, set_auto_check_updates};
+use settings::{get_agent_hosts, get_settings, set_agent_enabled, set_auto_check_updates};
 use state::AppState;
 use tail::set_tail;
 use tauri::Manager;
@@ -64,6 +64,8 @@ pub fn run() {
             take_pending_open,
             get_settings,
             set_auto_check_updates,
+            get_agent_hosts,
+            set_agent_enabled,
             save_session,
             load_session,
             validate_filter,
@@ -99,9 +101,15 @@ pub fn run() {
             let handle = app.handle().clone();
             let recent = recent::load_recent(&handle).unwrap_or_default();
             app.state::<AppState>().set_recent_files(recent.clone());
-            // 마지막으로 선택한 AWS 프로필을 설정에서 복원한다 (없으면 기본 체인)
-            let s3_profile = settings::load_settings(&handle).s3_profile;
-            app.state::<AppState>().set_s3_profile(s3_profile);
+            // 설정에서 AWS 프로필과 에이전트 사용 호스트 목록을 복원한다
+            let settings = settings::load_settings(&handle);
+            app.state::<AppState>().set_s3_profile(settings.s3_profile);
+            app.state::<AppState>()
+                .set_agent_hosts(settings.agent_hosts);
+            // 로컬 에이전트 바이너리는 앱 리소스 agents/ 에서 찾는다
+            // (RIFFLE_AGENT_DIR 환경 변수가 이 경로보다 우선한다)
+            let agent_dir = app.path().resource_dir().ok().map(|d| d.join("agents"));
+            app.state::<AppState>().set_agent_dir(agent_dir);
             menu::apply_menu(&handle, &recent)?;
             Ok(())
         })

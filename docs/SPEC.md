@@ -164,7 +164,7 @@ pub struct Line {
 SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워크로 읽어야 한다. **에이전트**는 원격 서버에서 riffle-core로 그 작업을 직접 수행하고 결과(희소 체크포인트, 줄 번호, 구간)만 돌려준다. 화면에 보이는 줄 읽기는 기존 SFTP(RandomRead) 경로를 그대로 쓴다.
 
 - **호스트별 opt-in, 기본 꺼짐.** 켠 호스트의 `sftp://` 파일을 열 때만 사용한다. 설정은 `settings.json`의 `agentHosts: Vec<String>`에 저장한다.
-- **설치 위치**: 원격 `~/.cache/riffle/riffle-agent-<버전>-<arch>` (`<버전>`은 `0.5.0` 같은 semver, `<arch>`는 `x86_64`|`aarch64`). 그 외 원격에는 아무것도 설치·수정하지 않는다. 바이너리는 `x86_64-unknown-linux-musl`/`aarch64-unknown-linux-musl` 정적 빌드를 릴리스 CI가 만들어 앱 리소스 `agents/`에 포함한다. 개발·테스트는 `RIFFLE_AGENT_DIR`로 디렉터리를 지정한다.
+- **설치 위치**: 원격 `~/.cache/riffle/riffle-agent-<버전>-<arch>` (`<버전>`은 워크스페이스 버전과 동일 — `AGENT_VERSION = env!("CARGO_PKG_VERSION")`이고 `riffle-agent`의 hello 버전도 같은 값이다, `<arch>`는 `x86_64`|`aarch64`). 그 외 원격에는 아무것도 설치·수정하지 않는다. 바이너리는 `x86_64-unknown-linux-musl`/`aarch64-unknown-linux-musl` 정적 빌드를 릴리스 CI가 만들어 앱 리소스 `agents/`에 포함한다. 개발·테스트는 `RIFFLE_AGENT_DIR`로 디렉터리를 지정한다.
 - **준비 절차**: `ssh <host> uname -sm`으로 아키텍처 확인(`Linux x86_64`/`Linux aarch64`만 지원) → 원격 경로에 같은 크기의 바이너리가 없으면 SFTP 업로드(임시 이름 `.tmp-<pid>`로 쓰기 → 권한 0755 → rename, 같은 크기면 생략) → `ssh -T -o BatchMode=yes … <host> "$HOME/.cache/riffle/<이름>" --stdio` 실행(홈 확장은 원격 셸에 맡김) → `hello`/`open` 핸드셰이크.
 - **폴백**: 아키텍처 미지원, 바이너리 없음, 업로드/실행 실패, 프로토콜 오류 등 어느 단계든 실패하면 조용히 기존 SFTP 경로로 폴백한다(기능 손실 없음). 호출자가 `RemoteError::Agent`를 받아 폴백 여부를 판단한다.
 - **인덱스 채택**: 에이전트 `index`의 `{ totalBytes, lineCount, checkpoints }`를 `LineIndex::from_checkpoints`로 완료 상태 인덱스로 재구성하고 `LogFile::adopt_index`로 채택한다. 로컬 인덱싱이 이미 진행됐거나, 미완료 인덱스이거나, 파일 크기가 다르면 `Error::IndexAdopt`로 거부된다.
@@ -172,7 +172,7 @@ SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워�
 - **프로토콜 (줄 단위 JSON, `riffle-agent --stdio`)**: 요청 1줄 → 응답 여러 줄 스트리밍. FilterSpec은 IPC의 FilterSpecDto와 동일한 JSON이다.
 
 ```
-→ {"id":1,"op":"hello"}                          ← {"id":1,"hello":{"version":"0.5.0","protocol":1}}
+→ {"id":1,"op":"hello"}                          ← {"id":1,"hello":{"version":"<버전>","protocol":1}}
 → {"id":2,"op":"open","path":"/var/log/app.log"} ← {"id":2,"opened":{"size":123,"gzip":false}}   (gzip이면 앱이 SFTP 경로로 폴백)
 → {"id":3,"op":"index"}                          ← {"id":3,"progress":{"indexedBytes":..,"lineCount":..}} … (200ms 간격)
                                                   ← {"id":3,"index":{"totalBytes":..,"lineCount":..,"checkpoints":[0,..]}}  (K=1024, LineIndex와 동일 의미)
@@ -195,7 +195,7 @@ SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워�
 
 | 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
-| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote, source }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP), `s3://버킷/키`이면 S3 객체로 열기 (Phase 12·13). `source`는 `"local" \| "sftp" \| "s3" \| "merge"` |
+| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size, compressed, remote, source, agent }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로. `sftp://호스트/경로`이면 원격(SFTP), `s3://버킷/키`이면 S3 객체로 열기 (Phase 12·13). `source`는 `"local" \| "sftp" \| "s3" \| "merge"`. `agent`는 에이전트 모드로 열렸을 때만 true (Phase 18) |
 | `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`, `with_fields?`                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용. withFields=true이고 형식이 plain이 아니면 `Line.fields`에 컬럼 분할 값 (Phase 16) |
 | `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
 | `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
@@ -219,6 +219,8 @@ SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워�
 | `list_ssh_hosts`     | -                                                                                                      | `Vec<SshHost>`                 | `~/.ssh/config`의 Host 별칭 목록 (Phase 12)              |
 | `list_remote_dir`    | `host`, `path`                                                                                         | `Vec<RemoteEntry>`             | 원격 디렉터리 목록. 이름순, 디렉터리 먼저 (Phase 12)      |
 | `remote_home`        | `host`                                                                                                 | `string`                       | 원격 홈 디렉터리 절대 경로 (Phase 12)                     |
+|| `get_agent_hosts`    | -                                                                                                      | `Vec<String>`                  | 에이전트를 켠 호스트 목록 (settings.json `agentHosts`) (Phase 18) |
+|| `set_agent_enabled`  | `host`, `enabled`                                                                                      | `()`                           | 호스트별 에이전트 사용 on/off를 `agentHosts`에 저장 (Phase 18) |
 | `list_aws_profiles`  | -                                                                                                      | `Vec<String>`                  | `~/.aws/config`(+`credentials`)의 프로필 이름 목록 (Phase 13). 이름만 읽고 키 값은 읽지 않음 |
 | `s3_list_buckets`    | `profile?`                                                                                             | `Vec<String>`                  | ListBuckets. 권한 없으면 오류 (Phase 13)                  |
 | `s3_list_prefix`     | `profile?`, `bucket`, `prefix`                                                                         | `Vec<S3Entry>`                 | 접두사를 `/` 구분자로 나열. 폴더 먼저, 이름순 (Phase 13)  |
@@ -232,7 +234,7 @@ SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워�
 | `merge_position_at_time` | `id`, `ts_ms`                                                                                     | `u64`                          | 유효 타임스탬프가 ts_ms 이상인 첫 병합 위치. 없으면 병합 줄 수 (Phase 17) |
 | `merge_sources`      | `id`                                                                                                   | `Vec<MergeSource>`             | `{ index, path, lineCount }` 원본 목록 (Phase 17)       |
 
-- `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
+- `IndexProgress { indexed_bytes, total_bytes, line_count, done, notice? }`. `notice`는 에이전트 폴백 사유 등 한 번만 채워 보내는 안내 문구다 (Phase 18).
 - (Phase 11) Finder "다음으로 열기"·다중 선택·드래그 앤 드롭으로 열린 파일은 `"open-files"` 이벤트(`string[]`, 순서 유지)로 프론트에 전달한다. 콜드 스타트처럼 프론트 준비 전에 도착한 경로는 Rust가 `pending_open`에 누적하고 `take_pending_open`으로 한 번에 수령한다. 파일 열기·드래그 앤 드롭·최근 파일·세션 복원은 모두 새 탭으로 열고, 이미 열린 같은 경로(canonical `FileInfo.path` 기준)면 해당 탭으로 전환한다.
 - (Phase 11) 탭 세션은 `session.json`에 `{ paths, activeIndex }`로 저장한다. 프론트가 탭 목록/활성 탭 변경 시 500ms 디바운스로 `save_session`을 호출하고, 시작 시 `load_session`으로 복원한다(`restoreSession` 설정, 기본 켜짐). 존재하지 않는 경로는 로드 시 걸러낸다.
 - `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나. `start_filter`도 같은 이벤트 형식을 쓴다.
@@ -243,6 +245,7 @@ SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워�
 - `TailEvent::Appended`에는 `filterCount`(활성 필터의 보이는 줄 수, 없으면 null)가 추가된다.
 - (Phase 12) 원격(SFTP) 파일: `open_file`의 `path`가 `sftp://호스트/경로`이면 `SftpPool`(시스템 `ssh` + russh-sftp, 앱 전역 하나, 호스트별 참조 카운트)로 연다. `FileInfo.remote`는 true이고 `path`는 URI 그대로 보관해 최근 파일·세션 복원이 그대로 동작한다. `close_file`은 원격이면 `pool.release(host)`를 호출한다. 원격 파일의 tail은 notify 대신 1초 폴링 `refresh`를 사용한다. 연결 오류는 탭 에러 바로 표시하고 재연결은 RandomRead 구현체가 read 시 1회 시도한다.
 - (Phase 12) `SshHost { alias, hostname?, user? }`, `RemoteEntry { name, isDir, size, mtime? }`(mtime은 unix 초). 모든 원격 호출은 `spawn_blocking`에서 수행한다. `list_ssh_hosts`는 `~/.ssh/config`(Include·~ 확장, 와일드카드/부정 별칭 제외)의 Host 목록을 반환한다.
+- (Phase 18) 에이전트: `agentHosts`에 등록된 호스트의 `sftp://` 파일을 열면 `SftpPool::start_agent`로 세션을 시작하고, 인덱싱은 에이전트 `index`의 체크포인트를 `adopt_index`로 채택해 진행률 이벤트를 그대로 전달한다. `search`·`start_filter`도 에이전트에 위임하고, 위임 실패 시 누적 결과를 비우고 일반 SFTP/로컬 스캔으로 폴백한다. 세션 시작 실패(아키텍처 미지원, 번들에 해당 arch 바이너리 없음, 버전/프로토콜 불일치 등)면 `IndexProgressDto.notice`에 사유를 실어 보낸다. 에이전트 바이너리 디렉터리는 `RIFFLE_AGENT_DIR` 환경 변수 우선, 없으면 `resource_dir()/agents`다. `FileInfo.agent`는 세션이 실제로 열렸을 때만 true다.
 - (Phase 13) S3 객체: `open_file`의 `path`가 `s3://버킷/키`이면 `S3Pool`(aws-sdk-s3, 앱 전역 하나, (프로필, 리전)별 클라이언트 캐시 + 버킷별 리전 캐시)로 연다. URI에는 프로필을 넣지 않고, 마지막 선택 프로필은 `settings.json`의 `s3Profile`에 저장한다(없으면 AWS 기본 자격 증명 체인). `FileInfo.remote`는 true, `source`는 `"s3"`이며 `path`는 URI 그대로 보관해 최근 파일·세션 복원이 그대로 동작한다. `close_file`은 별도 해제 없이 클라이언트를 풀에서 재사용한다. S3 객체는 불변이므로 `set_tail`은 `Err("S3 객체는 tail 을 지원하지 않습니다")`를 반환한다. RandomRead 구현은 `stat_len`을 HeadObject ContentLength로 얻고, 큰 요청은 8MB Range GET을 최대 16개 동시에, 작은 요청은 1MB 블록 LRU 캐시(최대 64MB)로 읽는다. 일시적 오류는 지수 백오프로 최대 3회 재시도한다. 읽기 전용 API(HeadObject, GetObject Range, ListObjectsV2, ListBuckets, GetBucketLocation/HeadBucket)만 호출한다.
 - (Phase 13) `S3Entry { name, isDir, size, mtime? }`(mtime은 unix 초, 폴더는 null). `list_aws_profiles`는 `~/.aws/config`의 `[default]`/`[profile x]`와 `~/.aws/credentials`의 `[x]` 섹션 헤더에서 프로필 이름만 읽는다(정렬, 중복 제거, default 포함). 모든 S3 호출은 `spawn_blocking`에서 수행한다.
 - (Phase 3 결정) 검색 결과 줄 번호 목록은 Rust에만 보관한다(최대 1,000만 건을 JS로 넘기지 않음). 프론트는 `search_nav`(다음/이전), `search_hit_at`, `search_density`(스크롤바 마커), `get_filtered_lines`(검색 필터 모드), `validate_query`로 필요한 만큼만 조회한다. 다중 필터의 보이는 줄도 `LineSet`으로 Rust에만 보관하고 `get_filter_lines`/`filter_index_of`/`filter_density`로 필요한 만큼만 조회한다.

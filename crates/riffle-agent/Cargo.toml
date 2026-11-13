@@ -1,8 +1,8 @@
 [package]
-# 버전을 바꾸면 riffle-remote 의 AGENT_VERSION 과 원격 설치 파일명이 달라져
-# 재설치가 트리거되므로 함께 확인할 것 (src-tauri/agents 리소스도 재빌드 필요).
+# 버전은 워크스페이스 버전(앱 버전)을 따른다. 올리면 원격 설치 파일명이
+# 달라져 재설치가 트리거되므로 src-tauri/agents 리소스도 재빌드해야 한다.
 name = "riffle-agent"
-version = "0.5.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]

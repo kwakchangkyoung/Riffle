@@ -28,6 +28,8 @@ pub struct FileInfo {
     pub remote: bool,
     /// 파일 출처: "local" | "sftp" | "s3" | "merge"
     pub source: String,
+    /// 서버 측 에이전트로 인덱싱·검색·필터를 처리 중인지 여부 (sftp 파일만)
+    pub agent: bool,
 }
 
 /// 인덱싱/해제 진행률 DTO
@@ -44,6 +46,9 @@ pub struct IndexProgressDto {
     pub decompressing: bool,
     /// gz 해제 실패/디스크 부족 등 오류 메시지 (그 전까지 내용은 유효)
     pub error: Option<String>,
+    /// 에이전트를 쓰지 못해 일반 방식으로 폴백할 때의 안내 문구 (한 번만 채워 보낸다)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 impl From<riffle_core::IndexProgress> for IndexProgressDto {
@@ -56,6 +61,7 @@ impl From<riffle_core::IndexProgress> for IndexProgressDto {
             content_bytes: progress.total_bytes,
             decompressing: false,
             error: None,
+            notice: None,
         }
     }
 }
@@ -442,6 +448,10 @@ pub struct OpenedFile {
     pub file: Arc<LogFile>,
     pub cancel: Arc<AtomicBool>,
     pub gz_writer: Option<riffle_core::GzWriter>,
+    /// 원격 에이전트 세션 (에이전트가 켜진 sftp 파일만)
+    pub agent: Option<Arc<riffle_remote::AgentSession>>,
+    /// 에이전트 준비 실패 사유 — 인덱싱 진행 이벤트의 notice 로 한 번 전달한다
+    pub agent_notice: Option<String>,
 }
 
 /// 경로가 원격(sftp://, s3://) URI인지 반환한다.
@@ -494,10 +504,13 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
             compressed,
             remote: false,
             source: "local".to_string(),
+            agent: false,
         },
         file,
         cancel,
         gz_writer,
+        agent: None,
+        agent_notice: None,
     })
 }
 
@@ -553,14 +566,17 @@ pub fn read_filtered_lines_from_file(
 }
 
 /// 백그라운드 인덱싱 스레드 실행 로직.
+/// notice 가 있으면 첫 진행 이벤트에 한 번만 실어 보낸다 (에이전트 폴백 사유 등).
 pub fn run_indexing(
     file: Arc<LogFile>,
     cancel: Arc<AtomicBool>,
     on_progress: Channel<IndexProgressDto>,
+    notice: Option<String>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut is_first = true;
         let mut last_send = Instant::now();
+        let mut notice = notice;
 
         file.build_index(&cancel, &mut |progress| {
             let now = Instant::now();
@@ -571,7 +587,8 @@ pub fn run_indexing(
             if should_send {
                 is_first = false;
                 last_send = now;
-                let dto = IndexProgressDto::from(progress);
+                let mut dto = IndexProgressDto::from(progress);
+                dto.notice = notice.take();
                 if let Err(e) = on_progress.send(dto) {
                     eprintln!("인덱싱 진행률 채널 전송 오류: {e}");
                 }
@@ -602,6 +619,7 @@ fn gz_progress_dto(p: riffle_core::DecompressProgress, decompressing: bool) -> I
         content_bytes: p.decompressed,
         decompressing,
         error: None,
+        notice: None,
     }
 }
 
@@ -668,6 +686,39 @@ pub fn run_gz_decompression(
     }
 }
 
+/// 에이전트 인덱싱 스레드 본체.
+/// 에이전트 실패(통신·프로토콜·채택 오류) 시 사유를 notice 로 달아
+/// 기존 인덱싱 경로로 폴백한다 (기능 손실 없음).
+fn run_agent_indexing(
+    file: Arc<LogFile>,
+    session: Arc<riffle_remote::AgentSession>,
+    cancel: Arc<AtomicBool>,
+    on_progress: Channel<IndexProgressDto>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::remote::agent_index(&file, &session, &mut |dto| {
+            if let Err(e) = on_progress.send(dto) {
+                eprintln!("에이전트 인덱싱 진행률 채널 전송 오류: {e}");
+            }
+        })
+    }));
+
+    let reason = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e,
+        Err(panic_payload) => {
+            eprintln!("에이전트 인덱싱 스레드 패닉 발생: {panic_payload:?}");
+            "알 수 없는 오류".to_string()
+        }
+    };
+    run_indexing(
+        file,
+        cancel,
+        on_progress,
+        Some(crate::remote::agent_notice_text(&reason)),
+    );
+}
+
 /// 로그 파일을 열고 즉시 파일 정보를 반환하며, 백그라운드에서 인덱싱을 시작한다.
 /// 성공 시 최근 파일 목록을 갱신하고 네이티브 메뉴를 재구성한다.
 /// 파일 열기와 recent.json 읽기-수정-쓰기는 spawn_blocking에서 수행한다.
@@ -710,9 +761,20 @@ pub async fn open_file(
         None => {
             let file = opened.file;
             let cancel = opened.cancel;
-            std::thread::spawn(move || {
-                run_indexing(file, cancel, on_progress);
-            });
+            match opened.agent {
+                // 에이전트 세션이 있으면 서버 측 인덱싱을 시도한다
+                Some(session) => {
+                    std::thread::spawn(move || {
+                        run_agent_indexing(file, session, cancel, on_progress);
+                    });
+                }
+                None => {
+                    let notice = opened.agent_notice;
+                    std::thread::spawn(move || {
+                        run_indexing(file, cancel, on_progress, notice);
+                    });
+                }
+            }
         }
     }
 
@@ -1196,8 +1258,11 @@ pub async fn start_filter(
     let filter_id = filter_state.id;
     match doc {
         Doc::File(file) => {
+            // 에이전트 세션이 있으면 스캔을 서버 측에 위임한다 (실패 시 로컬 폴백)
+            let agent = state.get_agent(id);
+            let spec_json = serde_json::to_value(&filter_state.spec).ok();
             std::thread::spawn(move || {
-                run_filter_scan(file, filter_state, on_event);
+                run_filter_scan(file, agent, spec_json, filter_state, on_event);
             });
         }
         Doc::Merge(m) => {
@@ -1273,14 +1338,45 @@ pub async fn filter_density(
 }
 
 /// 백그라운드 필터 스캔 스레드 본체.
+/// 에이전트 세션이 있으면 먼저 서버 측 스캔을 시도하고, 실패 시 로컬 스캔으로 폴백한다.
 /// 매치된 줄 번호를 LineSet에 누적하고 진행률/완료/취소/오류를 Channel로 보낸다.
 /// 스캔 완료 후에는 인덱스를 한 번 갱신해 tail로 추가된 꼬리도 반영한다.
 fn run_filter_scan(
     file: Arc<LogFile>,
+    agent: Option<Arc<riffle_remote::AgentSession>>,
+    spec_json: Option<serde_json::Value>,
     filter_state: Arc<crate::state::FilterState>,
     on_event: Channel<SearchEvent>,
 ) {
     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 에이전트 위임 시도 — 성공하면 tail 추가분만 반영하고 끝낸다.
+        if let (Some(session), Some(spec)) = (&agent, &spec_json) {
+            let delegated = crate::remote::agent_filter(session, spec, &filter_state, &mut |e| {
+                let _ = on_event.send(e);
+            });
+            match delegated {
+                Ok(()) => {
+                    if let Ok(riffle_core::RefreshOutcome::Appended {
+                        old_line_count,
+                        new_line_count,
+                        ..
+                    }) = file.refresh()
+                    {
+                        filter_state.apply_appended(&file, old_line_count, new_line_count);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    // 부분 결과를 비우고 로컬 스캔으로 폴백한다
+                    eprintln!("에이전트 필터 실패, 일반 방식으로 재시도합니다: {e}");
+                    *filter_state
+                        .lines
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner()) = LineSet::new();
+                }
+            }
+        }
+
         let mut last_progress_send = Instant::now();
         let mut sent_first_match = false;
 
@@ -1391,8 +1487,9 @@ pub async fn search(
     let doc = state.get_doc(id)?;
     let matcher = Matcher::new(&query.query, (&query).into()).map_err(|e| e.to_string())?;
 
-    // filter_id가 있으면 그 필터의 spec으로 FilterSet을 만든다
-    let filter_set = match filter_id {
+    // filter_id가 있으면 그 필터의 spec으로 FilterSet을 만든다.
+    // 에이전트 위임 경로에는 같은 spec의 FilterSpecDto JSON이 필요하다.
+    let (filter_set, filter_json) = match filter_id {
         Some(fid) => {
             let f = state.get_filter(fid)?;
             if f.file_id != id {
@@ -1401,9 +1498,9 @@ pub async fn search(
                     fid, id
                 ));
             }
-            Some(f.set.clone())
+            (Some(f.set.clone()), serde_json::to_value(&f.spec).ok())
         }
-        None => None,
+        None => (None, None),
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1430,6 +1527,8 @@ pub async fn search(
     }
     let Doc::File(file) = doc else { unreachable!() };
 
+    // 에이전트 세션이 있으면 검색을 서버 측에 위임한다 (실패 시 로컬 폴백)
+    let agent = state.get_agent(id);
     let thread_cancel = cancel;
     let thread_results = results;
     let thread_done = done;
@@ -1438,6 +1537,31 @@ pub async fn search(
 
     std::thread::spawn(move || {
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(session) = &agent {
+                let delegated = crate::remote::agent_search(
+                    session,
+                    &query,
+                    filter_json.as_ref(),
+                    &thread_cancel,
+                    &thread_results,
+                    &thread_done,
+                    &thread_capped,
+                    &mut |e| {
+                        let _ = thread_event.send(e);
+                    },
+                );
+                match delegated {
+                    Ok(()) => return,
+                    Err(e) => {
+                        // 부분 결과를 비우고 로컬 스캔으로 폴백한다
+                        eprintln!("에이전트 검색 실패, 일반 방식으로 재시도합니다: {e}");
+                        if let Ok(mut r) = thread_results.write() {
+                            r.clear();
+                        }
+                    }
+                }
+            }
+
             let mut last_progress_send = Instant::now();
             let mut sent_first_match = false;
 

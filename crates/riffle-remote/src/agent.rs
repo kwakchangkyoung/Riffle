@@ -24,12 +24,11 @@ use crate::conn::{SSH_ARGS, SftpConn, Transport};
 use crate::error::{RemoteError, classify_ssh_failure, map_sftp_error};
 use crate::pool::SftpPool;
 
-/// 에이전트 실행 파일 버전.
-/// `crates/riffle-agent/Cargo.toml` 의 version 과 반드시 일치시킬 것 —
-/// hello 응답의 version 과 비교해 다르면 에이전트를 사용하지 않는다.
-/// 원격 설치 파일명(`riffle-agent-<버전>-<arch>`)에도 들어가므로
-/// 버전을 올리면 원격에 새 파일이 설치된다.
-pub const AGENT_VERSION: &str = "0.5.0";
+/// 에이전트 실행 파일 버전 (= 워크스페이스 버전).
+/// riffle-agent crate 도 같은 `version.workspace` 를 쓰므로 hello 응답의
+/// version 과 항상 일치한다. 원격 설치 파일명(`riffle-agent-<버전>-<arch>`)에도
+/// 들어가므로 버전을 올리면 원격에 새 파일이 설치된다.
+pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 지원하는 프로토콜 버전.
 const AGENT_PROTOCOL: u64 = 1;
 /// 원격 홈 디렉터리 아래 에이전트 설치 위치.

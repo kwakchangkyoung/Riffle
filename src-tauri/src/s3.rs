@@ -71,10 +71,13 @@ pub fn open_s3_internal(state: &AppState, path: &str) -> Result<OpenedFile, Stri
             compressed,
             remote: true,
             source: "s3".to_string(),
+            agent: false,
         },
         file,
         cancel,
         gz_writer,
+        agent: None,
+        agent_notice: None,
     })
 }
 
@@ -291,6 +294,7 @@ mod tests {
                 tail: None,
                 compressed: false,
                 columns: Arc::new(Mutex::new(None)),
+                agent: None,
             },
         );
         path

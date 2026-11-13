@@ -12,7 +12,50 @@ permissions:
     contents: write
 
 jobs:
+    # 원격 에이전트(riffle-agent)를 Linux 정적 바이너리로 빌드한다.
+    # 앱이 SFTP 호스트의 ~/.cache/riffle 에 업로드해 서버 측 인덱싱·검색·필터에 쓴다.
+    agents:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      target: x86_64-unknown-linux-musl
+                      arch: x86_64
+                    - os: ubuntu-24.04-arm
+                      target: aarch64-unknown-linux-musl
+                      arch: aarch64
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: agent-${{ matrix.target }}
+
+            - name: musl 도구 설치
+              run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+            - name: 에이전트 빌드
+              run: cargo build --release -p riffle-agent --target ${{ matrix.target }}
+
+            - name: 바이너리 스트립 + 스테이징
+              run: |
+                  strip target/${{ matrix.target }}/release/riffle-agent
+                  mkdir -p staging
+                  cp target/${{ matrix.target }}/release/riffle-agent staging/riffle-agent-${{ matrix.arch }}
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: riffle-agent-${{ matrix.arch }}
+                  path: staging/riffle-agent-${{ matrix.arch }}
+
     build:
+        needs: agents
         strategy:
             fail-fast: false
             # 두 job 이 같은 릴리스의 latest.json 을 읽고-병합-재업로드하므로
@@ -69,6 +112,13 @@ jobs:
                   key: ${{ matrix.target }}
 
             - run: pnpm install --frozen-lockfile
+
+            # 에이전트 바이너리를 앱 번들 리소스(src-tauri/agents/)에 배치한다
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: riffle-agent-*
+                  path: src-tauri/agents
+                  merge-multiple: true
 
             - uses: tauri-apps/tauri-action@v1
               env:

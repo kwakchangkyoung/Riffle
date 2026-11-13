@@ -6,8 +6,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use riffle_core::{
     DecompressProgress, LogFile, Matcher, SearchOptions, is_gzip_reader, open_gzip_remote, search,
@@ -46,6 +46,66 @@ struct FakeS3 {
     /// 현재 처리 중인 요청 수 / 관측된 최대 동시 요청 수.
     inflight: Arc<AtomicUsize>,
     max_inflight: Arc<AtomicUsize>,
+    /// Range GET 응답을 목표 수만큼 동시 도착할 때까지 보류하는 장치 (0=비활성).
+    rendezvous: Arc<Rendezvous>,
+}
+
+/// Range GET 요청을 목표 수만큼 모아서 한꺼번에 풀어 주는 장치.
+/// 클라이언트가 정말 병렬로 요청할 때만 목표에 도달하므로 서버 측
+/// 동시 요청 수를 타이밍이 아니라 구조적으로 검증할 수 있다.
+/// 목표에 못 미친 채 마감이 지나면(직렬 클라이언트) 그냥 풀어 줘 무한 대기를 피한다.
+struct Rendezvous {
+    target: AtomicUsize,
+    inner: Mutex<RendezvousState>,
+    cv: Condvar,
+}
+
+struct RendezvousState {
+    arrived: usize,
+    /// 최초 도착 시각 + 제한 시간. 직렬 클라이언트의 데드락 방지용.
+    deadline: Option<Instant>,
+}
+
+impl Rendezvous {
+    fn new() -> Self {
+        Self {
+            target: AtomicUsize::new(0),
+            inner: Mutex::new(RendezvousState {
+                arrived: 0,
+                deadline: None,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 목표 도달까지 기다린다. target=0 이면 아무것도 하지 않는다.
+    fn wait(&self) {
+        let target = self.target.load(Ordering::Relaxed);
+        if target == 0 {
+            return;
+        }
+        let mut st = self.inner.lock().unwrap();
+        if st.arrived == 0 {
+            st.deadline = Some(Instant::now() + Duration::from_secs(10));
+        }
+        st.arrived += 1;
+        if st.arrived >= target {
+            self.cv.notify_all();
+            return;
+        }
+        let deadline = st.deadline.unwrap();
+        while st.arrived < target {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (g, timeout) = self.cv.wait_timeout(st, remaining).unwrap();
+            st = g;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
 }
 
 impl FakeS3 {
@@ -63,28 +123,41 @@ impl FakeS3 {
             requests: Arc::new(Mutex::new(Vec::new())),
             inflight: Arc::new(AtomicUsize::new(0)),
             max_inflight: Arc::new(AtomicUsize::new(0)),
+            rendezvous: Arc::new(Rendezvous::new()),
         };
-        let (state, requests, inflight, max_inflight) = (
+        let (state, requests, inflight, max_inflight, rendezvous) = (
             fake.state.clone(),
             fake.requests.clone(),
             fake.inflight.clone(),
             fake.max_inflight.clone(),
+            fake.rendezvous.clone(),
         );
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let (state, requests, inflight, max_inflight) = (
+                let (state, requests, inflight, max_inflight, rendezvous) = (
                     state.clone(),
                     requests.clone(),
                     inflight.clone(),
                     max_inflight.clone(),
+                    rendezvous.clone(),
                 );
                 std::thread::spawn(move || {
-                    handle_conn(stream, state, requests, inflight, max_inflight);
+                    handle_conn(stream, state, requests, inflight, max_inflight, rendezvous);
                 });
             }
         });
         fake
+    }
+
+    /// Range GET 응답을 `n`개가 동시에 도착할 때까지 보류하게 한다.
+    /// 병렬 읽기 검증 전에 호출한다.
+    fn set_range_rendezvous(&self, n: usize) {
+        *self.rendezvous.inner.lock().unwrap() = RendezvousState {
+            arrived: 0,
+            deadline: None,
+        };
+        self.rendezvous.target.store(n, Ordering::Relaxed);
     }
 
     fn add_bucket(&self, name: &str) {
@@ -134,6 +207,7 @@ fn handle_conn(
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     inflight: Arc<AtomicUsize>,
     max_inflight: Arc<AtomicUsize>,
+    rendezvous: Arc<Rendezvous>,
 ) {
     let Some(req) = read_request(&mut stream) else {
         return;
@@ -146,6 +220,10 @@ fn handle_conn(
     let cur = inflight.fetch_add(1, Ordering::Relaxed) + 1;
     max_inflight.fetch_max(cur, Ordering::Relaxed);
     let resp = route(&req, &state.lock().unwrap());
+    // 병렬 검증이 켜져 있으면 Range GET 응답을 목표 수만큼 모을 때까지 보류한다.
+    if req.method == "GET" && req.headers.contains_key("range") {
+        rendezvous.wait();
+    }
     let _ = write_response(&mut stream, &resp);
     inflight.fetch_sub(1, Ordering::Relaxed);
 }
@@ -645,6 +723,8 @@ fn s3_large_read_is_parallel() {
         v
     };
     s.put_object("big", "big.log", &content);
+    // 8개 조각 요청이 모두 도착할 때까지 응답을 보류해 병렬성을 결정적으로 검증한다.
+    s.set_range_rendezvous(8);
     let pool = make_pool(&s);
     let r = pool
         .open_object(None, &S3Uri::parse("s3://big/big.log").unwrap())
@@ -656,6 +736,7 @@ fn s3_large_read_is_parallel() {
     assert_eq!(&buf[..], &content[..buf.len()]);
 
     // 기록된 Range GET 이 8MiB 조각 단위로, 동시에 나갔는지 확인한다.
+    // 랑데부가 풀렸다는 것 자체가 8개 요청이 동시에 처리 중이었다는 증거이다.
     let reqs: Vec<RecordedRequest> = s
         .requests()
         .into_iter()
@@ -671,7 +752,7 @@ fn s3_large_read_is_parallel() {
         assert!(b - a < 8 * 1024 * 1024, "조각이 8MiB 초과: {range}");
     }
     assert!(
-        s.max_inflight.load(Ordering::Relaxed) >= 2,
+        s.max_inflight.load(Ordering::Relaxed) >= 8,
         "동시 요청 관측 실패: {}",
         s.max_inflight.load(Ordering::Relaxed)
     );

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use riffle_core::{Columns, FilterSet, LineSet, LogFile, MergeIndex};
-use riffle_remote::{S3Pool, SftpPool, Transport};
+use riffle_remote::{AgentSession, S3Pool, SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
 use crate::tail::TailLoopMsg;
@@ -62,6 +62,9 @@ pub struct OpenFile {
     pub compressed: bool,
     /// 컬럼 뷰용 감지된 컬럼 정보 캐시 (첫 요청 시 감지해 파일 단위로 고정)
     pub columns: ColumnsCache,
+    /// 원격 에이전트 세션 (에이전트가 켜진 sftp 파일만).
+    /// 인덱싱·검색·필터 위임에 사용하며, 줄 읽기는 SFTP 경로를 그대로 쓴다.
+    pub agent: Option<Arc<AgentSession>>,
 }
 
 /// OpenFile에 보관하는 컬럼 감지 캐시 타입
@@ -189,6 +192,12 @@ pub struct AppState {
     /// 마지막으로 선택한 AWS 프로필 (None이면 기본 자격 증명 체인).
     /// set_s3_profile이 settings.json 저장과 함께 갱신한다.
     pub s3_profile: Mutex<Option<String>>,
+    /// 에이전트(서버 측 인덱싱·검색·필터)를 사용할 원격 호스트 목록.
+    /// set_agent_enabled가 settings.json 저장과 함께 갱신한다.
+    pub agent_hosts: Mutex<Vec<String>>,
+    /// 로컬 에이전트 바이너리 디렉터리 (리소스 agents/).
+    /// setup에서 설정하며, RIFFLE_AGENT_DIR 환경 변수가 이 경로보다 우선한다.
+    pub agent_dir: Mutex<Option<PathBuf>>,
 }
 
 impl Default for AppState {
@@ -206,6 +215,8 @@ impl Default for AppState {
             remote_pool: SftpPool::new(Transport::Ssh),
             s3_pool: S3Pool::new(),
             s3_profile: Mutex::new(None),
+            agent_hosts: Mutex::new(Vec::new()),
+            agent_dir: Mutex::new(None),
         }
     }
 }
@@ -230,6 +241,7 @@ impl AppState {
                 tail: None,
                 compressed,
                 columns: Arc::new(Mutex::new(None)),
+                agent: None,
             },
         );
         id
@@ -249,6 +261,7 @@ impl AppState {
                 tail: None,
                 compressed: false,
                 columns: Arc::new(Mutex::new(None)),
+                agent: None,
             },
         );
         id
@@ -550,6 +563,55 @@ impl AppState {
     pub fn set_s3_profile(&self, profile: Option<String>) {
         *self.s3_profile.lock().unwrap_or_else(|p| p.into_inner()) = profile;
     }
+
+    /// 열린 파일에 에이전트 세션을 연결한다 (열기 직후 1회).
+    pub fn set_file_agent(&self, id: u32, agent: Arc<AgentSession>) {
+        let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(f) = files.get_mut(&id) {
+            f.agent = Some(agent);
+        }
+    }
+
+    /// 파일의 에이전트 세션을 반환한다 (에이전트가 없거나 파일이 없으면 None).
+    pub fn get_agent(&self, id: u32) -> Option<Arc<AgentSession>> {
+        let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        files.get(&id).and_then(|f| f.agent.clone())
+    }
+
+    /// 에이전트 사용이 켜진 호스트 목록을 반환한다.
+    pub fn agent_hosts(&self) -> Vec<String> {
+        self.agent_hosts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 에이전트 사용 호스트 목록을 갱신한다 (set_agent_enabled가 설정 저장 후 호출).
+    pub fn set_agent_hosts(&self, hosts: Vec<String>) {
+        *self.agent_hosts.lock().unwrap_or_else(|p| p.into_inner()) = hosts;
+    }
+
+    /// 해당 호스트에서 에이전트 사용이 켜져 있는지 반환한다.
+    pub fn agent_enabled_for(&self, host: &str) -> bool {
+        self.agent_hosts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|h| h == host)
+    }
+
+    /// 로컬 에이전트 바이너리 디렉터리를 반환한다 (리소스 agents/, 미설정이면 None).
+    pub fn agent_dir(&self) -> Option<PathBuf> {
+        self.agent_dir
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 로컬 에이전트 바이너리 디렉터리를 설정한다 (setup에서 1회).
+    pub fn set_agent_dir(&self, dir: Option<PathBuf>) {
+        *self.agent_dir.lock().unwrap_or_else(|p| p.into_inner()) = dir;
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +634,7 @@ mod tests {
                 tail: None,
                 compressed: false,
                 columns: Arc::new(Mutex::new(None)),
+                agent: None,
             },
         );
         path

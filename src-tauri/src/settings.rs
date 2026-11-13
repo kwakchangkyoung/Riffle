@@ -15,6 +15,8 @@ pub struct Settings {
     pub restore_session: bool,
     /// 마지막으로 선택한 AWS 프로필 (None이면 기본 자격 증명 체인)
     pub s3_profile: Option<String>,
+    /// 서버 측 가속(에이전트)을 사용할 원격 호스트 목록 (기본 빈 목록)
+    pub agent_hosts: Vec<String>,
 }
 
 impl Default for Settings {
@@ -23,6 +25,7 @@ impl Default for Settings {
             auto_check_updates: true,
             restore_session: true,
             s3_profile: None,
+            agent_hosts: Vec::new(),
         }
     }
 }
@@ -114,6 +117,38 @@ pub async fn set_auto_check_updates(app: tauri::AppHandle, enabled: bool) -> Res
     update_auto_check_setting(&app, enabled)
 }
 
+/// 에이전트 사용이 켜진 원격 호스트 목록을 반환한다.
+#[tauri::command]
+pub async fn get_agent_hosts(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    Ok(app.state::<crate::state::AppState>().agent_hosts())
+}
+
+/// 호스트별 에이전트 사용을 켜거나 끄고 settings.json에 저장한다.
+/// 켠 호스트의 sftp:// 파일을 열 때만 서버 측 인덱싱·검색·필터를 시도한다.
+#[tauri::command]
+pub async fn set_agent_enabled(
+    app: tauri::AppHandle,
+    host: String,
+    enabled: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut settings = load_settings(&app);
+        if enabled {
+            if !settings.agent_hosts.contains(&host) {
+                settings.agent_hosts.push(host);
+            }
+        } else {
+            settings.agent_hosts.retain(|h| h != &host);
+        }
+        save_settings(&app, &settings)?;
+        app.state::<crate::state::AppState>()
+            .set_agent_hosts(settings.agent_hosts);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("에이전트 설정 저장 비동기 태스크 실패: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,11 +166,12 @@ mod tests {
             auto_check_updates: false,
             restore_session: false,
             s3_profile: Some("work".to_string()),
+            agent_hosts: vec!["nas".to_string()],
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert_eq!(
             json,
-            r#"{"autoCheckUpdates":false,"restoreSession":false,"s3Profile":"work"}"#
+            r#"{"autoCheckUpdates":false,"restoreSession":false,"s3Profile":"work","agentHosts":["nas"]}"#
         );
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, settings);
@@ -154,6 +190,7 @@ mod tests {
         assert!(!parsed.auto_check_updates);
         assert!(parsed.restore_session);
         assert_eq!(parsed.s3_profile, None);
+        assert!(parsed.agent_hosts.is_empty());
     }
 
     #[test]
@@ -191,6 +228,7 @@ mod tests {
             auto_check_updates: false,
             restore_session: false,
             s3_profile: Some("work".to_string()),
+            agent_hosts: vec!["nas".to_string()],
         };
         write_settings_file(&path, &settings).unwrap();
         assert_eq!(read_settings_file(&path), settings);

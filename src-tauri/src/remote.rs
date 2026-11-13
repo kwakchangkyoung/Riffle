@@ -1,16 +1,18 @@
-// 원격(SFTP) 파일 열기 내부 로직과 원격 탐색 IPC 커맨드
+// 원격(SFTP) 파일 열기 내부 로직과 원격 탐색 IPC 커맨드.
+// 에이전트(서버 측 인덱싱·검색·필터) 위임 경로도 이 파일에 둔다.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use riffle_core::LogFile;
-use riffle_remote::RemoteUri;
+use riffle_remote::{AgentEvent, AgentSession, QueryJson, RemoteError, RemoteUri};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::Manager;
 
-use crate::commands::{FileInfo, OpenedFile};
-use crate::state::AppState;
+use crate::commands::{FileInfo, IndexProgressDto, OpenedFile, QueryDto, SearchEvent};
+use crate::state::{AppState, FilterState};
 
 /// ~/.ssh/config의 Host 항목 DTO (프론트 ipc.ts의 SshHost와 1:1)
 #[derive(Debug, Clone, Serialize)]
@@ -86,12 +88,37 @@ fn open_remote_inner(state: &AppState, path: &str, uri: &RemoteUri) -> Result<Op
     let file = Arc::new(log_file);
     let cancel = Arc::new(AtomicBool::new(false));
     let compressed = gz_writer.is_some();
+
+    // 에이전트 사용이 켜진 호스트면 세션을 준비한다. gzip은 에이전트가
+    // 지원하지 않으므로 시도하지 않는다. 어느 단계든 실패하면 사유(notice)만
+    // 남기고 일반 SFTP 경로로 진행한다 (기능 손실 없음).
+    let mut agent_session: Option<Arc<AgentSession>> = None;
+    let mut agent_notice: Option<String> = None;
+    if !compressed && state.agent_enabled_for(&uri.host) {
+        match agent_dir(state) {
+            Some(dir) => match state.remote_pool.start_agent(&uri.host, &uri.path, &dir) {
+                Ok(session) => agent_session = Some(Arc::new(session)),
+                Err(e) => {
+                    agent_notice = Some(agent_notice_text(&agent_fallback_reason(&e)));
+                }
+            },
+            None => {
+                agent_notice = Some(agent_notice_text(
+                    "이 빌드에는 에이전트가 포함되어 있지 않습니다",
+                ));
+            }
+        }
+    }
+
     let id = state.insert_file(
         file.clone(),
         cancel.clone(),
         PathBuf::from(path),
         compressed,
     );
+    if let Some(session) = &agent_session {
+        state.set_file_agent(id, session.clone());
+    }
 
     Ok(OpenedFile {
         info: FileInfo {
@@ -101,11 +128,160 @@ fn open_remote_inner(state: &AppState, path: &str, uri: &RemoteUri) -> Result<Op
             compressed,
             remote: true,
             source: "sftp".to_string(),
+            agent: agent_session.is_some(),
         },
         file,
         cancel,
         gz_writer,
+        agent: agent_session,
+        agent_notice,
     })
+}
+
+/// 에이전트 바이너리 디렉터리를 결정한다.
+/// RIFFLE_AGENT_DIR 환경 변수가 있으면 우선하고, 없으면 앱 리소스의 agents/ 다.
+fn agent_dir(state: &AppState) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("RIFFLE_AGENT_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    state.agent_dir()
+}
+
+/// 에이전트 준비 실패 사유를 사용자 안내 문구로 정리한다.
+/// 로컬에 해당 아키텍처 바이너리가 없는 경우는 "이 빌드에는 <arch> 에이전트가 없습니다"로 안내한다.
+fn agent_fallback_reason(e: &RemoteError) -> String {
+    let msg = e.to_string();
+    if msg.contains("에이전트 바이너리가 없습니다") {
+        for arch in ["x86_64", "aarch64"] {
+            if msg.contains(&format!("riffle-agent-{arch}")) {
+                return format!("이 빌드에는 {arch} 에이전트가 없습니다");
+            }
+        }
+    }
+    msg
+}
+
+/// 에이전트를 쓰지 못해 일반 방식으로 폴백할 때 안내 바에 표시할 문구를 만든다.
+pub fn agent_notice_text(reason: &str) -> String {
+    format!("에이전트를 사용할 수 없어 일반 방식으로 처리합니다 ({reason})")
+}
+
+/// 인덱싱을 에이전트에서 실행하고 완료 인덱스를 file 에 채택한다.
+/// 진행 상황은 on_progress 에 IndexProgressDto 로 전달한다.
+/// 통신·프로토콜·채택 실패 시 Err — 호출자는 일반 인덱싱으로 폴백한다.
+pub fn agent_index(
+    file: &LogFile,
+    session: &AgentSession,
+    on_progress: &mut dyn FnMut(IndexProgressDto),
+) -> Result<(), String> {
+    let total_bytes = session.size();
+    let progress = |indexed_bytes: u64, line_count: u64, done: bool| IndexProgressDto {
+        indexed_bytes,
+        total_bytes,
+        line_count,
+        done,
+        content_bytes: total_bytes,
+        decompressing: false,
+        error: None,
+        notice: None,
+    };
+    let (total, lines, checkpoints) = session
+        .index(&mut |e| {
+            if let AgentEvent::Progress {
+                indexed_bytes,
+                line_count,
+            } = e
+            {
+                on_progress(progress(indexed_bytes, line_count, false));
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    file.adopt_index(riffle_core::LineIndex::from_checkpoints(
+        total,
+        lines,
+        checkpoints,
+    ))
+    .map_err(|e| e.to_string())?;
+    on_progress(progress(total, lines, true));
+    Ok(())
+}
+
+/// 검색을 에이전트에 위임한다.
+/// 매치 배치는 results 에 누적하고 종료 이벤트(Done/Cancelled)는 on_event 로 전달한다.
+/// 통신·프로토콜 오류 시 Err — 호출자는 results 를 비우고 로컬 스캔으로 폴백한다.
+// IPC 경로의 상태 객체들을 그대로 채우므로 인자가 많다
+#[allow(clippy::too_many_arguments)]
+pub fn agent_search(
+    session: &AgentSession,
+    query: &QueryDto,
+    filter: Option<&Value>,
+    cancel: &AtomicBool,
+    results: &RwLock<Vec<u64>>,
+    done: &AtomicBool,
+    capped: &AtomicBool,
+    on_event: &mut dyn FnMut(SearchEvent),
+) -> Result<(), String> {
+    let q = QueryJson {
+        query: query.query.clone(),
+        regex: query.regex,
+        case_sensitive: query.case_sensitive,
+    };
+    session
+        .search(&q, filter, cancel, &mut |e| match e {
+            AgentEvent::Batch(batch) => {
+                if let Ok(mut r) = results.write() {
+                    r.extend_from_slice(&batch);
+                }
+            }
+            AgentEvent::Done { total, capped: c } => {
+                done.store(true, Ordering::Relaxed);
+                capped.store(c, Ordering::Relaxed);
+                on_event(SearchEvent::Done { total, capped: c });
+            }
+            AgentEvent::Cancelled => {
+                on_event(SearchEvent::Cancelled);
+            }
+            // Error 이벤트는 search() 가 Err 로 반환하므로 여기서는 무시한다.
+            _ => {}
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// 필터 스캔을 에이전트에 위임한다.
+/// 보이는 줄 구간은 filter_state.lines 에 누적하고 종료 이벤트는 on_event 로 전달한다.
+/// 통신·프로토콜 오류 시 Err — 호출자는 lines 를 비우고 로컬 스캔으로 폴백한다.
+pub fn agent_filter(
+    session: &AgentSession,
+    spec_json: &Value,
+    filter_state: &Arc<FilterState>,
+    on_event: &mut dyn FnMut(SearchEvent),
+) -> Result<(), String> {
+    session
+        .filter(spec_json, &filter_state.cancel, &mut |e| match e {
+            AgentEvent::Ranges(ranges) => {
+                let mut lines = filter_state
+                    .lines
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                for (start, end) in ranges {
+                    for n in start..end {
+                        lines.push_line(n);
+                    }
+                }
+            }
+            AgentEvent::Done { total, capped } => {
+                filter_state.done.store(true, Ordering::Relaxed);
+                filter_state.capped.store(capped, Ordering::Relaxed);
+                on_event(SearchEvent::Done { total, capped });
+            }
+            AgentEvent::Cancelled => {
+                on_event(SearchEvent::Cancelled);
+            }
+            _ => {}
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// ~/.ssh/config의 Host 별칭 목록을 반환한다.
@@ -168,9 +344,11 @@ pub async fn remote_home(app: tauri::AppHandle, host: String) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::open_file_internal;
+    use crate::commands::{FilterSpecDto, open_file_internal};
     use crate::testutil::temp_log_path;
+    use riffle_core::{FilterSet, LineSet, Matcher, SearchOptions};
     use riffle_remote::{SftpPool, Transport};
+    use std::process::Command;
     use std::sync::atomic::Ordering;
 
     /// macOS 기본 sftp-server를 Command transport로 사용하는 테스트용 풀.
@@ -184,6 +362,40 @@ mod tests {
 
     fn sftp_server_exists() -> bool {
         Path::new("/usr/libexec/sftp-server").exists()
+    }
+
+    /// `cargo build -p riffle-agent` 로 만든 로컬 에이전트 바이너리 경로.
+    /// `cargo test` 만으로는 bin 이 빌드되지 않을 수 있으므로 없으면 빌드한다.
+    /// RIFFLE_AGENT_BIN 환경 변수로 경로를 직접 지정할 수도 있다.
+    fn agent_bin() -> PathBuf {
+        if let Ok(b) = std::env::var("RIFFLE_AGENT_BIN") {
+            return PathBuf::from(b);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| root.join("target"));
+        let bin = target_dir.join("debug/riffle-agent");
+        if !bin.is_file() {
+            let status = Command::new(env!("CARGO"))
+                .args(["build", "-p", "riffle-agent"])
+                .current_dir(&root)
+                .status()
+                .expect("cargo build 실행 실패");
+            assert!(status.success(), "riffle-agent 빌드 실패");
+        }
+        bin
+    }
+
+    /// `riffle-agent-local` 바이너리가 든 임시 agent_dir 를 만든다.
+    /// Command transport 경로의 start_agent 는 이 이름의 로컬 바이너리를 직접 실행한다.
+    fn local_agent_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("riffle-agentdir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(agent_bin(), dir.join("riffle-agent-local")).unwrap();
+        dir
     }
 
     #[test]
@@ -316,6 +528,208 @@ mod tests {
         let _ = handle.join();
         assert_eq!(state.file_count(), 0);
 
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// Command transport + 로컬 에이전트로 SFTP 파일을 에이전트 모드로 열어
+    /// 인덱스·검색·필터 결과가 일반 SFTP 모드와 같은지 검증한다.
+    #[test]
+    fn test_agent_mode_open_index_search_filter() {
+        // RIFFLE_AGENT_DIR 이 있으면 agent_dir 결정이 환경 변수를 우선해 비결정적이므로 건너뛴다
+        if !sftp_server_exists() || std::env::var_os("RIFFLE_AGENT_DIR").is_some() {
+            return;
+        }
+        let state = AppState {
+            remote_pool: command_pool(),
+            ..Default::default()
+        };
+        state.set_agent_hosts(vec!["testhost".to_string()]);
+        let agent_dir = local_agent_dir("mode");
+        state.set_agent_dir(Some(agent_dir.clone()));
+
+        // i % 7 == 0 번째 줄은 WARN, 나머지는 INFO
+        let local = temp_log_path("agent_mode");
+        let mut content = String::new();
+        for i in 0..50_000u32 {
+            content.push_str(&format!(
+                "2026-11-14 10:{:02}:{:02} {} worker-{} 메시지\n",
+                (i / 60) % 60,
+                i % 60,
+                if i % 7 == 0 { "WARN" } else { "INFO" },
+                i % 8
+            ));
+        }
+        std::fs::write(&local, &content).expect("임시 파일 쓰기 실패");
+        let uri = format!("sftp://testhost{}", local.display());
+
+        let opened = open_file_internal(&state, &uri).expect("원격 열기 실패");
+        assert!(opened.info.agent, "에이전트 모드로 열려야 한다");
+        assert!(opened.agent_notice.is_none());
+        let session = state
+            .get_agent(opened.info.id)
+            .expect("파일에 에이전트 세션이 없다");
+        let id = opened.info.id;
+
+        // 인덱싱: 에이전트 체크포인트를 채택하고 로컬 인덱스와 비교한다
+        let mut saw_done = false;
+        agent_index(&opened.file, &session, &mut |p| {
+            if p.done {
+                saw_done = true;
+            }
+        })
+        .expect("에이전트 인덱싱 실패");
+        assert!(saw_done);
+        assert_eq!(opened.file.index().line_count(), 50_000);
+
+        let expect = LogFile::open(&local).expect("로컬 열기 실패");
+        expect
+            .build_index(&AtomicBool::new(false), &mut |_| {})
+            .expect("로컬 인덱싱 실패");
+        assert_eq!(
+            opened.file.index().checkpoints(),
+            expect.index().checkpoints()
+        );
+
+        // 줄 읽기는 SFTP(RandomRead) 경로 그대로 동작해야 한다
+        let remote_lines = opened.file.read_lines(0, 5, None, None).unwrap();
+        let local_lines = expect.read_lines(0, 5, None, None).unwrap();
+        for (a, b) in remote_lines.iter().zip(local_lines.iter()) {
+            assert_eq!(a.text, b.text);
+        }
+
+        // 검색: 에이전트 결과 == 로컬 search_filtered 결과
+        let query = QueryDto {
+            query: "worker-3".to_string(),
+            regex: false,
+            case_sensitive: true,
+        };
+        let results = RwLock::new(Vec::new());
+        let done = AtomicBool::new(false);
+        let capped = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let mut done_total = None;
+        agent_search(
+            &session,
+            &query,
+            None,
+            &cancel,
+            &results,
+            &done,
+            &capped,
+            &mut |e| {
+                if let SearchEvent::Done { total, .. } = e {
+                    done_total = Some(total);
+                }
+            },
+        )
+        .expect("에이전트 검색 실패");
+        let matcher = Matcher::new("worker-3", SearchOptions::from(&query)).unwrap();
+        let mut want = Vec::new();
+        riffle_core::search_filtered(
+            &expect,
+            &matcher,
+            None,
+            &cancel,
+            &mut |b| want.extend_from_slice(b),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(results.read().unwrap().as_slice(), want.as_slice());
+        assert_eq!(done_total, Some(want.len() as u64));
+        assert!(done.load(Ordering::Relaxed));
+
+        // 필터: 에이전트 구간 == 로컬 filter_scan 의 LineSet
+        let spec_dto = FilterSpecDto {
+            rules: Vec::new(),
+            combine: "and".to_string(),
+            levels: vec!["warn".to_string()],
+        };
+        let core_spec = crate::commands::filter_spec_of(&spec_dto).unwrap();
+        let set = Arc::new(FilterSet::new(&core_spec, None).unwrap());
+        let fstate = state
+            .insert_filter(id, spec_dto.clone(), set.clone())
+            .expect("필터 등록 실패");
+        let spec_json = serde_json::to_value(&spec_dto).unwrap();
+        agent_filter(&session, &spec_json, &fstate, &mut |_| {}).expect("에이전트 필터 실패");
+        assert!(fstate.done.load(Ordering::Relaxed));
+
+        let mut want_set = LineSet::new();
+        riffle_core::filter_scan(
+            &expect,
+            &set,
+            &cancel,
+            &mut |b| {
+                for &n in b {
+                    want_set.push_line(n);
+                }
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(fstate.lines.read().unwrap().ranges(), want_set.ranges());
+
+        state.close_file(id);
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_dir_all(&agent_dir);
+    }
+
+    /// 에이전트 바이너리가 없으면 조용히 일반 SFTP 경로로 폴백해야 한다.
+    #[test]
+    fn test_agent_fallback_missing_binary() {
+        if !sftp_server_exists() || std::env::var_os("RIFFLE_AGENT_DIR").is_some() {
+            return;
+        }
+        let state = AppState {
+            remote_pool: command_pool(),
+            ..Default::default()
+        };
+        state.set_agent_hosts(vec!["testhost".to_string()]);
+        // 존재하지 않는 디렉터리 → 에이전트 준비 실패 → 폴백
+        state.set_agent_dir(Some(PathBuf::from("/nonexistent/riffle-agent-dir")));
+
+        let local = temp_log_path("agent_fallback");
+        std::fs::write(&local, b"a\nb\n").expect("임시 파일 쓰기 실패");
+        let uri = format!("sftp://testhost{}", local.display());
+
+        let opened = open_file_internal(&state, &uri).expect("원격 열기 실패");
+        assert!(!opened.info.agent);
+        assert!(state.get_agent(opened.info.id).is_none());
+        let notice = opened.agent_notice.expect("폴백 사유가 있어야 한다");
+        assert!(notice.contains("에이전트를 사용할 수 없어"));
+
+        // 일반 인덱싱·읽기는 그대로 동작해야 한다
+        opened
+            .file
+            .build_index(&AtomicBool::new(false), &mut |_| {})
+            .expect("인덱싱 실패");
+        assert_eq!(opened.file.index().line_count(), 2);
+        let lines = opened.file.read_lines(0, 2, None, None).unwrap();
+        assert_eq!(lines[0].text, "a");
+
+        state.close_file(opened.info.id);
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// agentHosts 에 없는 호스트는 에이전트를 시도하지 않는다.
+    #[test]
+    fn test_agent_disabled_host_uses_sftp() {
+        if !sftp_server_exists() {
+            return;
+        }
+        let state = AppState {
+            remote_pool: command_pool(),
+            ..Default::default()
+        };
+        // set_agent_hosts 를 호출하지 않으면 기본 꺼짐이다
+        let local = temp_log_path("agent_off");
+        std::fs::write(&local, b"x\n").expect("임시 파일 쓰기 실패");
+        let uri = format!("sftp://testhost{}", local.display());
+
+        let opened = open_file_internal(&state, &uri).expect("원격 열기 실패");
+        assert!(!opened.info.agent);
+        assert!(opened.agent_notice.is_none());
+
+        state.close_file(opened.info.id);
         let _ = std::fs::remove_file(&local);
     }
 }

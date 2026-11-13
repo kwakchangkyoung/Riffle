@@ -6,6 +6,9 @@ target/
 src-tauri/target/
 src-tauri/gen/
 
+# 릴리스 CI가 내려받는 에이전트 바이너리
+src-tauri/agents/riffle-agent-*
+
 # Node dependencies and build
 node_modules/
 dist/
