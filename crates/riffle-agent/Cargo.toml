@@ -1,0 +1,11 @@
+[package]
+# 버전을 바꾸면 riffle-remote 의 AGENT_VERSION 과 원격 설치 파일명이 달라져
+# 재설치가 트리거되므로 함께 확인할 것 (src-tauri/agents 리소스도 재빌드 필요).
+name = "riffle-agent"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+riffle-core = { path = "../riffle-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

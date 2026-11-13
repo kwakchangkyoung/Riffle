@@ -62,6 +62,44 @@ impl LineIndex {
         self.segment_size.store(size, Ordering::Relaxed);
     }
 
+    /// 외부(원격 에이전트)에서 만든 체크포인트로 완료 상태의 인덱스를 생성한다.
+    /// checkpoints[i] 는 i*K 번째 줄의 시작 오프셋이어야 한다.
+    /// 첫 값이 0이 아니거나 비어 있으면 0을 앞에 보정한다 (checkpoints[0] 불변 조건 유지).
+    pub fn from_checkpoints(total_bytes: u64, line_count: u64, checkpoints: Vec<u64>) -> LineIndex {
+        let mut cps = checkpoints;
+        if cps.first() != Some(&0) {
+            cps.insert(0, 0);
+        }
+        LineIndex {
+            total_bytes: AtomicU64::new(total_bytes),
+            checkpoints: RwLock::new(cps),
+            line_count: AtomicU64::new(line_count),
+            indexed_bytes: AtomicU64::new(total_bytes),
+            done: AtomicBool::new(true),
+            segment_size: AtomicUsize::new(DEFAULT_SEGMENT_SIZE),
+        }
+    }
+
+    /// 체크포인트 목록의 복사본을 반환한다 (에이전트의 index 응답 직렬화용).
+    pub fn checkpoints(&self) -> Vec<u64> {
+        self.checkpoints.read().unwrap().clone()
+    }
+
+    /// 다른 인덱스의 완성 상태를 이 인덱스로 옮겨 온다 (LogFile::adopt_index 전용).
+    /// done 을 마지막에 세워 읽는 쪽이 항상 완성된 상태만 보게 한다.
+    pub(crate) fn adopt(&self, src: LineIndex) {
+        let cps = src.checkpoints.into_inner().unwrap();
+        *self.checkpoints.write().unwrap() = cps;
+        self.line_count
+            .store(src.line_count.load(Ordering::Acquire), Ordering::Release);
+        self.indexed_bytes
+            .store(src.indexed_bytes.load(Ordering::Acquire), Ordering::Release);
+        self.total_bytes
+            .store(src.total_bytes.load(Ordering::Acquire), Ordering::Release);
+        self.done
+            .store(src.done.load(Ordering::Acquire), Ordering::Release);
+    }
+
     /// 블로킹 방식으로 인덱스를 생성한다. 호출자가 별도 스레드에서 실행해야 한다.
     /// cancel 플래그가 true가 되면 즉시 Ok(())로 중단하며, 진행 상태는 done=false로 유지된다.
     /// I/O 읽기와 개행 스캔을 더블 버퍼링(2개 재사용 버퍼)으로 파이프라이닝하여 디스크 한계 속도를 달성한다.

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/riffle-agent",
     "crates/riffle-core",
     "crates/riffle-remote",
     "src-tauri",

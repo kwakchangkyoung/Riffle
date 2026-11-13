@@ -11,6 +11,8 @@ pub enum Error {
     Gzip(String),
     #[error("범위가 너무 큽니다 (최대 {limit} 바이트)")]
     TooLarge { limit: u64 },
+    #[error("에이전트 인덱스 채택 실패: {0}")]
+    IndexAdopt(String),
 }
 
 /// Riffle 코어 Result 타입 별칭

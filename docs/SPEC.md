@@ -159,7 +159,33 @@ pub struct Line {
 - **검색·필터 위임**: 병합 탭의 검색/필터는 각 원본에 기존 `search`/`filter_scan`을 실행한 뒤 원본 줄을 `map_positions`로 병합 위치로 변환해 `Vec<u64>`/`LineSet`을 채운다(원본별 결과는 이미 정렬). gz·원격 원본도 `Source` 추상화로 동일하게 동작한다.
 - **수명**: `MergeIndex`는 원본 `Arc<LogFile>`을 보유하므로 원본 탭이 닫혀도 병합 탭이 살아 있고, 병합 탭을 닫으면 원본 참조가 해제된다.
 
-### 3.8 테스트 필수 케이스
+### 3.8 원격 에이전트 (Phase 18)
+
+SFTP 원격 파일은 인덱싱·검색·필터 시 파일 전체를 네트워크로 읽어야 한다. **에이전트**는 원격 서버에서 riffle-core로 그 작업을 직접 수행하고 결과(희소 체크포인트, 줄 번호, 구간)만 돌려준다. 화면에 보이는 줄 읽기는 기존 SFTP(RandomRead) 경로를 그대로 쓴다.
+
+- **호스트별 opt-in, 기본 꺼짐.** 켠 호스트의 `sftp://` 파일을 열 때만 사용한다. 설정은 `settings.json`의 `agentHosts: Vec<String>`에 저장한다.
+- **설치 위치**: 원격 `~/.cache/riffle/riffle-agent-<버전>-<arch>` (`<버전>`은 `0.5.0` 같은 semver, `<arch>`는 `x86_64`|`aarch64`). 그 외 원격에는 아무것도 설치·수정하지 않는다. 바이너리는 `x86_64-unknown-linux-musl`/`aarch64-unknown-linux-musl` 정적 빌드를 릴리스 CI가 만들어 앱 리소스 `agents/`에 포함한다. 개발·테스트는 `RIFFLE_AGENT_DIR`로 디렉터리를 지정한다.
+- **준비 절차**: `ssh <host> uname -sm`으로 아키텍처 확인(`Linux x86_64`/`Linux aarch64`만 지원) → 원격 경로에 같은 크기의 바이너리가 없으면 SFTP 업로드(임시 이름 `.tmp-<pid>`로 쓰기 → 권한 0755 → rename, 같은 크기면 생략) → `ssh -T -o BatchMode=yes … <host> "$HOME/.cache/riffle/<이름>" --stdio` 실행(홈 확장은 원격 셸에 맡김) → `hello`/`open` 핸드셰이크.
+- **폴백**: 아키텍처 미지원, 바이너리 없음, 업로드/실행 실패, 프로토콜 오류 등 어느 단계든 실패하면 조용히 기존 SFTP 경로로 폴백한다(기능 손실 없음). 호출자가 `RemoteError::Agent`를 받아 폴백 여부를 판단한다.
+- **인덱스 채택**: 에이전트 `index`의 `{ totalBytes, lineCount, checkpoints }`를 `LineIndex::from_checkpoints`로 완료 상태 인덱스로 재구성하고 `LogFile::adopt_index`로 채택한다. 로컬 인덱싱이 이미 진행됐거나, 미완료 인덱스이거나, 파일 크기가 다르면 `Error::IndexAdopt`로 거부된다.
+- **에이전트 구현**: `crates/riffle-agent`(bin). 의존성은 `serde`(derive)·`serde_json`·`riffle-core`뿐이며 외부 네이티브 의존성이 없어 musl 정적 빌드가 가능하다. 동기 스레드 구조: stdin 읽기 스레드 + 작업(index/search/filter)별 스레드 + stdout 쓰기 `Mutex`(한 응답 = 완전한 JSON 한 줄, 줄 단위 flush). 한 세션은 파일 하나이며 작업은 동시에 여러 개 실행 가능하다. stdin EOF 시 진행 중 작업을 취소하고 스레드를 정리한다. `riffle-agent --version`은 `riffle-agent <버전> protocol 1`을 출력한다.
+- **프로토콜 (줄 단위 JSON, `riffle-agent --stdio`)**: 요청 1줄 → 응답 여러 줄 스트리밍. FilterSpec은 IPC의 FilterSpecDto와 동일한 JSON이다.
+
+```
+→ {"id":1,"op":"hello"}                          ← {"id":1,"hello":{"version":"0.5.0","protocol":1}}
+→ {"id":2,"op":"open","path":"/var/log/app.log"} ← {"id":2,"opened":{"size":123,"gzip":false}}   (gzip이면 앱이 SFTP 경로로 폴백)
+→ {"id":3,"op":"index"}                          ← {"id":3,"progress":{"indexedBytes":..,"lineCount":..}} … (200ms 간격)
+                                                  ← {"id":3,"index":{"totalBytes":..,"lineCount":..,"checkpoints":[0,..]}}  (K=1024, LineIndex와 동일 의미)
+→ {"id":4,"op":"search","query":{"query":"x","regex":false,"caseSensitive":true},"filter":null|FilterSpec}
+                                                  ← {"id":4,"batch":[줄번호,…]}(≤10,000개) … ← {"id":4,"done":{"total":..,"capped":false}}
+→ {"id":5,"op":"filter","spec":FilterSpec}        ← {"id":5,"ranges":[[s,e],…]}(≤10,000구간) … ← {"id":5,"done":{…}}
+→ {"id":6,"op":"cancel","target":4}               (응답 없음, 대상 작업은 {"id":4,"cancelled":true}로 끝남)
+오류: {"id":N,"error":"메시지"}  (알 수 없는 op·잘못된 JSON도 error 응답 후 세션은 계속 동작)
+```
+
+- **클라이언트**: `riffle_remote::AgentSession`이 자식 프로세스(ssh 또는 로컬)와 줄 단위 JSON을 주고받는다. `AgentEvent`(Progress/Batch/Ranges/Done/Cancelled/Error)로 스트리밍 결과를 전달하고, 테스트는 `AgentSession::spawn_local`(ssh 없이 로컬 바이너리 직접 실행)이나 `Transport::Command`로 검증한다.
+
+### 3.9 테스트 필수 케이스
 
 빈 파일, 개행 없는 마지막 줄, CRLF, 개행만 있는 파일, 16KB를 넘는 단일 줄, 잘못된 UTF-8 바이트, 청크 경계에 정확히 걸치는 줄, 청크 경계에 걸치는 검색 매치, 한글이 포함된 줄의 하이라이트 범위, K의 배수 번째 줄.
 

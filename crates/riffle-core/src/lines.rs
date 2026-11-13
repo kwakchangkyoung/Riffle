@@ -334,6 +334,31 @@ impl LogFile {
         self.index.build(&self.source, cancel, on_progress)
     }
 
+    /// 원격 에이전트가 만든 완성 인덱스(`LineIndex::from_checkpoints`)를 채택한다.
+    /// 아직 인덱싱을 시작하지 않은 파일에만 적용되며, 에이전트가 본 파일 크기가
+    /// 현재 소스 길이와 다르면(열기 사이에 변경) 거부한다.
+    /// 로컬 인덱싱 경로를 대체하지 않는다 — 원격 파일 전용 경로다.
+    pub fn adopt_index(&self, idx: LineIndex) -> Result<()> {
+        let cur = self.index.progress();
+        if cur.done || cur.line_count > 0 || cur.indexed_bytes > 0 {
+            return Err(Error::IndexAdopt(
+                "이미 인덱싱이 진행됐거나 완료됐습니다".to_string(),
+            ));
+        }
+        let progress = idx.progress();
+        if !progress.done {
+            return Err(Error::IndexAdopt("완료되지 않은 인덱스입니다".to_string()));
+        }
+        if progress.total_bytes != self.source.len() {
+            return Err(Error::IndexAdopt(
+                "파일 크기가 에이전트 인덱스와 다릅니다".to_string(),
+            ));
+        }
+        self.index.adopt(idx);
+        self.line_start_cache.lock().unwrap().clear();
+        Ok(())
+    }
+
     /// 지정된 범위의 줄들을 읽어온다.
     /// 현재까지 인덱싱이 완료되어 확인된 줄 범위까지만 반환한다.
     /// matcher가 제공되면 각 줄의 highlights(UTF-16 범위)를 계산하여 채운다.

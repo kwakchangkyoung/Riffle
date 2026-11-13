@@ -83,6 +83,11 @@ impl PoolInner {
         self.rt.block_on(f)
     }
 
+    /// 이 풀의 전송 방식을 반환한다 (에이전트 실행 경로 분기용).
+    pub(crate) fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
     fn entry(&self, host: &str) -> Arc<HostSlot> {
         let mut map = self.hosts.lock().unwrap();
         map.entry(host.to_string())
@@ -348,7 +353,7 @@ async fn reaper_loop(weak: Weak<PoolInner>) {
 /// 내부에 멀티스레드 토키오 런타임(워커 2개)을 소유한다.
 /// 모든 메서드는 블로킹이며, 무거운 호출은 호출 측에서 `spawn_blocking` 등으로 감싸는 것을 권장한다.
 pub struct SftpPool {
-    inner: Arc<PoolInner>,
+    pub(crate) inner: Arc<PoolInner>,
 }
 
 impl SftpPool {

@@ -67,7 +67,8 @@ impl SftpConn {
     }
 }
 
-const SSH_ARGS: &[&str] = &[
+/// ssh 공통 옵션. SFTP 접속뿐 아니라 에이전트 실행/uname 확인에도 그대로 쓴다.
+pub(crate) const SSH_ARGS: &[&str] = &[
     "-T",
     "-o",
     "BatchMode=yes",

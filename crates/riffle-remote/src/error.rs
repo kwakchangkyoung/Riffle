@@ -48,6 +48,9 @@ pub enum RemoteError {
     /// 그 외 S3 오류 요약.
     #[error("S3 오류: {0}")]
     S3(String),
+    /// 원격 에이전트 준비·통신 오류. 호출자는 항상 SFTP 방식으로 폴백하면 된다.
+    #[error("에이전트를 사용할 수 없습니다: {0}")]
+    Agent(String),
     /// 그 외 I/O 오류.
     #[error("I/O 오류: {0}")]
     Io(#[from] io::Error),
