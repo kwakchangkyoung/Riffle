@@ -455,36 +455,45 @@ async fn fetch_range(
     off: u64,
     len: u64,
 ) -> RangeResult {
+    // SDK 는 요청 전송 실패만 재시도하므로, 본문 수신 중 끊김은 요청부터 다시 보낸다.
+    const BODY_RETRY_BACKOFF: [std::time::Duration; 2] = [
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(500),
+    ];
     let range = format!("bytes={}-{}", off, off + len - 1);
     let what = uri.to_string();
-    let out = inner
-        .run_op(profile, &uri.bucket, &what, |client| {
-            let (bucket, key, range) = (uri.bucket.clone(), uri.key.clone(), range.clone());
-            async move {
-                match client
-                    .get_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .range(range)
-                    .send()
-                    .await
-                {
-                    Err(e) if s3_is_invalid_range(&e) => Ok(None),
-                    r => r.map(Some),
+    let mut attempt = 0;
+    loop {
+        let out = inner
+            .run_op(profile, &uri.bucket, &what, |client| {
+                let (bucket, key, range) = (uri.bucket.clone(), uri.key.clone(), range.clone());
+                async move {
+                    match client
+                        .get_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .range(range)
+                        .send()
+                        .await
+                    {
+                        Err(e) if s3_is_invalid_range(&e) => Ok(None),
+                        r => r.map(Some),
+                    }
                 }
+            })
+            .await?;
+        let Some(out) = out else {
+            return Ok(Vec::new());
+        };
+        match out.body.collect().await {
+            Ok(data) => return Ok(data.into_bytes().to_vec()),
+            Err(_) if attempt < BODY_RETRY_BACKOFF.len() => {
+                tokio::time::sleep(BODY_RETRY_BACKOFF[attempt]).await;
+                attempt += 1;
             }
-        })
-        .await?;
-    let Some(out) = out else {
-        return Ok(Vec::new());
-    };
-    let bytes = out
-        .body
-        .collect()
-        .await
-        .map_err(|e| RemoteError::S3(format!("{what}: 본문 읽기 실패: {e}")))?
-        .into_bytes();
-    Ok(bytes.to_vec())
+            Err(e) => return Err(RemoteError::S3(format!("{what}: 본문 읽기 실패: {e}"))),
+        }
+    }
 }
 
 /// 작업 범위를 블록 경계로 자른 조각.

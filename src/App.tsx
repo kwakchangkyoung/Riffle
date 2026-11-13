@@ -495,16 +495,17 @@ export default function App() {
     // 복원 로드가 끝날 때까지 sessionReady를 false로 두어
     // 디바운스 저장이 기존 세션을 빈 값으로 덮어쓰지 않게 한다.
     const [sessionReady, setSessionReady] = useState(false);
+    // 세션 복원은 앱 생애 동안 정확히 1회만 실행한다.
+    // ref 가드로 막으므로 deps가 바뀌어 effect가 재실행돼도 중복 실행되지 않고,
+    // cancelled 취소를 쓰지 않으므로 재실행이 진행 중인 복원을 중단시키지도 않는다.
+    const restoreStartedRef = useRef(false);
     useEffect(() => {
-        let cancelled = false;
-        (async () => {
+        if (restoreStartedRef.current) return;
+        restoreStartedRef.current = true;
+        void (async () => {
             try {
                 const session = await loadSession();
-                if (
-                    !cancelled &&
-                    session !== null &&
-                    session.paths.length > 0
-                ) {
+                if (session !== null && session.paths.length > 0) {
                     const ids = addTabsForPaths(session.paths);
                     const ai = session.activeIndex;
                     const idx =
@@ -516,22 +517,16 @@ export default function App() {
             } catch (err) {
                 console.warn("세션 복원 실패:", err);
             }
-            if (cancelled) return;
             try {
                 const pending = await takePendingOpen();
-                if (!cancelled && pending.length > 0) {
+                if (pending.length > 0) {
                     openPaths(pending);
                 }
             } catch (err) {
                 console.warn("대기 파일 경로 조회 실패:", err);
             }
-            if (!cancelled) {
-                setSessionReady(true);
-            }
+            setSessionReady(true);
         })();
-        return () => {
-            cancelled = true;
-        };
     }, [addTabsForPaths, activateTab, openPaths]);
 
     // 탭 목록/활성 탭 변경을 500ms 디바운스로 세션에 저장한다.

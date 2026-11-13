@@ -36,6 +36,7 @@ import {
     type TailEvent,
 } from "@/lib/ipc";
 import { isMergePath, mergeShortName, mergeSourceColor } from "@/lib/merge";
+import { isRemotePath } from "@/lib/remote";
 import { LineCache } from "@/lib/lineCache";
 import { useTauriListener } from "@/lib/useTauriListener";
 import { loadScrollPos, saveScrollPos } from "@/lib/scrollPos";
@@ -154,6 +155,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         const [errorMessage, setErrorMessage] = useState<string | null>(null);
         // 인덱싱 진행 이벤트에 실려 온 1회성 안내 (에이전트 폴백 사유 등, 닫기 전까지 유지)
         const [indexNotice, setIndexNotice] = useState<string | null>(null);
+        // 열기가 제한 시간을 넘겼을 때 재시도 제안 표시 (openWatchdogRef가 켠다)
+        const [openSlow, setOpenSlow] = useState(false);
 
         // 검색 및 필터 모드 관련 상태
         const [isFilterMode, setIsFilterMode] = useState(false);
@@ -242,6 +245,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
 
         const currentFileRef = useRef<FileInfo | null>(null);
         const openSeqRef = useRef(0);
+        // 열기 시도별 감시 타이머: 응답 없는 invoke로 탭이 "여는 중"에 멈추는 것을 막는다
+        const openWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(
+            null,
+        );
         const latestProgressRef = useRef<IndexProgress | null>(null);
         // 진행률 이벤트로 이미 표시한 해제 오류 (같은 오류 재표시 방지)
         const lastProgressErrorRef = useRef<string | null>(null);
@@ -556,12 +563,33 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             trackHeightRef.current = h;
         }, []);
 
+        // 진행 중인 열기 감시 타이머 해제
+        const clearOpenWatchdog = useCallback(() => {
+            if (openWatchdogRef.current !== null) {
+                clearTimeout(openWatchdogRef.current);
+                openWatchdogRef.current = null;
+            }
+        }, []);
+
         // 파일 열기 처리 함수
         const handleOpenFileByPath = useCallback(
             async (openPath: string, options?: { preserveTail?: boolean }) => {
                 const seq = ++openSeqRef.current;
                 setErrorMessage(null);
                 setIndexNotice(null);
+                setOpenSlow(false);
+                clearOpenWatchdog();
+                // 열기 감시: 이 시도가 제한 시간(로컬 30초, 원격 60초) 안에
+                // 끝나지 않으면 다시 시도를 제안한다. 최신 시도만 켠다.
+                openWatchdogRef.current = setTimeout(
+                    () => {
+                        openWatchdogRef.current = null;
+                        if (openSeqRef.current === seq) {
+                            setOpenSlow(true);
+                        }
+                    },
+                    isRemotePath(openPath) ? 60_000 : 30_000,
+                );
                 latestProgressRef.current = null;
                 lastProgressErrorRef.current = null;
                 pendingPosRef.current = null;
@@ -686,6 +714,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         return;
                     }
 
+                    clearOpenWatchdog();
+                    setOpenSlow(false);
                     currentFileRef.current = info;
                     setFile(info);
                     normalLineCache.setFile(info.id);
@@ -764,6 +794,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     }
                 } catch (err) {
                     if (openSeqRef.current === seq) {
+                        clearOpenWatchdog();
+                        setOpenSlow(false);
                         restoreSettledRef.current = true;
                         const msg =
                             typeof err === "string"
@@ -782,12 +814,19 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 filteredLineCache,
                 filterLineCache,
                 flushBookmarks,
+                clearOpenWatchdog,
             ],
         );
 
         // 마운트 시 요청 경로의 파일을 연다.
         // StrictMode 이중 실행은 openSeqRef로 이전 요청이 자동 정리된다.
         useEffect(() => {
+            void handleOpenFileByPath(path);
+        }, [handleOpenFileByPath, path]);
+
+        // 느린 열기 다시 시도: 진행 중인 시도를 무효화하고 열기를 다시 시작한다.
+        // 이전 시도의 늦은 결과는 stale 판정으로 close_file된다.
+        const handleOpenRetry = useCallback(() => {
             void handleOpenFileByPath(path);
         }, [handleOpenFileByPath, path]);
 
@@ -801,6 +840,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         useEffect(() => {
             return () => {
                 invalidateOpenSeq();
+                clearOpenWatchdog();
                 pendingAppendedRef.current = null;
                 if (tailRafRef.current !== null) {
                     cancelAnimationFrame(tailRafRef.current);
@@ -825,7 +865,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     });
                 }
             };
-        }, [invalidateOpenSeq, flushBookmarks]);
+        }, [invalidateOpenSeq, flushBookmarks, clearOpenWatchdog]);
 
         // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
         const handleToggleTail = useCallback(() => {
@@ -2422,6 +2462,29 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         >
                             닫기
                         </button>
+                    </div>
+                )}
+
+                {/* 느린 열기 안내 바: 열기가 제한 시간을 넘기면 재시도를 제안한다 */}
+                {openSlow && (
+                    <div className="px-4 py-2 bg-zinc-50 text-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300 text-xs flex items-center justify-between border-b border-zinc-200 dark:border-zinc-700">
+                        <span>파일을 여는 데 시간이 오래 걸립니다</span>
+                        <div className="flex items-center gap-3 ml-4 shrink-0">
+                            <button
+                                type="button"
+                                onClick={handleOpenRetry}
+                                className="font-bold hover:underline cursor-pointer"
+                            >
+                                다시 시도
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setOpenSlow(false)}
+                                className="hover:underline cursor-pointer"
+                            >
+                                닫기
+                            </button>
+                        </div>
                     </div>
                 )}
 

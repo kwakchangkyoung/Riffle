@@ -781,6 +781,8 @@ pub async fn open_file(
     // 최근 파일 기록 + 메뉴의 "최근 파일" 서브메뉴 재구성.
     // 기록/메뉴 갱신 실패는 파일 열기 자체를 실패시키지 않는다.
     // FileInfo.path는 canonical 경로이므로 그대로 기록한다.
+    // 메뉴 재구성은 메인 스레드 동기 호출이라 앱 시작 직후 지연될 수 있으므로,
+    // 열기 응답이 이를 기다리지 않도록 백그라운드에서 처리한다.
     let recent_app = app.clone();
     let recent_path = opened.info.path.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -801,9 +803,7 @@ pub async fn open_file(
                 Err(e) => eprintln!("최근 파일 기록 실패: {e}"),
             }
         })
-    })
-    .await
-    .map_err(|e| format!("최근 파일 기록 비동기 태스크 실패: {e}"))?;
+    });
 
     Ok(opened.info)
 }
