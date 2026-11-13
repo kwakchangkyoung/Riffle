@@ -13,7 +13,10 @@ import {
     detectColumns,
     filterIndexOf,
     getBookmarks,
+    mergePositionAtTime,
+    mergeSources,
     openFile,
+    openMerge,
     searchDensity,
     searchNav,
     setBookmarks as saveBookmarksIpc,
@@ -25,12 +28,14 @@ import {
     type FilterSpec,
     type IndexProgress,
     type MenuEvent,
+    type MergeSource,
     type QueryOptions,
     type RuleKind,
     type SearchEvent,
     type SearchHit,
     type TailEvent,
 } from "@/lib/ipc";
+import { isMergePath, mergeShortName, mergeSourceColor } from "@/lib/merge";
 import { LineCache } from "@/lib/lineCache";
 import { useTauriListener } from "@/lib/useTauriListener";
 import { loadScrollPos, saveScrollPos } from "@/lib/scrollPos";
@@ -98,20 +103,26 @@ function escapeRegex(s: string): string {
 interface FileTabProps {
     /** 탭 ID (App의 탭 목록과 대응) */
     tabId: string;
-    /** 이 탭이 열 경로 (사용자가 요청한 경로) */
+    /** 이 탭이 열 경로 (사용자가 요청한 경로). 병합 탭은 "merge://<tabId>" (표시용) */
     path: string;
+    /** 병합 탭이면 원본 파일 id 목록 — null이 아니면 openFile 대신 openMerge로 연다 */
+    mergeSourceIds?: number[] | null;
     /** 활성 탭 여부 — false이면 화면을 숨기고 단축키/메뉴 명령을 무시한다 */
     isActive: boolean;
     /** 전역 글자 크기 (App 상태) */
     fontSize: number;
     /** 파일 열기 완료 시 FileInfo 보고 (탭 제목/중복 경로 판정용) */
     onFileInfo: (tabId: string, info: FileInfo) => void;
-    /** 인덱싱/해제 진행률 보고 (탭 진행률 표시용) */
+    /** 인덱싱/해제/병합 구축 진행률 보고 (탭 진행률 표시용) */
     onProgress: (tabId: string, progress: IndexProgress | null) => void;
     /** tail 모드 상태 보고 (탭 표시용) */
     onTailChange: (tabId: string, enabled: boolean) => void;
     /** 글자 크기 조절 (+1/-1 단계) — 트랙패드 핀치 줌 */
     onFontSizeAdjust?: (delta: number) => void;
+    /** 병합 탭에서 원본 탭으로 이동 요청 (원본 경로, 0-based 원본 줄) */
+    onJumpToSource?: (path: string, sourceLine: number) => void;
+    /** App이 요청한 줄 이동 (병합 탭에서 이 탭으로 점프할 때). key는 재요청 구분용 */
+    gotoRequest?: { line: number; key: number } | null;
 }
 
 /**
@@ -123,12 +134,15 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
     ({
         tabId,
         path,
+        mergeSourceIds = null,
         isActive,
         fontSize,
         onFileInfo,
         onProgress,
         onTailChange,
         onFontSizeAdjust,
+        onJumpToSource,
+        gotoRequest = null,
     }) => {
         const [file, setFile] = useState<FileInfo | null>(null);
         // tail appended 이벤트의 totalBytes로 갱신되는 표시용 파일 크기 (null이면 file.size 사용)
@@ -189,6 +203,11 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         // columnView는 파일을 바꿔 열어도 탭 안에서 유지된다 (단, plain이면 비활성).
         const [columns, setColumns] = useState<Columns | null>(null);
         const [columnView, setColumnView] = useState(false);
+
+        // 병합 뷰 상태 (Phase 17): 원본 목록(순번·경로·줄 수). 병합 탭이 아니면 빈 배열.
+        const [mergeSourceList, setMergeSourceList] = useState<MergeSource[]>(
+            [],
+        );
 
         const rowHeight = rowHeightFor(fontSize);
         // 최신 rowHeight를 ref로 유지해 안정적인 콜백(tail 핸들러 등)에서 참조한다
@@ -292,10 +311,12 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         const onFileInfoRef = useRef(onFileInfo);
         const onProgressRef = useRef(onProgress);
         const onTailChangeRef = useRef(onTailChange);
+        const onJumpToSourceRef = useRef(onJumpToSource);
         useEffect(() => {
             onFileInfoRef.current = onFileInfo;
             onProgressRef.current = onProgress;
             onTailChangeRef.current = onTailChange;
+            onJumpToSourceRef.current = onJumpToSource;
         });
 
         // 활성 탭 여부를 ref로 미러링해 window 이벤트/메뉴 핸들러에서 참조한다
@@ -465,9 +486,15 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             handleTopLineChange,
         ]);
 
-        // 스크롤 위치 저장: 복원이 끝난 뒤 topLine 변경을 디바운스로 기록한다
+        // 스크롤 위치 저장: 복원이 끝난 뒤 topLine 변경을 디바운스로 기록한다 (병합 탭 제외)
         useEffect(() => {
-            if (file === null || !restoreSettledRef.current) return;
+            if (
+                file === null ||
+                !restoreSettledRef.current ||
+                isMergePath(file.path)
+            ) {
+                return;
+            }
             const path = file.path;
             const timer = setTimeout(() => {
                 saveScrollPos(path, topLine);
@@ -557,6 +584,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     });
                 }
 
+                // 병합 원본 목록 초기화 (열기 성공 시 다시 채운다)
+                setMergeSourceList([]);
+
                 // 캐시 및 화면 상태 초기화
                 normalLineCache.setFile(null);
                 filteredLineCache.setFile(null);
@@ -613,7 +643,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 }
 
                 try {
-                    const info = await openFile(openPath, (progress) => {
+                    const onOpenProgress = (progress: IndexProgress) => {
                         // 최신 열기 작업이 아닌 경우 콜백 무시
                         if (openSeqRef.current !== seq) return;
                         latestProgressRef.current = progress;
@@ -624,17 +654,24 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             progress.lineCount,
                             progress.done,
                         );
-                        // gzip 해제 실패/디스크 부족 등: 그 전까지 해제된 내용은 계속 사용 가능
+                        // gzip 해제 실패/병합 구축 실패 등: 그 전까지 확정된 내용은 계속 사용 가능
                         if (
                             progress.error !== null &&
                             progress.error !== lastProgressErrorRef.current
                         ) {
                             lastProgressErrorRef.current = progress.error;
                             setErrorMessage(
-                                `압축 해제 실패: ${progress.error} (그때까지 해제된 내용은 볼 수 있습니다)`,
+                                mergeSourceIds !== null
+                                    ? `병합 구축 실패: ${progress.error}`
+                                    : `압축 해제 실패: ${progress.error} (그때까지 해제된 내용은 볼 수 있습니다)`,
                             );
                         }
-                    });
+                    };
+                    // 병합 탭은 openFile이 아니라 openMerge로 가상 파일을 연다
+                    const info =
+                        mergeSourceIds !== null
+                            ? await openMerge(mergeSourceIds, onOpenProgress)
+                            : await openFile(openPath, onOpenProgress);
 
                     // 열리는 도중 다른 파일 열기 요청이 시작되었으면 취소
                     if (openSeqRef.current !== seq) {
@@ -647,19 +684,34 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     normalLineCache.setFile(info.id);
                     onFileInfoRef.current(tabId, info);
 
-                    // 인덱싱 시작과 함께 컬럼 형식을 감지한다 (파일별 캐시, 실패해도 뷰어 동작에 지장 없음)
-                    detectColumns(info.id)
-                        .then((cols) => {
-                            if (openSeqRef.current !== seq) return;
-                            setColumns(cols);
-                        })
-                        .catch((err) => {
-                            console.warn("컬럼 감지 실패:", err);
-                        });
+                    if (info.source === "merge") {
+                        // 병합 탭: 원본 목록(칩/범례용)을 가져온다. 컬럼 감지·북마크는 지원하지 않는다
+                        mergeSources(info.id)
+                            .then((srcs) => {
+                                if (openSeqRef.current !== seq) return;
+                                setMergeSourceList(srcs);
+                            })
+                            .catch((err) => {
+                                console.warn("병합 원본 목록 조회 실패:", err);
+                            });
+                    } else {
+                        // 인덱싱 시작과 함께 컬럼 형식을 감지한다 (파일별 캐시, 실패해도 뷰어 동작에 지장 없음)
+                        detectColumns(info.id)
+                            .then((cols) => {
+                                if (openSeqRef.current !== seq) return;
+                                setColumns(cols);
+                            })
+                            .catch((err) => {
+                                console.warn("컬럼 감지 실패:", err);
+                            });
+                    }
 
                     // 저장된 북마크를 불러온다 (머리 지문이 다르면 stale=true로 안내)
-                    getBookmarks(info.id)
-                        .then((bm) => {
+                    // 병합 뷰는 북마크를 지원하지 않으므로 건너뛴다
+                    const bookmarksPromise =
+                        info.source === "merge" ? null : getBookmarks(info.id);
+                    bookmarksPromise
+                        ?.then((bm) => {
                             if (openSeqRef.current !== seq) return;
                             setBookmarkItems((prev) => {
                                 // 불러오기가 끝나기 전 사용자가 단 북마크가 있으면
@@ -682,7 +734,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         });
 
                     // 이전에 보던 스크롤 위치 복원 예약 (로테이션 재오픈은 맨 아래로 가므로 제외)
-                    if (!options?.preserveTail) {
+                    // 병합 탭은 매번 새로 만드는 스냅샷이라 위치 복원을 하지 않는다
+                    if (!options?.preserveTail && !isMergePath(info.path)) {
                         const saved = loadScrollPos(info.path);
                         if (saved !== null) {
                             pendingPosRef.current = saved;
@@ -717,6 +770,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             },
             [
                 tabId,
+                mergeSourceIds,
                 normalLineCache,
                 filteredLineCache,
                 filterLineCache,
@@ -752,8 +806,11 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 void flushBookmarks();
                 const current = currentFileRef.current;
                 if (current !== null) {
-                    // 탭이 닫혀도 마지막 위치가 남도록 즉시 저장한다
-                    if (restoreSettledRef.current) {
+                    // 탭이 닫혀도 마지막 위치가 남도록 즉시 저장한다 (병합 탭 제외)
+                    if (
+                        restoreSettledRef.current &&
+                        !isMergePath(current.path)
+                    ) {
                         saveScrollPos(current.path, topLineRef.current);
                     }
                     closeFile(current.id).catch((err) => {
@@ -766,8 +823,14 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
         const handleToggleTail = useCallback(() => {
             const current = currentFileRef.current;
-            // 압축 파일(.gz)은 임시 파일 해제 방식이고, S3 객체는 불변이라 tail 모드를 지원하지 않는다
-            if (!current || current.compressed || current.source === "s3")
+            // 압축 파일(.gz)은 임시 파일 해제 방식이고, S3 객체는 불변,
+            // 병합 뷰는 스냅샷이라 tail 모드를 지원하지 않는다
+            if (
+                !current ||
+                current.compressed ||
+                current.source === "s3" ||
+                current.source === "merge"
+            )
                 return;
             const next = !tailEnabledRef.current;
             tailEnabledRef.current = next;
@@ -1544,6 +1607,90 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             setFullLinePanel({ fileId: current.id, no: lineNo });
         }, []);
 
+        // ===== 로그 병합 뷰 (Phase 17) =====
+
+        // Cmd+L에서 시각 이동 (병합 탭): 시각을 로컬로 해석한 epoch ms → 첫 병합 위치로 스크롤
+        const handleGotoTime = useCallback(
+            (tsMs: number) => {
+                const current = currentFileRef.current;
+                if (current === null || current.source !== "merge") return;
+                setGotoLineOpen(false);
+                mergePositionAtTime(current.id, tsMs)
+                    .then((pos) => {
+                        const visibleRows =
+                            viewportHeightRef.current > 0
+                                ? viewportHeightRef.current /
+                                  rowHeightRef.current
+                                : 30;
+                        const offset = Math.floor(visibleRows / 3);
+                        const maxTop = Math.max(
+                            0,
+                            displayCountRef.current - visibleRows,
+                        );
+                        handleTopLineChange(
+                            Math.max(0, Math.min(maxTop, pos - offset)),
+                        );
+                    })
+                    .catch((err) => {
+                        const msg =
+                            typeof err === "string"
+                                ? err
+                                : "시각 위치 계산에 실패했습니다.";
+                        setErrorMessage(msg);
+                    });
+            },
+            [handleTopLineChange],
+        );
+
+        // 병합 탭에서 원본 탭으로 이동 (행 더블클릭/원본 칩/범례 클릭)
+        const jumpToSource = useCallback(
+            (sourceIndex: number, sourceLine: number) => {
+                const info = mergeSourceList.find(
+                    (s) => s.index === sourceIndex,
+                );
+                if (info === undefined) return;
+                onJumpToSourceRef.current?.(info.path, sourceLine);
+            },
+            [mergeSourceList],
+        );
+
+        // 범례 클릭: 현재 화면에 보이는 해당 원본의 첫 줄로 원본 탭을 연다.
+        // 보이는 줄이 없으면 원본 처음으로 이동한다.
+        const handleLegendClick = useCallback(
+            (sourceIndex: number) => {
+                const cached = activeLineCache
+                    .sampleLines(2000)
+                    .find((l) => l.source === sourceIndex);
+                jumpToSource(sourceIndex, cached?.sourceLine ?? 0);
+            },
+            [activeLineCache, jumpToSource],
+        );
+
+        // App이 보낸 원본 탭 줄 이동 요청: 파일이 열리고 대상 줄이 확인 범위에
+        // 들어오면(또는 인덱싱이 끝나면) 해당 줄이 화면 위 1/3 지점에 오도록 스크롤한다
+        const pendingGotoRef = useRef<number | null>(null);
+        useEffect(() => {
+            if (gotoRequest !== null) {
+                pendingGotoRef.current = gotoRequest.line;
+            }
+            const target = pendingGotoRef.current;
+            if (target === null || file === null) return;
+            if (target >= lineCount && indexProgress?.done !== true) return;
+            pendingGotoRef.current = null;
+            // 저장된 스크롤 위치 복원보다 이 이동 요청을 우선한다
+            pendingPosRef.current = null;
+            restoreSettledRef.current = true;
+            // 검색 결과만 보기에서는 실제 줄 번호로 갈 수 없으므로 보기를 해제한다
+            setIsFilterMode(false);
+            handleGotoNavigate(target + 1);
+        }, [
+            gotoRequest,
+            file,
+            lineCount,
+            indexProgress?.done,
+            handleGotoNavigate,
+        ]);
+
         const handleCloseFullLinePanel = useCallback(() => {
             setFullLinePanel(null);
         }, []);
@@ -1560,6 +1707,13 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         }, [isFilterMode, filterViewActive, lineSelection]);
 
         // ===== 북마크 (Phase 15) =====
+
+        // 병합 뷰는 북마크를 지원하지 않는다 — 단축키/버튼은 안내 토스트만 표시한다
+        const bookmarkBlockedForMerge = useCallback((): boolean => {
+            if (currentFileRef.current?.source !== "merge") return false;
+            setToast("병합 보기에서는 북마크를 지원하지 않습니다");
+            return true;
+        }, []);
 
         // 비동기 북마크 핸들러에서 최신 검색 결과를 읽기 위한 ref
         useEffect(() => {
@@ -1615,9 +1769,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
 
         // Cmd+B: 기준 줄의 북마크 토글
         const handleToggleBookmark = useCallback(() => {
+            if (bookmarkBlockedForMerge()) return;
             const line = bookmarkTargetLine();
             if (line !== null) toggleBookmarkAt(line);
-        }, [bookmarkTargetLine, toggleBookmarkAt]);
+        }, [bookmarkBlockedForMerge, bookmarkTargetLine, toggleBookmarkAt]);
 
         // 실제 파일 줄 번호로 스크롤한다 (줄이 화면 위 1/3 지점에 오도록).
         // 인덱스 기반 보기에서는 보이는 줄 인덱스로 변환한다.
@@ -1684,6 +1839,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         const handleBookmarkNav = useCallback(
             async (forward: boolean) => {
                 lastBookmarkNavAtRef.current = Date.now();
+                if (bookmarkBlockedForMerge()) return;
                 const items = bookmarksRef.current;
                 if (items.length === 0 || currentFileRef.current === null) {
                     return;
@@ -1707,14 +1863,19 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 // 검색 결과만 보기에서 결과에 속한 북마크가 하나도 없는 경우
                 setToast("현재 보기에 북마크가 없습니다");
             },
-            [bookmarkTargetLine, navigateToBookmarkLine],
+            [
+                bookmarkBlockedForMerge,
+                bookmarkTargetLine,
+                navigateToBookmarkLine,
+            ],
         );
 
         // 북마크 패널 토글 (Cmd+Shift+B). 사이드 패널은 하나만 열린다
         const handleToggleBookmarkPanel = useCallback(() => {
+            if (bookmarkBlockedForMerge()) return;
             setBookmarkPanelOpen((prev) => !prev);
             setFullLinePanel(null);
-        }, []);
+        }, [bookmarkBlockedForMerge]);
 
         // 패널에서 북마크 속성을 고친다 (메모/색상/삭제 공통 패턴)
         const updateBookmarkItem = useCallback(
@@ -2006,6 +2167,19 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             [filterSpec],
         );
 
+        // 병합 뷰 여부와 원본 칩 정보 (원본 순번 → 색·짧은 이름)
+        const isMergeView = file?.source === "merge";
+        const mergeChips = useMemo(
+            () =>
+                mergeSourceList.map((s) => ({
+                    index: s.index,
+                    name: mergeShortName(s.path),
+                    color: mergeSourceColor(s.index),
+                    path: s.path,
+                })),
+            [mergeSourceList],
+        );
+
         // 현재 렌더 기준 맨 아래 여부 (상태바 tail 일시정지 표시용)
         const maxTopNow = Math.max(
             0,
@@ -2097,23 +2271,31 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             type="button"
                             onClick={handleToggleTail}
                             disabled={
-                                !file || file.compressed || file.source === "s3"
+                                !file ||
+                                file.compressed ||
+                                file.source === "s3" ||
+                                file.source === "merge"
                             }
                             title={
-                                file?.source === "s3"
-                                    ? "S3 객체는 불변이므로 tail 을 지원하지 않습니다"
-                                    : file?.compressed
-                                      ? "압축 파일은 tail 을 지원하지 않습니다"
-                                      : file?.remote
-                                        ? "tail 모드 토글 (⌘T) — 원격: 1초 간격으로 확인합니다"
-                                        : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
+                                file?.source === "merge"
+                                    ? "병합 뷰는 병합 시점 스냅샷이라 tail 을 지원하지 않습니다"
+                                    : file?.source === "s3"
+                                      ? "S3 객체는 불변이므로 tail 을 지원하지 않습니다"
+                                      : file?.compressed
+                                        ? "압축 파일은 tail 을 지원하지 않습니다"
+                                        : file?.remote
+                                          ? "tail 모드 토글 (⌘T) — 원격: 1초 간격으로 확인합니다"
+                                          : "tail 모드 토글 (⌘T) — 파일 끝을 실시간으로 따라갑니다"
                             }
                             className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 ${
                                 tailEnabled
                                     ? "bg-emerald-600 text-white hover:bg-emerald-500 shadow-xs"
                                     : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
                             } ${
-                                file && !file.compressed && file.source !== "s3"
+                                file &&
+                                !file.compressed &&
+                                file.source !== "s3" &&
+                                file.source !== "merge"
                                     ? "cursor-pointer"
                                     : "opacity-40 cursor-not-allowed"
                             }`}
@@ -2142,6 +2324,40 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         fileId={file.id}
                         columns={columns}
                     />
+                )}
+
+                {/* 병합 원본 범례: 원본별 색·이름·줄 수.
+                    클릭하면 해당 원본 탭으로 이동한다 (원본 숨기기는 지원하지 않음) */}
+                {isMergeView && mergeSourceList.length > 0 && (
+                    <div className="h-8 shrink-0 px-3 flex items-center gap-x-4 border-b border-zinc-200 dark:border-zinc-800 bg-violet-50/50 dark:bg-violet-950/20 overflow-x-auto">
+                        <span className="text-[10px] font-semibold text-violet-600 dark:text-violet-400 shrink-0">
+                            병합
+                        </span>
+                        {mergeSourceList.map((s) => (
+                            <button
+                                key={s.index}
+                                type="button"
+                                onClick={() => handleLegendClick(s.index)}
+                                className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 cursor-pointer shrink-0"
+                                title={`${s.path} — 클릭하면 이 원본 탭으로 이동`}
+                            >
+                                <span
+                                    className="w-2 h-2 rounded-full shrink-0"
+                                    style={{
+                                        backgroundColor: mergeSourceColor(
+                                            s.index,
+                                        ),
+                                    }}
+                                />
+                                <span className="font-medium">
+                                    {mergeShortName(s.path)}
+                                </span>
+                                <span className="text-zinc-400 dark:text-zinc-500">
+                                    {s.lineCount.toLocaleString("ko-KR")}줄
+                                </span>
+                            </button>
+                        ))}
+                    </div>
                 )}
 
                 {/* 로테이션 안내 배너 (5초 후 자동 숨김) */}
@@ -2228,12 +2444,22 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 onTruncatedLineClick={handleTruncatedLineClick}
                                 onPinchZoom={onFontSizeAdjust}
                                 isActive={isActive}
-                                bookmarks={bookmarkLineMap}
-                                bookmarkMarkers={bookmarkMarkers}
-                                onBookmarkToggle={toggleBookmarkAt}
+                                bookmarks={
+                                    isMergeView ? undefined : bookmarkLineMap
+                                }
+                                bookmarkMarkers={
+                                    isMergeView ? undefined : bookmarkMarkers
+                                }
+                                onBookmarkToggle={
+                                    isMergeView ? undefined : toggleBookmarkAt
+                                }
                                 columns={columns}
                                 columnView={columnViewActive}
                                 onFieldFilter={handleFieldFilter}
+                                mergeSources={mergeChips}
+                                onJumpToSource={
+                                    isMergeView ? jumpToSource : undefined
+                                }
                             />
                             {isActive &&
                                 fullLinePanel !== null &&
@@ -2301,6 +2527,14 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             ? selectedRange.end - selectedRange.start + 1
                             : 0
                     }
+                    mergeSourceCount={
+                        isMergeView ? mergeSourceList.length : null
+                    }
+                    mergeSourcePaths={
+                        isMergeView
+                            ? mergeSourceList.map((s) => s.path)
+                            : undefined
+                    }
                 />
 
                 {/* 줄 번호 이동 모달 (Cmd+L) — 활성 탭에서만 표시 */}
@@ -2308,8 +2542,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     <GotoLineDialog
                         totalLines={lineCount}
                         indexing={indexProgress?.done !== true}
+                        mergeMode={file.source === "merge"}
                         onClose={() => setGotoLineOpen(false)}
                         onNavigate={handleGotoNavigate}
+                        onNavigateTime={handleGotoTime}
                     />
                 )}
 

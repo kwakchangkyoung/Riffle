@@ -25,6 +25,8 @@ import { FileTab } from "@/components/FileTab";
 import { TabBar, type TabMeta } from "@/components/TabBar";
 import { EmptyState } from "@/components/EmptyState";
 import { ShortcutsDialog } from "@/components/ShortcutsDialog";
+import { MergeDialog } from "@/components/MergeDialog";
+import { isMergePath, mergeTabTitle } from "@/lib/merge";
 import { RemoteOpenDialog } from "@/components/remote/RemoteOpenDialog";
 import {
     UpdateDialog,
@@ -206,6 +208,71 @@ export default function App() {
             updateTab(tabId, { tailOn });
         },
         [updateTab],
+    );
+
+    // ===== 로그 병합 (Phase 17) =====
+
+    // 로그 병합 대화상자 표시 여부 (⌘⇧M)
+    const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+
+    // 병합 가능한 탭 = 파일이 열려 있고 병합 뷰가 아닌 탭 (병합 탭은 원본이 될 수 없다)
+    const mergeableTabs = useMemo(
+        () => tabs.filter((t) => t.file !== null && t.file.source !== "merge"),
+        [tabs],
+    );
+
+    // 병합 대화상자 확인: 선택 순서대로 원본 id/이름을 모아 병합 탭을 만든다
+    const handleMergeConfirm = useCallback(
+        (tabIds: string[]) => {
+            const cur = tabsRef.current;
+            const files: { id: number; path: string }[] = [];
+            for (const tid of tabIds) {
+                const file = cur.find((t) => t.id === tid)?.file;
+                if (file !== null && file !== undefined) {
+                    files.push({ id: file.id, path: file.path });
+                }
+            }
+            if (files.length < 2 || files.length > 8) return;
+            const id = `tab-${++tabSeqRef.current}`;
+            commitTabs([
+                ...cur,
+                {
+                    id,
+                    // 실제 파일이 아닌 표시용 경로 — FileTab은 mergeSourceIds로 openMerge를 호출한다
+                    path: `merge://${id}`,
+                    file: null,
+                    progress: null,
+                    tailOn: false,
+                    title: mergeTabTitle(files.map((f) => f.path)),
+                    mergeSourceIds: files.map((f) => f.id),
+                },
+            ]);
+            activateTab(id);
+            setMergeDialogOpen(false);
+        },
+        [commitTabs, activateTab],
+    );
+
+    // 병합 탭 → 원본 탭 줄 이동 요청 (탭 id → 요청). key는 같은 줄 재요청도 구분하기 위한 순번
+    const [gotoRequests, setGotoRequests] = useState<
+        Record<string, { line: number; key: number }>
+    >({});
+    const gotoSeqRef = useRef(0);
+
+    // 병합 탭에서 원본 탭으로 이동: 탭을 찾거나(닫혀 있으면 다시 열고) 활성화한 뒤
+    // 해당 원본 줄로 이동시킨다 (이동 자체는 대상 FileTab이 gotoRequest를 받아 수행)
+    const handleJumpToSource = useCallback(
+        (path: string, line: number) => {
+            const ids = addTabsForPaths([path]);
+            const tid = ids[0];
+            gotoSeqRef.current += 1;
+            setGotoRequests((prev) => ({
+                ...prev,
+                [tid]: { line, key: gotoSeqRef.current },
+            }));
+            activateTab(tid);
+        },
+        [addTabsForPaths, activateTab],
     );
 
     // ===== 전역 상태 =====
@@ -468,6 +535,7 @@ export default function App() {
     }, [addTabsForPaths, activateTab, openPaths]);
 
     // 탭 목록/활성 탭 변경을 500ms 디바운스로 세션에 저장한다.
+    // 병합 탭은 재현할 수 없으므로 세션에 저장하지 않는다 (원본 탭만 저장).
     // 진행률 같은 표시용 필드 변경은 키에 포함하지 않아 저장을 유발하지 않는다.
     const sessionKey = useMemo(
         () =>
@@ -481,8 +549,15 @@ export default function App() {
         if (!sessionReady) return;
         const timer = setTimeout(() => {
             const cur = tabsRef.current;
-            const paths = cur.map((t) => t.file?.path ?? t.path);
-            const ai = cur.findIndex((t) => t.id === activeTabIdRef.current);
+            const restorable = cur.filter(
+                (t) =>
+                    t.mergeSourceIds === undefined &&
+                    !isMergePath(t.file?.path ?? t.path),
+            );
+            const paths = restorable.map((t) => t.file?.path ?? t.path);
+            const ai = restorable.findIndex(
+                (t) => t.id === activeTabIdRef.current,
+            );
             saveSession({
                 paths,
                 activeIndex: ai >= 0 ? ai : null,
@@ -504,12 +579,13 @@ export default function App() {
             });
     }, [tabs]);
 
-    // 창 제목: "활성 파일명 — Riffle"
+    // 창 제목: "활성 파일명 — Riffle" (병합 탭은 "병합: a.log + b.log" 제목)
     const windowTitle = useMemo(() => {
         const active = tabs.find((t) => t.id === activeTabId);
         const p =
             active !== undefined ? (active.file?.path ?? active.path) : null;
-        const name = p !== null ? p.split("/").pop() || p : null;
+        const name =
+            active?.title ?? (p !== null ? p.split("/").pop() || p : null);
         return name !== null ? `${name} — Riffle` : "Riffle";
     }, [tabs, activeTabId]);
     useEffect(() => {
@@ -532,6 +608,17 @@ export default function App() {
                 if (e.code === "KeyO") {
                     e.preventDefault();
                     setRemoteDialogOpen(true);
+                    return;
+                }
+                // Cmd+Shift+M: 로그 병합 대화상자 (병합 가능한 탭이 2개 이상일 때)
+                if (e.code === "KeyM") {
+                    e.preventDefault();
+                    const count = tabsRef.current.filter(
+                        (t) => t.file !== null && t.file.source !== "merge",
+                    ).length;
+                    if (count >= 2) {
+                        setMergeDialogOpen(true);
+                    }
                     return;
                 }
             }
@@ -583,6 +670,8 @@ export default function App() {
                 onClose={closeTab}
                 onReorder={reorderTabs}
                 onOpenDialog={() => void handleOpenDialog()}
+                mergeable={mergeableTabs.length >= 2}
+                onMergeClick={() => setMergeDialogOpen(true)}
             />
 
             {/* 탭 스택: 활성 탭만 표시, 나머지는 숨긴 채 마운트 유지(백그라운드 작업 계속) */}
@@ -600,12 +689,15 @@ export default function App() {
                         key={tab.id}
                         tabId={tab.id}
                         path={tab.path}
+                        mergeSourceIds={tab.mergeSourceIds ?? null}
                         isActive={tab.id === activeTabId}
                         fontSize={fontSize}
                         onFileInfo={handleTabFileInfo}
                         onProgress={handleTabProgress}
                         onTailChange={handleTabTailChange}
                         onFontSizeAdjust={adjustFontSize}
+                        onJumpToSource={handleJumpToSource}
+                        gotoRequest={gotoRequests[tab.id] ?? null}
                     />
                 ))
             )}
@@ -624,6 +716,15 @@ export default function App() {
                 <RemoteOpenDialog
                     onClose={() => setRemoteDialogOpen(false)}
                     onOpenPaths={(paths) => openPaths(paths)}
+                />
+            )}
+
+            {/* 로그 병합 모달 (⌘⇧M / 탭 바 "병합…") */}
+            {mergeDialogOpen && (
+                <MergeDialog
+                    tabs={mergeableTabs}
+                    onClose={() => setMergeDialogOpen(false)}
+                    onMerge={handleMergeConfirm}
                 />
             )}
 

@@ -34,6 +34,8 @@ interface StatusBarProps {
     tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
     copying?: boolean; // 줄 범위 복사 진행 중 여부
     selectionLines?: number; // 줄 단위 선택된 줄 수 (0이면 미표시)
+    mergeSourceCount?: number | null; // 병합 뷰: 원본 개수 (병합 탭이 아니면 null/미지정)
+    mergeSourcePaths?: string[]; // 병합 뷰: 원본 경로 목록 (툴팁용)
 }
 
 /**
@@ -55,6 +57,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         tailPaused,
         copying,
         selectionLines = 0,
+        mergeSourceCount = null,
+        mergeSourcePaths,
     }) => {
         if (!file) {
             return (
@@ -79,12 +83,20 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                 : "-"
             : normalCurrentLine.toLocaleString("ko-KR");
 
-        // 인덱싱/압축 해제 진행률 텍스트
+        // 병합 뷰 여부 (file.source가 "merge"인 가상 파일)
+        const isMergeView = file.source === "merge";
+
+        // 인덱싱/압축 해제/병합 구축 진행률 텍스트
         let progressText = "";
         let progressTitle = "인덱싱 진행률";
+        if (isMergeView) {
+            progressTitle = "병합 구축 진행률";
+        }
         if (indexProgress) {
             if (indexProgress.done) {
-                progressText = "인덱싱 완료 (100%)";
+                progressText = isMergeView
+                    ? "병합 구축 완료 (100%)"
+                    : "인덱싱 완료 (100%)";
             } else if (indexProgress.decompressing) {
                 progressTitle = "압축 해제 진행률";
                 if (indexProgress.totalBytes > 0) {
@@ -102,9 +114,11 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                     (indexProgress.indexedBytes / indexProgress.totalBytes) *
                     100
                 ).toFixed(1);
-                progressText = `인덱싱 중 ${pct}%`;
+                progressText = isMergeView
+                    ? `병합 구축 중 ${pct}%`
+                    : `인덱싱 중 ${pct}%`;
             } else {
-                progressText = "인덱싱 중...";
+                progressText = isMergeView ? "병합 구축 중..." : "인덱싱 중...";
             }
         }
 
@@ -143,11 +157,34 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
         return (
             <footer className="h-7 shrink-0 px-3 flex items-center justify-between text-xs bg-zinc-100 dark:bg-zinc-900 border-t border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 select-none font-mono">
-                {/* 좌측: 파일 경로 */}
+                {/* 좌측: 파일 경로 (병합 뷰는 원본 개수) */}
                 <div className="flex items-center space-x-2 truncate mr-4">
-                    <span className="truncate" title={file.path}>
-                        {file.path}
-                    </span>
+                    {isMergeView ? (
+                        <>
+                            <span
+                                className="px-1.5 py-0.2 rounded bg-violet-100 dark:bg-violet-900/60 text-violet-700 dark:text-violet-300 font-semibold text-[10px] shrink-0"
+                                title={
+                                    mergeSourcePaths?.join("\n") ?? "병합 뷰"
+                                }
+                            >
+                                병합
+                            </span>
+                            <span
+                                className="truncate"
+                                title={
+                                    mergeSourcePaths?.join("\n") ??
+                                    "여러 로그의 시간순 병합 뷰 (스냅샷)"
+                                }
+                            >
+                                병합: 원본 {mergeSourceCount ?? 0}개 · 병합 시점
+                                스냅샷
+                            </span>
+                        </>
+                    ) : (
+                        <span className="truncate" title={file.path}>
+                            {file.path}
+                        </span>
+                    )}
                     {remoteHost !== null && (
                         <span
                             className="px-1.5 py-0.2 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 font-semibold text-[10px] shrink-0"

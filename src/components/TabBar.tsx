@@ -5,14 +5,18 @@ import { remoteHostOf, s3BucketOf } from "@/lib/remote";
 /** App이 관리하는 탭 메타데이터 (TabBar 표시용) */
 export interface TabMeta {
     id: string;
-    /** 사용자가 요청한 경로 (openFile 인자) */
+    /** 사용자가 요청한 경로 (openFile 인자). 병합 탭은 "merge://<tabId>" */
     path: string;
     /** Rust가 canonicalize한 경로를 포함한 파일 정보 (열리기 전 null) */
     file: FileInfo | null;
-    /** 인덱싱/해제 진행률 (탭 진행률 바용) */
+    /** 인덱싱/해제/병합 구축 진행률 (탭 진행률 바용) */
     progress: IndexProgress | null;
     /** tail 모드 활성 여부 (탭 표시용) */
     tailOn: boolean;
+    /** 탭 표시 이름 (병합 탭 "병합: a.log + b.log"). 없으면 경로 basename */
+    title?: string;
+    /** 병합 탭이면 원본 파일 id 목록 (이 필드가 있으면 openMerge로 연다) */
+    mergeSourceIds?: number[];
 }
 
 interface TabBarProps {
@@ -23,6 +27,9 @@ interface TabBarProps {
     /** HTML5 드래그 앤 드롭 순서 변경 (from 인덱스의 탭을 to 위치로 이동) */
     onReorder: (from: number, to: number) => void;
     onOpenDialog: () => void;
+    /** 병합 대화상자 열기 (병합 가능한 탭이 2개 미만이면 비활성) */
+    mergeable: boolean;
+    onMergeClick: () => void;
 }
 
 /** 진행률 퍼센트. 완료/미시작/크기 미상이면 null (바를 표시하지 않음) */
@@ -31,8 +38,9 @@ function progressPct(p: IndexProgress | null): number | null {
     return Math.min(100, (p.indexedBytes / p.totalBytes) * 100);
 }
 
-/** 탭에 표시할 파일 이름 (해석된 경로 우선, 없으면 요청 경로) */
+/** 탭에 표시할 파일 이름 (명시 제목 우선, 없으면 경로 basename) */
 function tabName(tab: TabMeta): string {
+    if (tab.title !== undefined) return tab.title;
     const p = tab.file?.path ?? tab.path;
     return p.split("/").pop() || p;
 }
@@ -48,6 +56,8 @@ export const TabBar: React.FC<TabBarProps> = ({
     onClose,
     onReorder,
     onOpenDialog,
+    mergeable,
+    onMergeClick,
 }) => {
     const [dragIndex, setDragIndex] = useState<number | null>(null);
 
@@ -74,9 +84,12 @@ export const TabBar: React.FC<TabBarProps> = ({
                     const active = tab.id === activeId;
                     const pct = progressPct(tab.progress);
                     const fullPath = tab.file?.path ?? tab.path;
-                    // 원격 탭 배지: sftp는 호스트, s3는 s3:버킷을 표시한다
-                    const remoteHost = remoteHostOf(fullPath);
-                    const s3Bucket = s3BucketOf(fullPath);
+                    // 병합 탭 배지와 원격 탭 배지(sftp 호스트, s3 버킷)
+                    const isMerge =
+                        tab.mergeSourceIds !== undefined ||
+                        tab.file?.source === "merge";
+                    const remoteHost = isMerge ? null : remoteHostOf(fullPath);
+                    const s3Bucket = isMerge ? null : s3BucketOf(fullPath);
                     return (
                         <div
                             key={tab.id}
@@ -113,6 +126,14 @@ export const TabBar: React.FC<TabBarProps> = ({
                                     : "text-zinc-500 dark:text-zinc-400 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60"
                             } ${dragIndex === i ? "opacity-40" : ""}`}
                         >
+                            {isMerge && (
+                                <span
+                                    className="mr-1.5 text-[9px] font-bold px-1 py-px rounded bg-violet-100 dark:bg-violet-900/60 text-violet-700 dark:text-violet-300 shrink-0"
+                                    title="여러 로그의 시간순 병합 뷰"
+                                >
+                                    merge
+                                </span>
+                            )}
                             {tab.file?.compressed === true && (
                                 <span
                                     className="mr-1.5 text-[9px] font-bold px-1 py-px rounded border border-zinc-300 dark:border-zinc-600 text-zinc-400 dark:text-zinc-500 shrink-0"
@@ -170,6 +191,28 @@ export const TabBar: React.FC<TabBarProps> = ({
                     );
                 })}
             </div>
+
+            {/* 로그 병합 버튼 (병합 가능한 탭이 2개 이상일 때만 활성) */}
+            <button
+                type="button"
+                onClick={onMergeClick}
+                disabled={!mergeable}
+                title={
+                    mergeable
+                        ? "열린 탭 2~8개를 타임스탬프 순으로 병합합니다"
+                        : "병합하려면 파일이 2개 이상 열려 있어야 합니다"
+                }
+                className={`mr-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 shrink-0 ${
+                    mergeable
+                        ? "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
+                        : "bg-zinc-50 text-zinc-400 dark:bg-zinc-900 dark:text-zinc-600 cursor-not-allowed"
+                }`}
+            >
+                <span>병합…</span>
+                <kbd className="text-[10px] px-1 py-0.5 rounded bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400 font-mono">
+                    ⌘⇧M
+                </kbd>
+            </button>
 
             {/* 파일 열기 버튼 */}
             <button

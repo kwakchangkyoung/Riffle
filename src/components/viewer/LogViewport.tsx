@@ -16,6 +16,7 @@ import {
 } from "./columnLayout";
 import { Gutter } from "./Gutter";
 import { Scrollbar } from "./Scrollbar";
+import { MergeChipColumn, type MergeChipInfo } from "./MergeChipColumn";
 
 const OVERSCAN = 3; // 뷰포트 위아래 추가 렌더링 행 수
 
@@ -185,6 +186,8 @@ interface LogViewportProps {
     columns?: Columns | null; // 감지된 컬럼 정보 (plain이면 null 또는 format "plain")
     columnView?: boolean; // 컬럼 뷰 모드 여부
     onFieldFilter?: (field: string, value: string, kind: RuleKind) => void; // 셀 우클릭 필드 필터 추가
+    mergeSources?: MergeChipInfo[]; // 병합 뷰 원본 칩 정보 (비어 있지 않으면 원본 칩 열 표시)
+    onJumpToSource?: (sourceIndex: number, sourceLine: number) => void; // 병합 행/칩 → 원본 탭 이동
 }
 
 /**
@@ -219,6 +222,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         columns = null,
         columnView = false,
         onFieldFilter,
+        mergeSources,
+        onJumpToSource,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyWrapRef = useRef<HTMLDivElement>(null);
@@ -232,6 +237,9 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         // 컬럼 뷰 활성 여부: 토글이 켜져 있고 형식이 plain이 아닐 때만
         const colViewActive =
             columnView && columns !== null && columns.format !== "plain";
+
+        // 병합 뷰 여부: 원본 칩 정보가 있으면 원본 칩 열을 표시한다
+        const mergeView = mergeSources !== undefined && mergeSources.length > 0;
 
         // 본문 영역(헤더 아래) 크기 관찰 — 컬럼 헤더 높이는 행 수 계산에서 제외된다
         useEffect(() => {
@@ -644,6 +652,16 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 <div
                     key={index}
                     onDoubleClick={() => {
+                        // 병합 뷰: 더블클릭은 원본 탭의 같은 줄로 이동 (모든 보기 모드)
+                        if (
+                            line !== undefined &&
+                            line.sourceLine !== null &&
+                            line.sourceLine !== undefined &&
+                            onJumpToSource !== undefined
+                        ) {
+                            onJumpToSource(line.source ?? 0, line.sourceLine);
+                            return;
+                        }
                         if (isFilterMode && line && onLineDoubleClick) {
                             onLineDoubleClick(line.no);
                         } else if (
@@ -773,7 +791,23 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                         onTruncatedClick={onTruncatedLineClick}
                         bookmarks={bookmarks}
                         onBookmarkToggle={onBookmarkToggle}
+                        mergeMode={mergeView}
                     />
+
+                    {/* 병합 뷰: 원본 표시 칩 열 (거터 옆 고정 폭) */}
+                    {mergeView && (
+                        <MergeChipColumn
+                            startLine={renderStart}
+                            rowCount={rowCount}
+                            translateY={translateY}
+                            rowHeight={rowHeight}
+                            fontSize={fontSize}
+                            getLine={getLineCallback}
+                            cacheVersion={cacheVersion}
+                            sources={mergeSources}
+                            onJumpToSource={onJumpToSource}
+                        />
+                    )}
 
                     {/* 본문 영역 (가로 스크롤 가능) */}
                     <div

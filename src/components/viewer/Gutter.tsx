@@ -22,6 +22,7 @@ interface GutterProps {
     onTruncatedClick?: (lineNo: number) => void; // 잘린 줄 아이콘 클릭 (실제 파일 줄 번호)
     bookmarks?: Map<number, string>; // 북마크: 실제 파일 줄 번호(0-based) → 색상
     onBookmarkToggle?: (lineNo: number) => void; // 거터 우클릭/Option+클릭 북마크 토글 (실제 파일 줄 번호)
+    mergeMode?: boolean; // 병합 뷰: 줄 번호 대신 원본 줄 번호(sourceLine)를 표시
 }
 
 /**
@@ -42,6 +43,7 @@ export const Gutter: React.FC<GutterProps> = React.memo(
         onTruncatedClick,
         bookmarks,
         onBookmarkToggle,
+        mergeMode = false,
     }) => {
         // 전체 줄 수의 자릿수에 비례하여 폭 계산 (최소 4글자 폭 확보)
         // 모노스페이스 글자 폭은 폰트 크기의 약 0.6em이므로 fontSize에 연동한다
@@ -84,8 +86,21 @@ export const Gutter: React.FC<GutterProps> = React.memo(
             const index = startLine + i;
             const line = getLine ? getLine(index) : undefined;
             let displayNo: number | string;
+            let rowTitle: string | undefined;
 
-            if (isFilterMode) {
+            if (mergeMode) {
+                // 병합 뷰: 원본 줄 번호(1-based) 표시, 툴팁은 병합 위치
+                if (
+                    line !== undefined &&
+                    line.sourceLine !== null &&
+                    line.sourceLine !== undefined
+                ) {
+                    displayNo = line.sourceLine + 1;
+                    rowTitle = `병합 위치 ${(line.no + 1).toLocaleString("ko-KR")}`;
+                } else {
+                    displayNo = "";
+                }
+            } else if (isFilterMode) {
                 // 인덱스 기반 보기: 원본 파일의 실제 줄 번호(1-based) 표시
                 displayNo = line !== undefined ? line.no + 1 : "";
             } else {
@@ -135,7 +150,7 @@ export const Gutter: React.FC<GutterProps> = React.memo(
                         e.preventDefault();
                         onBookmarkToggle(actualNo);
                     }}
-                    title={showHint ? HINT_TEXT : undefined}
+                    title={rowTitle ?? (showHint ? HINT_TEXT : undefined)}
                     className={`relative pr-3 text-right font-mono select-none ${
                         selectable ? "cursor-pointer" : ""
                     } ${

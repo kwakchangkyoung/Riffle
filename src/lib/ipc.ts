@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
-/** 파일을 연 소스 종류 */
-export type FileSource = "local" | "sftp" | "s3";
+/** 파일을 연 소스 종류 ("merge"는 병합 가상 뷰, Phase 17) */
+export type FileSource = "local" | "sftp" | "s3" | "merge";
 
 export interface FileInfo {
     id: number;
@@ -126,6 +126,10 @@ export interface Line {
     ruleHighlights: [number, number, number][];
     /** 컬럼 뷰용 분할 값. withFields=true이고 형식이 plain이 아닐 때만 채워진다 */
     fields?: string[];
+    /** 병합 뷰에서 원본 순번 (병합 파일이 아니면 null) */
+    source?: number | null;
+    /** 병합 뷰에서 원본 줄 번호 (0-based, 병합 파일이 아니면 null) */
+    sourceLine?: number | null;
 }
 
 export type SearchEvent =
@@ -573,6 +577,52 @@ export function getS3Bookmarks(): Promise<string[]> {
  */
 export function setS3Bookmarks(items: string[]): Promise<void> {
     return invoke<void>("set_s3_bookmarks", { items });
+}
+
+// ===== 로그 시간순 병합 (Phase 17) =====
+
+/** 병합 원본 정보 (Rust MergeSourceDto와 1:1, camelCase) */
+export interface MergeSource {
+    /** 원본 순번 (병합 대화상자의 선택 순서 = 동시각 우선순위) */
+    index: number;
+    /** 원본 파일 경로 또는 원격 URI */
+    path: string;
+    /** 병합 시점 스냅샷의 원본 줄 수 */
+    lineCount: number;
+}
+
+/**
+ * 열려 있는 파일 2~8개를 타임스탬프 기준으로 섞은 가상 병합 파일을 엽니다.
+ * 반환된 FileInfo.path는 "merge://<id>"이고 source는 "merge"입니다.
+ * localOffsetMinutes는 JS getTimezoneOffset()의 부호를 반전해 넘깁니다
+ * (로컬 시각 = UTC + offset).
+ */
+export function openMerge(
+    sourceIds: number[],
+    onProgress: (p: IndexProgress) => void,
+): Promise<FileInfo> {
+    const channel = new Channel<IndexProgress>();
+    channel.onmessage = onProgress;
+    return invoke<FileInfo>("open_merge", {
+        sourceIds,
+        localOffsetMinutes: -new Date().getTimezoneOffset(),
+        onProgress: channel,
+    });
+}
+
+/**
+ * 병합 뷰에서 유효 타임스탬프가 tsMs 이상인 첫 병합 위치를 조회합니다.
+ * 없으면 병합 줄 수(끝 위치)를 반환합니다.
+ */
+export function mergePositionAtTime(id: number, tsMs: number): Promise<number> {
+    return invoke<number>("merge_position_at_time", { id, tsMs });
+}
+
+/**
+ * 병합 파일의 원본 목록(순번, 경로, 스냅샷 줄 수)을 조회합니다.
+ */
+export function mergeSources(id: number): Promise<MergeSource[]> {
+    return invoke<MergeSource[]>("merge_sources", { id });
 }
 
 // ===== 줄 북마크 (Phase 15) =====
