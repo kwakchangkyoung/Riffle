@@ -4,12 +4,14 @@ import {
     listFilterPresets,
     saveFilterPreset,
     validateFilter,
+    type Columns,
     type FilterPreset,
     type FilterRule,
     type FilterSpec,
     type LevelName,
     type RuleKind,
 } from "@/lib/ipc";
+import { pickRuleColor } from "@/lib/ruleColor";
 
 interface FilterBarProps {
     spec: FilterSpec;
@@ -18,6 +20,10 @@ interface FilterBarProps {
     focusSignal?: number;
     /** 활성 탭 여부 — false이면 Cmd+Shift+F 포커스 단축키를 무시한다 */
     isActive?: boolean;
+    /** 열린 파일 ID — 필드 규칙의 컬럼명 검증(validate_filter)에 사용 */
+    fileId?: number | null;
+    /** 감지된 컬럼 정보 — 있으면 규칙 입력에 "필드" 선택 드롭다운을 표시한다 */
+    columns?: Columns | null;
 }
 
 /** 레벨 칩 정의. 색은 LogViewport의 로그 레벨 색상과 동일하게 맞춘다 */
@@ -62,6 +68,8 @@ interface DraftRule {
     regex: boolean;
     caseSensitive: boolean;
     kind: RuleKind;
+    /** 필드 필터 대상 컬럼 이름 (null이면 줄 전체) */
+    field: string | null;
 }
 
 const EMPTY_DRAFT: DraftRule = {
@@ -69,6 +77,7 @@ const EMPTY_DRAFT: DraftRule = {
     regex: false,
     caseSensitive: false,
     kind: "include",
+    field: null,
 };
 
 /**
@@ -76,7 +85,7 @@ const EMPTY_DRAFT: DraftRule = {
  * 레벨 칩, 규칙 칩(추가/수정/삭제/색상), AND/OR 전환, 프리셋 관리를 담당한다.
  */
 export const FilterBar: React.FC<FilterBarProps> = React.memo(
-    ({ spec, onSpecChange, focusSignal, isActive = true }) => {
+    ({ spec, onSpecChange, focusSignal, isActive = true, fileId, columns }) => {
         const ruleInputRef = useRef<HTMLInputElement>(null);
 
         const [draft, setDraft] = useState<DraftRule>(EMPTY_DRAFT);
@@ -108,6 +117,7 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                         regex: d.regex,
                         caseSensitive: d.caseSensitive,
                         kind: d.kind,
+                        field: d.field,
                     };
                     return {
                         ...spec,
@@ -116,34 +126,32 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                         ),
                     };
                 }
-                const used = new Set(spec.rules.map((r) => r.color));
-                const color =
-                    PALETTE.find((c) => !used.has(c)) ??
-                    PALETTE[spec.rules.length % PALETTE.length];
                 const rule: FilterRule = {
                     pattern: d.pattern,
                     regex: d.regex,
                     caseSensitive: d.caseSensitive,
                     kind: d.kind,
                     enabled: true,
-                    color,
+                    color: pickRuleColor(spec.rules),
+                    field: d.field,
                 };
                 return { ...spec, rules: [...spec.rules, rule] };
             },
             [spec, editingIndex],
         );
 
-        // 정규식 입력 중 실시간 유효성 검사 (리터럴은 항상 유효)
+        // 정규식·필드 선택 중 실시간 유효성 검사 (리터럴 줄 규칙은 항상 유효).
+        // 필드 규칙은 컬럼명 존재 여부도 검증되므로 fileId를 함께 넘긴다.
         const validateSeqRef = useRef(0);
         useEffect(() => {
             const candidate = buildCandidate(draft);
-            if (!draft.regex || candidate === null) {
+            if ((!draft.regex && draft.field === null) || candidate === null) {
                 setInputError(null);
                 return;
             }
             const seq = ++validateSeqRef.current;
             const timer = setTimeout(() => {
-                validateFilter(candidate)
+                validateFilter(fileId ?? null, candidate)
                     .then(() => {
                         if (validateSeqRef.current === seq) {
                             setInputError(null);
@@ -156,12 +164,12 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                                 ? err
                                 : err instanceof Error
                                   ? err.message
-                                  : "잘못된 정규식입니다.";
+                                  : "잘못된 규칙입니다.";
                         setInputError(msg);
                     });
             }, 300);
             return () => clearTimeout(timer);
-        }, [draft, buildCandidate]);
+        }, [draft, buildCandidate, fileId]);
 
         const resetDraft = useCallback(() => {
             setDraft(EMPTY_DRAFT);
@@ -173,16 +181,16 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
         const submitDraft = useCallback(async () => {
             const candidate = buildCandidate(draft);
             if (candidate === null) return;
-            if (draft.regex) {
+            if (draft.regex || draft.field !== null) {
                 try {
-                    await validateFilter(candidate);
+                    await validateFilter(fileId ?? null, candidate);
                 } catch (err) {
                     const msg =
                         typeof err === "string"
                             ? err
                             : err instanceof Error
                               ? err.message
-                              : "잘못된 정규식입니다.";
+                              : "잘못된 규칙입니다.";
                     setInputError(msg);
                     return;
                 }
@@ -191,11 +199,9 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
             onSpecChange(candidate);
             resetDraft();
             ruleInputRef.current?.focus();
-        }, [buildCandidate, draft, onSpecChange, resetDraft]);
+        }, [buildCandidate, draft, onSpecChange, resetDraft, fileId]);
 
-        const handleDraftKeyDown = (
-            e: React.KeyboardEvent<HTMLInputElement>,
-        ) => {
+        const handleDraftKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
             if (e.key === "Enter") {
                 e.preventDefault();
                 void submitDraft();
@@ -341,6 +347,7 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                     regex: rule.regex,
                     caseSensitive: rule.caseSensitive,
                     kind: rule.kind,
+                    field: rule.field ?? null,
                 });
                 setEditingIndex(index);
                 setInputError(null);
@@ -458,6 +465,10 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                                         rule.kind === "exclude"
                                             ? "제외 규칙"
                                             : "포함 규칙"
+                                    }${
+                                        rule.field != null && rule.field !== ""
+                                            ? ` [필드: ${rule.field}]`
+                                            : ""
                                     }${rule.regex ? " (정규식)" : ""}${
                                         rule.caseSensitive
                                             ? " (대소문자 구분)"
@@ -465,6 +476,12 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                                     } — 클릭 토글, 더블클릭 편집`}
                                 >
                                     {rule.kind === "exclude" && "−"}
+                                    {rule.field != null &&
+                                        rule.field !== "" && (
+                                            <span className="text-blue-600 dark:text-blue-400 shrink-0">
+                                                {rule.field}=
+                                            </span>
+                                        )}
                                     <span
                                         className={
                                             rule.kind === "exclude"
@@ -539,6 +556,38 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
                                     </button>
                                 )}
                         </div>
+
+                        {/* 필드 선택 드롭다운: 컬럼이 감지된 파일에서만 표시 (전체 줄 / 각 컬럼) */}
+                        {columns !== null &&
+                            columns !== undefined &&
+                            columns.names.length > 0 && (
+                                <select
+                                    value={draft.field ?? ""}
+                                    onChange={(e) =>
+                                        setDraft((d) => ({
+                                            ...d,
+                                            field:
+                                                e.target.value === ""
+                                                    ? null
+                                                    : e.target.value,
+                                        }))
+                                    }
+                                    onKeyDown={handleDraftKeyDown}
+                                    className={`h-6 px-1 text-[10px] font-mono bg-white dark:bg-zinc-900 border rounded focus:outline-none text-zinc-700 dark:text-zinc-300 cursor-pointer max-w-32 ${
+                                        draft.field !== null
+                                            ? "border-blue-500 text-blue-600 dark:text-blue-400"
+                                            : "border-zinc-300 dark:border-zinc-700"
+                                    }`}
+                                    title="필드 — 규칙을 특정 컬럼 값에만 적용합니다"
+                                >
+                                    <option value="">전체 줄</option>
+                                    {columns.names.map((name) => (
+                                        <option key={name} value={name}>
+                                            {name}
+                                        </option>
+                                    ))}
+                                </select>
+                            )}
 
                         {/* 정규식 토글 (.*) */}
                         <button

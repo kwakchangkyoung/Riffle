@@ -44,6 +44,8 @@ export interface FilterRule {
     enabled: boolean;
     /** 규칙 하이라이트 색상 (#rrggbb). Rust는 판정에 사용하지 않고 프리셋 저장용으로만 보관한다 */
     color: string;
+    /** 지정된 컬럼 값에만 규칙을 적용한다 (없으면 줄 전체). 컬럼 이름은 detectColumns 결과의 names */
+    field?: string | null;
 }
 
 export interface FilterSpec {
@@ -59,9 +61,14 @@ export interface FilterPreset {
 
 /**
  * 필터 스펙의 정규식 유효성을 검사합니다.
+ * spec에 필드 규칙이 있으면 id 파일의 감지된 컬럼으로 컬럼명도 검증합니다
+ * (id가 null이면 컬럼 없음으로 간주해 필드 규칙은 무효 에러가 됩니다).
  */
-export function validateFilter(spec: FilterSpec): Promise<void> {
-    return invoke<void>("validate_filter", { spec });
+export function validateFilter(
+    id: number | null,
+    spec: FilterSpec,
+): Promise<void> {
+    return invoke<void>("validate_filter", { id, spec });
 }
 
 /**
@@ -117,6 +124,8 @@ export interface Line {
     highlights: [number, number][];
     /** 필터 규칙 하이라이트 [UTF-16 시작, UTF-16 끝, spec.rules 인덱스] */
     ruleHighlights: [number, number, number][];
+    /** 컬럼 뷰용 분할 값. withFields=true이고 형식이 plain이 아닐 때만 채워진다 */
+    fields?: string[];
 }
 
 export type SearchEvent =
@@ -222,6 +231,7 @@ export function searchDensity(
 
 /**
  * 지정된 파일의 특정 범위 줄들을 가져옵니다.
+ * withFields=true이고 파일 형식이 plain이 아니면 각 줄의 fields에 컬럼 분할 값이 채워집니다.
  */
 export function getLines(
     id: number,
@@ -229,6 +239,7 @@ export function getLines(
     count: number,
     query?: QueryOptions | null,
     spec?: FilterSpec | null,
+    withFields?: boolean,
 ): Promise<Line[]> {
     return invoke<Line[]>("get_lines", {
         id,
@@ -236,11 +247,13 @@ export function getLines(
         count,
         query: query ?? null,
         spec: spec ?? null,
+        withFields: withFields ?? null,
     });
 }
 
 /**
  * 필터 모드: 검색 결과 목록의 특정 구간에 해당하는 줄들을 조회합니다.
+ * withFields=true이고 파일 형식이 plain이 아니면 각 줄의 fields에 컬럼 분할 값이 채워집니다.
  */
 export function getFilteredLines(
     id: number,
@@ -249,6 +262,7 @@ export function getFilteredLines(
     count: number,
     query?: QueryOptions | null,
     spec?: FilterSpec | null,
+    withFields?: boolean,
 ): Promise<Line[]> {
     return invoke<Line[]>("get_filtered_lines", {
         id,
@@ -257,11 +271,13 @@ export function getFilteredLines(
         count,
         query: query ?? null,
         spec: spec ?? null,
+        withFields: withFields ?? null,
     });
 }
 
 /**
  * 필터 결과 목록의 특정 구간에 해당하는 줄들을 조회합니다.
+ * withFields=true이고 파일 형식이 plain이 아니면 각 줄의 fields에 컬럼 분할 값이 채워집니다.
  */
 export function getFilterLines(
     id: number,
@@ -270,6 +286,7 @@ export function getFilterLines(
     count: number,
     query?: QueryOptions | null,
     spec?: FilterSpec | null,
+    withFields?: boolean,
 ): Promise<Line[]> {
     return invoke<Line[]>("get_filter_lines", {
         id,
@@ -278,6 +295,7 @@ export function getFilterLines(
         count,
         query: query ?? null,
         spec: spec ?? null,
+        withFields: withFields ?? null,
     });
 }
 
@@ -318,6 +336,30 @@ export function setTail(
  */
 export function closeFile(id: number): Promise<void> {
     return invoke<void>("close_file", { id });
+}
+
+// ===== 컬럼 뷰 (CSV / JSON Lines, Phase 16) =====
+
+/**
+ * 파일의 컬럼 정보 (Rust ColumnsDto와 1:1, camelCase).
+ * format이 "plain"이면 구조화된 형식이 아니므로 names는 빈 배열입니다.
+ */
+export interface Columns {
+    /** 감지된 형식: "plain" | "csv" | "jsonl" */
+    format: "plain" | "csv" | "jsonl";
+    /** CSV 구분자 문자 (plain/jsonl이면 null) */
+    delimiter: string | null;
+    /** CSV 첫 줄이 헤더로 감지됐는지 여부 */
+    hasHeader: boolean;
+    /** 컬럼 이름 목록 (표시 순서) */
+    names: string[];
+}
+
+/**
+ * 파일의 컬럼 정보를 조회합니다 (형식 감지, 파일별 캐시).
+ */
+export function detectColumns(id: number): Promise<Columns> {
+    return invoke<Columns>("detect_columns", { id });
 }
 
 export interface CopyResult {
@@ -531,4 +573,41 @@ export function getS3Bookmarks(): Promise<string[]> {
  */
 export function setS3Bookmarks(items: string[]): Promise<void> {
     return invoke<void>("set_s3_bookmarks", { items });
+}
+
+// ===== 줄 북마크 (Phase 15) =====
+
+/** 파일의 한 줄에 붙는 북마크 (Rust BookmarkDto와 1:1, camelCase) */
+export interface Bookmark {
+    /** 0-based 줄 번호 */
+    line: number;
+    /** 메모 */
+    note: string;
+    /** 표시 색상 ("#rrggbb") */
+    color: string;
+    /** 생성 시각 (unix 초) */
+    createdAt: number;
+}
+
+/** 북마크 조회 결과 */
+export interface Bookmarks {
+    items: Bookmark[];
+    /** 저장 이후 파일 내용이 바뀌어 북마크 위치가 어긋났을 수 있음 */
+    stale: boolean;
+}
+
+/**
+ * 열린 파일의 북마크 목록을 조회합니다.
+ * 저장된 파일 지문과 현재 지문이 다르면 stale=true로 반환됩니다.
+ */
+export function getBookmarks(id: number): Promise<Bookmarks> {
+    return invoke<Bookmarks>("get_bookmarks", { id });
+}
+
+/**
+ * 열린 파일의 북마크 목록을 저장합니다.
+ * 빈 목록이면 해당 파일의 북마크 항목을 삭제합니다.
+ */
+export function setBookmarks(id: number, items: Bookmark[]): Promise<void> {
+    return invoke<void>("set_bookmarks", { id, items });
 }

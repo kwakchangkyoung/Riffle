@@ -131,6 +131,16 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
         true,
         &[
             &MenuItem::with_id(app, "toggle_tail", "Tail 모드", true, Some("CmdOrCtrl+T"))?,
+            // WKWebView가 ⌘⇧C를 웹 인스펙터 단축키로 가로채 keydown이 도달하지
+            // 않으므로 컬럼 보기 토글은 네이티브 메뉴 accelerator로 처리한다.
+            // 컬럼 형식이 아닌 탭에서의 토글은 프론트가 무시한다.
+            &MenuItem::with_id(
+                app,
+                "toggle_columns",
+                "컬럼 보기",
+                true,
+                Some("CmdOrCtrl+Shift+C"),
+            )?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "font_inc", "글자 크게", true, Some("CmdOrCtrl+="))?,
             &MenuItem::with_id(app, "font_dec", "글자 작게", true, Some("CmdOrCtrl+-"))?,

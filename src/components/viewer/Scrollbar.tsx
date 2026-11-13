@@ -6,6 +6,8 @@ interface ScrollbarProps {
     visibleRows: number;
     onScroll: (topLine: number) => void;
     densityBins?: number[];
+    /** 북마크 위치 마커 (실제 파일 줄 번호와 색상). 인덱스 기반 보기에서는 전달하지 않는다 */
+    bookmarkMarkers?: { line: number; color: string }[];
     onTrackHeightChange?: (height: number) => void;
     onDraggingChange?: (dragging: boolean) => void; // 드래그 시작/종료 알림 (프리페치 제어용)
 }
@@ -21,6 +23,7 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
         visibleRows,
         onScroll,
         densityBins,
+        bookmarkMarkers,
         onTrackHeightChange,
         onDraggingChange,
     }) => {
@@ -236,6 +239,24 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                     ref={canvasRef}
                     className="absolute inset-0 pointer-events-none w-full h-full"
                 />
+
+                {/* 북마크 위치 마커: 밀도 캔버스와 구분되는 북마크 색의 작은 가로선 */}
+                {bookmarkMarkers !== undefined &&
+                    lineCount > 1 &&
+                    trackHeight > 0 &&
+                    bookmarkMarkers.map((m) => (
+                        <div
+                            key={m.line}
+                            className="absolute left-0.5 right-0.5 h-0.5 rounded-full pointer-events-none"
+                            style={{
+                                top: `${Math.min(
+                                    trackHeight - 2,
+                                    (m.line / (lineCount - 1)) * trackHeight,
+                                )}px`,
+                                backgroundColor: m.color,
+                            }}
+                        />
+                    ))}
 
                 {/* 스크롤바 Thumb */}
                 {canScroll && (

@@ -5,12 +5,25 @@ import React, {
     useRef,
     useState,
 } from "react";
-import type { FileInfo, Line } from "@/lib/ipc";
+import type { Columns, FileInfo, Line, RuleKind } from "@/lib/ipc";
 import type { LineCache } from "@/lib/lineCache";
+import { ColumnHeader, FieldFilterMenu, type CellMenu } from "./ColumnView";
+import {
+    estimateColWidths,
+    MIN_COL_WIDTH,
+    MONO_FONT_STACK,
+    useColumnLayout,
+} from "./columnLayout";
 import { Gutter } from "./Gutter";
 import { Scrollbar } from "./Scrollbar";
 
 const OVERSCAN = 3; // 뷰포트 위아래 추가 렌더링 행 수
+
+/** columns가 없을 때 useColumnLayout에 넘기는 공용 빈 배열 (참조 안정성용) */
+const EMPTY_NAMES: string[] = [];
+
+/** 컬럼 뷰가 꺼져 있을 때 기본 폭으로 넘기는 공용 빈 배열 (참조 안정성용) */
+const EMPTY_WIDTHS: number[] = [];
 
 /** 로그 레벨 토큰 탐색: 줄 앞 200자 안의 첫 번째 매치만 사용 */
 const LEVEL_TOKEN_RE = /\b(ERROR|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/;
@@ -166,6 +179,12 @@ interface LogViewportProps {
     onTruncatedLineClick?: (lineNo: number) => void; // 잘린 줄 표시 클릭 시 원문 줄 번호(0-based)
     onPinchZoom?: (delta: number) => void; // 트랙패드 핀치로 글자 크기 조절 (+1/-1 단계)
     isActive?: boolean; // 활성 탭 여부 — false이면 뷰어 단축키를 무시한다
+    bookmarks?: Map<number, string>; // 북마크: 실제 파일 줄 번호 → 색상 (거터 표시용)
+    bookmarkMarkers?: { line: number; color: string }[]; // 스크롤바 북마크 마커
+    onBookmarkToggle?: (lineNo: number) => void; // 거터 우클릭/Option+클릭 북마크 토글
+    columns?: Columns | null; // 감지된 컬럼 정보 (plain이면 null 또는 format "plain")
+    columnView?: boolean; // 컬럼 뷰 모드 여부
+    onFieldFilter?: (field: string, value: string, kind: RuleKind) => void; // 셀 우클릭 필드 필터 추가
 }
 
 /**
@@ -194,17 +213,30 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         onTruncatedLineClick,
         onPinchZoom,
         isActive = true,
+        bookmarks,
+        bookmarkMarkers,
+        onBookmarkToggle,
+        columns = null,
+        columnView = false,
+        onFieldFilter,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
+        const bodyWrapRef = useRef<HTMLDivElement>(null);
         const bodyScrollRef = useRef<HTMLDivElement>(null);
         const contentRef = useRef<HTMLDivElement>(null);
+        // 컬럼 헤더 내용 요소 — 본문 가로 스크롤과 transform으로 동기화한다
+        const headerContentRef = useRef<HTMLDivElement | null>(null);
 
         const [viewportHeight, setViewportHeight] = useState(0);
 
-        // 컨테이너 크기 관찰
+        // 컬럼 뷰 활성 여부: 토글이 켜져 있고 형식이 plain이 아닐 때만
+        const colViewActive =
+            columnView && columns !== null && columns.format !== "plain";
+
+        // 본문 영역(헤더 아래) 크기 관찰 — 컬럼 헤더 높이는 행 수 계산에서 제외된다
         useEffect(() => {
-            const container = containerRef.current;
-            if (!container) return;
+            const wrap = bodyWrapRef.current;
+            if (!wrap) return;
 
             const observer = new ResizeObserver((entries) => {
                 for (const entry of entries) {
@@ -213,7 +245,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                     onViewportHeightChange?.(h);
                 }
             });
-            observer.observe(container);
+            observer.observe(wrap);
             return () => observer.disconnect();
         }, [onViewportHeightChange]);
 
@@ -260,6 +292,107 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             intTopLine + Math.ceil(visibleRows) + OVERSCAN,
         );
         const rowCount = Math.max(0, renderEnd - renderStart);
+
+        // ===== 컬럼 뷰 =====
+
+        // 거터 폭 (Gutter.tsx의 계산식과 동일 — 헤더 왼쪽 여백을 본문 거터와 맞춘다)
+        const gutterDigits = Math.max(4, String(totalFileLines || 1).length);
+        const gutterWidth = Math.ceil((gutterDigits + 2) * fontSize * 0.6) + 16;
+
+        // 셀/헤더와 동일 클래스의 숨은 프로브에서 계산된 글꼴 단축값을 읽는다.
+        // ref 콜백은 커밋 후 실행되므로 프로브 장착 시 한 번 재렌더돼
+        // 실제 폰트로 추정을 다시 계산한다.
+        const [cellFont, setCellFont] = useState<string | null>(null);
+        const [headerFont, setHeaderFont] = useState<string | null>(null);
+        const cellProbeRef = useCallback((el: HTMLSpanElement | null) => {
+            if (el !== null) setCellFont(getComputedStyle(el).font);
+        }, []);
+        const headerProbeRef = useCallback((el: HTMLSpanElement | null) => {
+            if (el !== null) setHeaderFont(getComputedStyle(el).font);
+        }, []);
+        const effCellFont = cellFont ?? `${fontSize}px ${MONO_FONT_STACK}`;
+        const effHeaderFont = headerFont ?? `600 11px ${MONO_FONT_STACK}`;
+
+        // 기본 컬럼 폭: 컬럼 이름과 캐시에 처음 로드된 행(최대 200행)의 값의
+        // 실제 텍스트 폭으로 추정한다. measureText 비용 때문에 캐시나
+        // 측정 입력이 바뀐 시점에만 재추정하고, 수동 저장 폭이 없는 컬럼은
+        // 이 추정값이 늘어나면 그대로 따라간다.
+        const estRef = useRef<{
+            key: number;
+            columns: Columns | null;
+            cellFont: string;
+            headerFont: string;
+            active: boolean;
+            widths: number[];
+        }>({
+            key: -1,
+            columns: null,
+            cellFont: "",
+            headerFont: "",
+            active: false,
+            widths: EMPTY_WIDTHS,
+        });
+        const est = estRef.current;
+        if (
+            est.key !== cacheVersion ||
+            est.columns !== columns ||
+            est.cellFont !== effCellFont ||
+            est.headerFont !== effHeaderFont ||
+            est.active !== colViewActive
+        ) {
+            estRef.current = {
+                key: cacheVersion,
+                columns,
+                cellFont: effCellFont,
+                headerFont: effHeaderFont,
+                active: colViewActive,
+                widths:
+                    colViewActive && columns !== null
+                        ? estimateColWidths(
+                              columns,
+                              effCellFont,
+                              effHeaderFont,
+                              lineCache.sampleLines(200),
+                          )
+                        : EMPTY_WIDTHS,
+            };
+        }
+        const defaultColWidths = estRef.current.widths;
+
+        const colNames = columns !== null ? columns.names : EMPTY_NAMES;
+        const colLayout = useColumnLayout(
+            file.path,
+            colNames,
+            defaultColWidths,
+        );
+
+        // 컬럼 뷰 본문/헤더의 최소 폭 — 단조 폭 규칙(Phase 14)에 컬럼 합계를 합산한다
+        const contentMinWidth = colViewActive
+            ? Math.max(minContentWidth, colLayout.totalWidth)
+            : minContentWidth;
+
+        // 셀 우클릭 필드 필터 메뉴 상태
+        const [cellMenu, setCellMenu] = useState<CellMenu | null>(null);
+
+        // 본문 가로 스크롤 → 컬럼 헤더 동기화 (리렌더 없이 transform만 갱신)
+        const handleBodyScroll = useCallback(
+            (e: React.UIEvent<HTMLDivElement>) => {
+                const el = headerContentRef.current;
+                if (el !== null) {
+                    el.style.transform = `translateX(${-e.currentTarget.scrollLeft}px)`;
+                }
+            },
+            [],
+        );
+
+        // 헤더가 다시 그려진 후(컬럼 뷰 토글/폭 변경) 스크롤 위치를 재동기화한다
+        useLayoutEffect(() => {
+            const el = headerContentRef.current;
+            const body = bodyScrollRef.current;
+            if (el !== null && body !== null) {
+                el.style.transform = `translateX(${-body.scrollLeft}px)`;
+            }
+        }, [colViewActive, colLayout.totalWidth]);
 
         // 렌더 후 실제 행 폭을 측정해 최대값을 누적한다 (단조 증가).
         // 행 내용이 바뀌는 조건(보이는 구간/캐시/행 높이)이 변할 때만 측정한다.
@@ -419,11 +552,21 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 // 먼저 소비해 네이티브 메뉴 accelerator(go_top/go_bottom)가
                 // 발화하지 않는 경우가 있으므로 여기서도 처음/끝 이동을 처리한다.
                 // 두 경로 모두 같은 동작이라 중복 실행돼도 문제없다 (멱등).
-                if ((e.metaKey && e.key === "ArrowUp") || e.key === "Home") {
+                // Option 조합(Cmd+Option+↑/↓)은 북마크 이동이므로 여기서 제외한다.
+                if (
+                    (e.metaKey &&
+                        !e.altKey &&
+                        !e.shiftKey &&
+                        e.key === "ArrowUp") ||
+                    e.key === "Home"
+                ) {
                     e.preventDefault();
                     onTopLineChange(0);
                 } else if (
-                    (e.metaKey && e.key === "ArrowDown") ||
+                    (e.metaKey &&
+                        !e.altKey &&
+                        !e.shiftKey &&
+                        e.key === "ArrowDown") ||
                     e.key === "End"
                 ) {
                     e.preventDefault();
@@ -489,6 +632,14 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 index >= selectedRange.start &&
                 index <= selectedRange.end;
 
+            // CSV 헤더 감지 파일의 0번 줄(헤더 행)은 흐리게 표시한다
+            const isCsvHeaderRow =
+                colViewActive &&
+                columns !== null &&
+                columns.format === "csv" &&
+                columns.hasHeader &&
+                line?.no === 0;
+
             rows.push(
                 <div
                     key={index}
@@ -504,36 +655,82 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                             onTruncatedLineClick?.(line.no);
                         }
                     }}
-                    className={`flex items-center font-mono whitespace-pre select-text px-2 cursor-default ${
+                    className={`flex font-mono select-text cursor-default ${
+                        colViewActive
+                            ? "items-stretch"
+                            : "items-center whitespace-pre px-2"
+                    } ${
                         isCurrentHit
                             ? "bg-amber-100/80 dark:bg-amber-950/50 text-zinc-950 dark:text-zinc-50 border-l-2 border-amber-500"
                             : isSelected
                               ? "bg-sky-200/70 dark:bg-sky-800/50 text-zinc-900 dark:text-zinc-100"
                               : "text-zinc-900 dark:text-zinc-100 hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40"
-                    }`}
+                    } ${isCsvHeaderRow ? "opacity-45" : ""}`}
                     style={{
                         height: rowHeight,
                         lineHeight: `${rowHeight}px`,
                         fontSize: `${fontSize}px`,
                     }}
                 >
-                    <span>
-                        {line ? (
-                            renderLineContent(
-                                line.text,
-                                line.highlights,
-                                line.ruleHighlights,
-                                ruleColors,
-                                isCurrentHit,
-                            )
-                        ) : lineCache.isLineFailed(index) ? (
-                            <span className="text-zinc-400 dark:text-zinc-600 italic">
+                    {colViewActive ? (
+                        line === undefined && lineCache.isLineFailed(index) ? (
+                            <span className="flex items-center px-2 text-zinc-400 dark:text-zinc-600 italic">
                                 불러오기 실패
                             </span>
                         ) : (
-                            ""
-                        )}
-                    </span>
+                            // 컬럼 뷰: 행을 고정 폭 셀로 렌더링 (셀 단위 검색 하이라이트는 생략)
+                            colLayout.visible.map((ci) => {
+                                const val = line?.fields?.[ci] ?? "";
+                                return (
+                                    <div
+                                        key={ci}
+                                        className="flex h-full items-center shrink-0 overflow-hidden whitespace-nowrap px-2 border-r border-zinc-200/70 dark:border-zinc-800/70"
+                                        style={{
+                                            width:
+                                                colLayout.widths[ci] ??
+                                                MIN_COL_WIDTH,
+                                        }}
+                                        title={val}
+                                        onContextMenu={(e) => {
+                                            if (
+                                                onFieldFilter === undefined ||
+                                                line === undefined
+                                            ) {
+                                                return;
+                                            }
+                                            e.preventDefault();
+                                            setCellMenu({
+                                                x: e.clientX,
+                                                y: e.clientY,
+                                                field: colNames[ci] ?? "",
+                                                value: val,
+                                            });
+                                        }}
+                                    >
+                                        <span className="truncate">{val}</span>
+                                    </div>
+                                );
+                            })
+                        )
+                    ) : (
+                        <span>
+                            {line ? (
+                                renderLineContent(
+                                    line.text,
+                                    line.highlights,
+                                    line.ruleHighlights,
+                                    ruleColors,
+                                    isCurrentHit,
+                                )
+                            ) : lineCache.isLineFailed(index) ? (
+                                <span className="text-zinc-400 dark:text-zinc-600 italic">
+                                    불러오기 실패
+                                </span>
+                            ) : (
+                                ""
+                            )}
+                        </span>
+                    )}
                 </div>,
             );
         }
@@ -541,54 +738,108 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         return (
             <div
                 ref={containerRef}
-                className="relative flex-1 flex h-full w-full overflow-hidden select-none bg-white dark:bg-zinc-950"
+                className="relative flex-1 flex flex-col h-full w-full overflow-hidden select-none bg-white dark:bg-zinc-950"
             >
-                {/* 줄 번호 거터 (잘린 줄 표시·줄 선택 강조 포함) */}
-                <Gutter
-                    startLine={renderStart}
-                    rowCount={rowCount}
-                    totalLines={totalFileLines}
-                    translateY={translateY}
-                    rowHeight={rowHeight}
-                    fontSize={fontSize}
-                    isFilterMode={indexView}
-                    getLine={getLineCallback}
-                    cacheVersion={cacheVersion}
-                    onLineClick={onGutterLineClick}
-                    selectedRange={selectedRange}
-                    onTruncatedClick={onTruncatedLineClick}
-                />
+                {/* 컬럼 뷰 고정 헤더 (본문과 가로 스크롤 동기화) */}
+                {colViewActive && columns !== null && (
+                    <ColumnHeader
+                        names={colNames}
+                        widths={colLayout.widths}
+                        visible={colLayout.visible}
+                        hidden={colLayout.hidden}
+                        gutterWidth={gutterWidth}
+                        contentMinWidth={contentMinWidth}
+                        contentRef={headerContentRef}
+                        onResize={colLayout.setWidth}
+                        onToggleHidden={colLayout.toggleHidden}
+                    />
+                )}
 
-                {/* 본문 영역 (가로 스크롤 가능) */}
-                <div
-                    ref={bodyScrollRef}
-                    className="flex-1 h-full overflow-x-auto overflow-y-hidden"
-                    style={{ scrollbarWidth: "thin" }}
-                >
+                {/* 본문 영역: 거터 + 가상 행 + 스크롤바 */}
+                <div ref={bodyWrapRef} className="flex-1 flex min-h-0">
+                    {/* 줄 번호 거터 (잘린 줄 표시·줄 선택 강조 포함) */}
+                    <Gutter
+                        startLine={renderStart}
+                        rowCount={rowCount}
+                        totalLines={totalFileLines}
+                        translateY={translateY}
+                        rowHeight={rowHeight}
+                        fontSize={fontSize}
+                        isFilterMode={indexView}
+                        getLine={getLineCallback}
+                        cacheVersion={cacheVersion}
+                        onLineClick={onGutterLineClick}
+                        selectedRange={selectedRange}
+                        onTruncatedClick={onTruncatedLineClick}
+                        bookmarks={bookmarks}
+                        onBookmarkToggle={onBookmarkToggle}
+                    />
+
+                    {/* 본문 영역 (가로 스크롤 가능) */}
                     <div
-                        ref={contentRef}
-                        className="inline-block"
-                        style={{
-                            // 렌더된 최장 폭을 유지해 가로 스크롤 위치가 튀지 않게 한다
-                            minWidth: `max(100%, ${minContentWidth}px)`,
-                            transform: `translateY(${translateY}px)`,
-                            willChange: "transform",
-                        }}
+                        ref={bodyScrollRef}
+                        className="flex-1 h-full overflow-x-auto overflow-y-hidden"
+                        style={{ scrollbarWidth: "thin" }}
+                        onScroll={handleBodyScroll}
                     >
-                        {rows}
+                        <div
+                            ref={contentRef}
+                            className="inline-block"
+                            style={{
+                                // 렌더된 최장 폭을 유지해 가로 스크롤 위치가 튀지 않게 한다
+                                minWidth: `max(100%, ${contentMinWidth}px)`,
+                                transform: `translateY(${translateY}px)`,
+                                willChange: "transform",
+                            }}
+                        >
+                            {rows}
+                        </div>
                     </div>
+
+                    {/* 커스텀 수직 스크롤바 (인덱스 기반 보기에서는 밀도·북마크 마커 숨김) */}
+                    <Scrollbar
+                        topLine={topLine}
+                        lineCount={lineCount}
+                        visibleRows={visibleRows}
+                        onScroll={onTopLineChange}
+                        densityBins={indexView ? undefined : densityBins}
+                        bookmarkMarkers={
+                            indexView ? undefined : bookmarkMarkers
+                        }
+                        onTrackHeightChange={onTrackHeightChange}
+                        onDraggingChange={handleScrollbarDragging}
+                    />
                 </div>
 
-                {/* 커스텀 수직 스크롤바 (인덱스 기반 보기에서는 밀도 마커 숨김) */}
-                <Scrollbar
-                    topLine={topLine}
-                    lineCount={lineCount}
-                    visibleRows={visibleRows}
-                    onScroll={onTopLineChange}
-                    densityBins={indexView ? undefined : densityBins}
-                    onTrackHeightChange={onTrackHeightChange}
-                    onDraggingChange={handleScrollbarDragging}
-                />
+                {/* 폰트 실측용 프로브: 셀/헤더와 동일한 클래스·크기 (비가시) */}
+                {colViewActive && (
+                    <>
+                        <span
+                            ref={cellProbeRef}
+                            aria-hidden="true"
+                            className="font-mono absolute invisible whitespace-nowrap"
+                            style={{ fontSize: `${fontSize}px` }}
+                        >
+                            {"\u00a0"}
+                        </span>
+                        <span
+                            ref={headerProbeRef}
+                            aria-hidden="true"
+                            className="font-mono text-[11px] font-semibold absolute invisible whitespace-nowrap"
+                        >
+                            {"\u00a0"}
+                        </span>
+                    </>
+                )}
+
+                {/* 셀 우클릭 필드 필터 메뉴 */}
+                {cellMenu !== null && onFieldFilter !== undefined && (
+                    <FieldFilterMenu
+                        menu={cellMenu}
+                        onFilter={onFieldFilter}
+                        onClose={() => setCellMenu(null)}
+                    />
+                )}
             </div>
         );
     },

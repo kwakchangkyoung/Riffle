@@ -41,6 +41,8 @@ export class LineCache {
     private query: QueryOptions | null = null;
     /** 규칙 하이라이트 계산용 필터 스펙 (get_*의 spec 인자) */
     private ruleSpec: FilterSpec | null = null;
+    /** 컬럼 뷰: get_*의 with_fields 인자 (true이면 각 줄의 fields를 함께 요청) */
+    private withFields = false;
     private lineCount = 0;
     private isDone = false;
     /** true면 새 블록 요청을 보류한다 (캐시된 줄 표시는 유지) */
@@ -123,6 +125,22 @@ export class LineCache {
             return;
         }
         this.query = query;
+        this.fetchSeq++;
+        this.attempts.clear();
+        this.failedBlocks.clear();
+        this.refetchLastRange();
+        this.notify();
+    }
+
+    /**
+     * 컬럼 분할 값(fields) 요청 여부를 변경합니다.
+     * 캐시된 블록은 stale로 표시하고 보이는 범위를 재요청합니다.
+     */
+    public setWithFields(withFields: boolean): void {
+        if (this.withFields === withFields) {
+            return;
+        }
+        this.withFields = withFields;
         this.fetchSeq++;
         this.attempts.clear();
         this.failedBlocks.clear();
@@ -277,6 +295,28 @@ export class LineCache {
     }
 
     /**
+     * 캐시에 로드된 줄을 인덱스 순으로 최대 `limit`개 반환합니다.
+     * (컬럼 뷰 기본 폭 표본용 — 새 요청을 발생시키지 않습니다)
+     */
+    public sampleLines(limit: number): Line[] {
+        const out: Line[] = [];
+        const keys = [...this.blocks.keys()].sort((a, b) => a - b);
+        for (const k of keys) {
+            const block = this.blocks.get(k);
+            if (block === undefined) {
+                continue;
+            }
+            for (const line of block.lines) {
+                out.push(line);
+                if (out.length >= limit) {
+                    return out;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
      * 해당 줄이 속한 블록의 요청이 최종 실패했는지 확인합니다.
      */
     public isLineFailed(lineNo: number): boolean {
@@ -386,6 +426,7 @@ export class LineCache {
                       BLOCK_SIZE,
                       this.query,
                       this.ruleSpec,
+                      this.withFields,
                   )
                 : this.source.kind === "filter"
                   ? getFilterLines(
@@ -395,6 +436,7 @@ export class LineCache {
                         BLOCK_SIZE,
                         this.query,
                         this.ruleSpec,
+                        this.withFields,
                     )
                   : getLines(
                         currentFileId,
@@ -402,6 +444,7 @@ export class LineCache {
                         BLOCK_SIZE,
                         this.query,
                         this.ruleSpec,
+                        this.withFields,
                     );
 
         request

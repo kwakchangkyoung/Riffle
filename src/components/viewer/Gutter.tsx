@@ -4,7 +4,8 @@ import type { Line } from "@/lib/ipc";
 /** 거터 클릭 안내 툴팁을 보여준 횟수를 세는 localStorage 키 (처음 3회만 표시) */
 const HINT_KEY = "riffle.gutterHintShown";
 const HINT_LIMIT = 3;
-const HINT_TEXT = "클릭: 줄 선택 · Shift+클릭: 범위 선택 · Cmd+C: 복사";
+const HINT_TEXT =
+    "클릭: 줄 선택 · Shift+클릭: 범위 · Option+클릭: 북마크 · Cmd+C: 복사";
 
 interface GutterProps {
     startLine: number; // 0-based 시작 인덱스
@@ -19,6 +20,8 @@ interface GutterProps {
     onLineClick?: (index: number, shiftKey: boolean) => void; // 거터 줄 클릭 (줄 선택용)
     selectedRange?: { start: number; end: number } | null; // 줄 선택 범위 (인덱스 기준)
     onTruncatedClick?: (lineNo: number) => void; // 잘린 줄 아이콘 클릭 (실제 파일 줄 번호)
+    bookmarks?: Map<number, string>; // 북마크: 실제 파일 줄 번호(0-based) → 색상
+    onBookmarkToggle?: (lineNo: number) => void; // 거터 우클릭/Option+클릭 북마크 토글 (실제 파일 줄 번호)
 }
 
 /**
@@ -37,6 +40,8 @@ export const Gutter: React.FC<GutterProps> = React.memo(
         onLineClick,
         selectedRange,
         onTruncatedClick,
+        bookmarks,
+        onBookmarkToggle,
     }) => {
         // 전체 줄 수의 자릿수에 비례하여 폭 계산 (최소 4글자 폭 확보)
         // 모노스페이스 글자 폭은 폰트 크기의 약 0.6em이므로 fontSize에 연동한다
@@ -95,10 +100,41 @@ export const Gutter: React.FC<GutterProps> = React.memo(
                 index >= selectedRange.start &&
                 index <= selectedRange.end;
 
+            // 이 행의 실제 파일 줄 번호 (북마크 표시·토글 기준)
+            const actualNo = isFilterMode
+                ? line !== undefined
+                    ? line.no
+                    : null
+                : index;
+            const bookmarkColor =
+                actualNo !== null ? bookmarks?.get(actualNo) : undefined;
+
             lines.push(
                 <div
                     key={index}
-                    onClick={(e) => handleClick(index, e.shiftKey)}
+                    onClick={(e) => {
+                        // Option+클릭은 줄 선택 대신 북마크 토글
+                        if (
+                            e.altKey &&
+                            onBookmarkToggle !== undefined &&
+                            actualNo !== null
+                        ) {
+                            onBookmarkToggle(actualNo);
+                            return;
+                        }
+                        handleClick(index, e.shiftKey);
+                    }}
+                    onContextMenu={(e) => {
+                        // 거터 우클릭: 북마크 토글
+                        if (
+                            onBookmarkToggle === undefined ||
+                            actualNo === null
+                        ) {
+                            return;
+                        }
+                        e.preventDefault();
+                        onBookmarkToggle(actualNo);
+                    }}
                     title={showHint ? HINT_TEXT : undefined}
                     className={`relative pr-3 text-right font-mono select-none ${
                         selectable ? "cursor-pointer" : ""
@@ -114,6 +150,14 @@ export const Gutter: React.FC<GutterProps> = React.memo(
                     }}
                 >
                     {displayNo}
+                    {/* 북마크 색 점 (줄 번호 왼쪽) */}
+                    {bookmarkColor !== undefined && (
+                        <span
+                            className="absolute left-1 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full"
+                            style={{ backgroundColor: bookmarkColor }}
+                            title="북마크 (⌘B 토글 · F2 이동 · ⌘⇧B 목록)"
+                        />
+                    )}
                     {line !== undefined &&
                         line.truncated &&
                         onTruncatedClick !== undefined && (

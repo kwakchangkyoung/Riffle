@@ -10,16 +10,23 @@ import {
     cancelFilter,
     closeFile,
     copyLines,
+    detectColumns,
     filterIndexOf,
+    getBookmarks,
     openFile,
     searchDensity,
+    searchNav,
+    setBookmarks as saveBookmarksIpc,
     setTail,
     startFilter,
+    type Bookmark,
+    type Columns,
     type FileInfo,
     type FilterSpec,
     type IndexProgress,
     type MenuEvent,
     type QueryOptions,
+    type RuleKind,
     type SearchEvent,
     type SearchHit,
     type TailEvent,
@@ -29,11 +36,14 @@ import { useTauriListener } from "@/lib/useTauriListener";
 import { loadScrollPos, saveScrollPos } from "@/lib/scrollPos";
 import { rowHeightFor } from "@/lib/fontSize";
 import { formatBytes } from "@/lib/format";
+import { DEFAULT_BOOKMARK_COLOR } from "@/lib/bookmarks";
 import { LogViewport } from "@/components/viewer/LogViewport";
 import { FullLinePanel } from "@/components/viewer/FullLinePanel";
+import { BookmarkPanel } from "@/components/bookmarks/BookmarkPanel";
 import { GotoLineDialog } from "@/components/GotoLineDialog";
 import { SearchBar } from "@/components/search/SearchBar";
 import { FilterBar } from "@/components/filter/FilterBar";
+import { pickRuleColor } from "@/lib/ruleColor";
 import {
     StatusBar,
     type FilterStatusInfo,
@@ -68,6 +78,7 @@ function filterSignature(spec: FilterSpec): string {
             r.caseSensitive,
             r.kind,
             r.enabled,
+            r.field ?? null,
         ]),
     });
 }
@@ -77,6 +88,11 @@ function ruleHighlightSpec(spec: FilterSpec): FilterSpec | null {
     return spec.rules.some((r) => r.enabled && r.kind === "include")
         ? spec
         : null;
+}
+
+/** 문자열을 정규식 리터럴로 이스케이프한다 (필드 필터의 값 매치용) */
+function escapeRegex(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 interface FileTabProps {
@@ -164,6 +180,16 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         } | null>(null);
         const [findSignal, setFindSignal] = useState(0);
 
+        // 북마크 상태 (Phase 15): 항목 목록(줄 번호 오름차순), stale 안내, 사이드 패널
+        const [bookmarks, setBookmarkItems] = useState<Bookmark[]>([]);
+        const [bookmarksStale, setBookmarksStale] = useState(false);
+        const [bookmarkPanelOpen, setBookmarkPanelOpen] = useState(false);
+
+        // 컬럼 뷰 상태 (Phase 16): 감지된 컬럼 정보와 탭별 컬럼 보기 토글.
+        // columnView는 파일을 바꿔 열어도 탭 안에서 유지된다 (단, plain이면 비활성).
+        const [columns, setColumns] = useState<Columns | null>(null);
+        const [columnView, setColumnView] = useState(false);
+
         const rowHeight = rowHeightFor(fontSize);
         // 최신 rowHeight를 ref로 유지해 안정적인 콜백(tail 핸들러 등)에서 참조한다
         const rowHeightRef = useRef(rowHeight);
@@ -219,6 +245,17 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         // 탭별 스크롤 위치 기억: 복원 대기 위치와 복원 완료 여부 (완료 전엔 저장하지 않는다)
         const pendingPosRef = useRef<number | null>(null);
         const restoreSettledRef = useRef(false);
+
+        // 북마크 관련 ref: 비동기/이벤트 콜백에서 최신 값을 읽기 위한 미러와 저장 예약 상태
+        const bookmarksRef = useRef<Bookmark[]>([]);
+        const bookmarksDirtyRef = useRef(false);
+        const bookmarkSaveTimerRef = useRef<ReturnType<
+            typeof setTimeout
+        > | null>(null);
+        const currentHitRef = useRef<SearchHit | null>(null);
+        useEffect(() => {
+            bookmarksRef.current = bookmarks;
+        }, [bookmarks]);
 
         // tail 모드 관련 ref
         const tailEnabledRef = useRef(false);
@@ -305,6 +342,35 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         // 다중 필터 보기 활성 여부 (화면에 표시 중인 필터가 있을 때)
         const filterViewActive = activeFilterId !== null;
 
+        // 컬럼 뷰 활성 여부 (토글 on + 감지 형식이 plain이 아닐 때만)
+        const columnViewActive =
+            columnView && columns !== null && columns.format !== "plain";
+
+        // 컬럼 뷰가 켜지면 모든 라인 캐시가 줄 분할 값(fields)을 함께 요청하도록 한다
+        useEffect(() => {
+            normalLineCache.setWithFields(columnViewActive);
+            filteredLineCache.setWithFields(columnViewActive);
+            filterLineCache.setWithFields(columnViewActive);
+        }, [
+            columnViewActive,
+            normalLineCache,
+            filteredLineCache,
+            filterLineCache,
+        ]);
+
+        // 단축키 핸들러에서 최신 컬럼 정보를 읽기 위한 ref
+        const columnsRef = useRef<Columns | null>(null);
+        useEffect(() => {
+            columnsRef.current = columns;
+        }, [columns]);
+
+        // 컬럼 뷰 토글 (툴바 버튼 / Cmd+Shift+C). plain 파일에서는 무시한다
+        const handleToggleColumnView = useCallback(() => {
+            const cols = columnsRef.current;
+            if (cols === null || cols.format === "plain") return;
+            setColumnView((v) => !v);
+        }, []);
+
         // 활성 라인 캐시 및 총 라인 수 (검색 결과만 / 다중 필터 / 일반 모드 분기)
         const activeLineCache = isFilterMode
             ? filteredLineCache
@@ -341,18 +407,27 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             }
         }, []);
 
-        // 뷰포트 맨 위 행의 실제 파일 줄 번호.
+        // 뷰포트 행 인덱스의 실제 파일 줄 번호.
         // 인덱스 기반 보기(검색 결과만/다중 필터)에서는 캐시된 줄의 실제 번호를 반환한다.
-        const currentTopActualLine = useCallback((): number => {
-            const t = Math.floor(topLineRef.current);
-            if (isFilterModeRef.current) {
-                return filteredLineCache.getLine(t)?.no ?? t;
-            }
-            if (filterViewActiveRef.current) {
-                return filterLineCache.getLine(t)?.no ?? t;
-            }
-            return t;
-        }, [filteredLineCache, filterLineCache]);
+        const actualLineAtIndex = useCallback(
+            (index: number): number => {
+                const i = Math.max(0, Math.floor(index));
+                if (isFilterModeRef.current) {
+                    return filteredLineCache.getLine(i)?.no ?? i;
+                }
+                if (filterViewActiveRef.current) {
+                    return filterLineCache.getLine(i)?.no ?? i;
+                }
+                return i;
+            },
+            [filteredLineCache, filterLineCache],
+        );
+
+        // 뷰포트 맨 위 행의 실제 파일 줄 번호.
+        const currentTopActualLine = useCallback(
+            (): number => actualLineAtIndex(topLineRef.current),
+            [actualLineAtIndex],
+        );
 
         // topLine 직접 변경(setTopLine) 경로에 대한 ref 동기화 백업
         useEffect(() => {
@@ -414,6 +489,39 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             [],
         );
 
+        // 대기 중인 북마크 저장을 즉시 실행한다 (디바운스 타이머 취소 포함).
+        // 저장이 성공하면 백엔드가 현재 지문으로 갱신하므로 stale 안내도 함께 해제한다.
+        const flushBookmarks = useCallback(async () => {
+            if (bookmarkSaveTimerRef.current !== null) {
+                clearTimeout(bookmarkSaveTimerRef.current);
+                bookmarkSaveTimerRef.current = null;
+            }
+            if (!bookmarksDirtyRef.current) return;
+            bookmarksDirtyRef.current = false;
+            const current = currentFileRef.current;
+            if (current === null) return;
+            try {
+                await saveBookmarksIpc(current.id, bookmarksRef.current);
+                setBookmarksStale(false);
+            } catch (err) {
+                // 실패 시 dirty를 되돌려 다음 flush(탭 닫기 등)에서 재시도한다
+                bookmarksDirtyRef.current = true;
+                console.warn("북마크 저장 실패:", err);
+            }
+        }, []);
+
+        // 북마크 변경을 300ms 디바운스로 저장 예약한다
+        const scheduleBookmarkSave = useCallback(() => {
+            bookmarksDirtyRef.current = true;
+            if (bookmarkSaveTimerRef.current !== null) {
+                clearTimeout(bookmarkSaveTimerRef.current);
+            }
+            bookmarkSaveTimerRef.current = setTimeout(() => {
+                bookmarkSaveTimerRef.current = null;
+                void flushBookmarks();
+            }, 300);
+        }, [flushBookmarks]);
+
         // 스크롤바 트랙 높이 변경 콜백 (인라인 함수면 memoized LogViewport이 무력화된다)
         const handleTrackHeightChange = useCallback((h: number) => {
             trackHeightRef.current = h;
@@ -436,6 +544,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     cancelAnimationFrame(tailRafRef.current);
                     tailRafRef.current = null;
                 }
+
+                // 대기 중인 북마크 저장이 남아 있으면 이전 파일 id로 즉시 flush한다.
+                // 같은 경로 재오픈(로테이션)이어도 항목이 유실되지 않게 닫기 전에 보낸다.
+                await flushBookmarks();
 
                 // 이전 파일이 열려있다면 닫기 요청
                 if (currentFileRef.current) {
@@ -464,6 +576,16 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 setLineSelection(null);
                 setFullLinePanel(null);
                 setGotoLineOpen(false);
+
+                // 북마크 상태 초기화 (저장된 목록은 파일이 열리면 다시 불러온다)
+                bookmarksDirtyRef.current = false;
+                bookmarksRef.current = [];
+                setBookmarkItems([]);
+                setBookmarksStale(false);
+                setBookmarkPanelOpen(false);
+
+                // 컬럼 감지 결과 초기화 (토글 자체는 탭 안에서 유지)
+                setColumns(null);
 
                 // 다중 필터 계산 상태 초기화 (스펙 자체는 탭 내에서 유지)
                 filterSeqRef.current++;
@@ -525,6 +647,40 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     normalLineCache.setFile(info.id);
                     onFileInfoRef.current(tabId, info);
 
+                    // 인덱싱 시작과 함께 컬럼 형식을 감지한다 (파일별 캐시, 실패해도 뷰어 동작에 지장 없음)
+                    detectColumns(info.id)
+                        .then((cols) => {
+                            if (openSeqRef.current !== seq) return;
+                            setColumns(cols);
+                        })
+                        .catch((err) => {
+                            console.warn("컬럼 감지 실패:", err);
+                        });
+
+                    // 저장된 북마크를 불러온다 (머리 지문이 다르면 stale=true로 안내)
+                    getBookmarks(info.id)
+                        .then((bm) => {
+                            if (openSeqRef.current !== seq) return;
+                            setBookmarkItems((prev) => {
+                                // 불러오기가 끝나기 전 사용자가 단 북마크가 있으면
+                                // 병합한다 (같은 줄은 로컬 항목 우선)
+                                if (prev.length === 0) return bm.items;
+                                const localLines = new Set(
+                                    prev.map((b) => b.line),
+                                );
+                                return [
+                                    ...prev,
+                                    ...bm.items.filter(
+                                        (b) => !localLines.has(b.line),
+                                    ),
+                                ].sort((a, b) => a.line - b.line);
+                            });
+                            setBookmarksStale(bm.stale);
+                        })
+                        .catch((err) => {
+                            console.warn("북마크 조회 실패:", err);
+                        });
+
                     // 이전에 보던 스크롤 위치 복원 예약 (로테이션 재오픈은 맨 아래로 가므로 제외)
                     if (!options?.preserveTail) {
                         const saved = loadScrollPos(info.path);
@@ -559,7 +715,13 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     }
                 }
             },
-            [tabId, normalLineCache, filteredLineCache, filterLineCache],
+            [
+                tabId,
+                normalLineCache,
+                filteredLineCache,
+                filterLineCache,
+                flushBookmarks,
+            ],
         );
 
         // 마운트 시 요청 경로의 파일을 연다.
@@ -586,6 +748,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 if (densityTimerRef.current !== null) {
                     clearTimeout(densityTimerRef.current);
                 }
+                // 디바운스로 대기 중인 북마크 저장은 닫기 전에 즉시 flush한다
+                void flushBookmarks();
                 const current = currentFileRef.current;
                 if (current !== null) {
                     // 탭이 닫혀도 마지막 위치가 남도록 즉시 저장한다
@@ -597,7 +761,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     });
                 }
             };
-        }, [invalidateOpenSeq]);
+        }, [invalidateOpenSeq, flushBookmarks]);
 
         // tail 모드 토글 (버튼 / Cmd+T). 켜기 방향은 인덱싱 완료 effect가 처리한다.
         const handleToggleTail = useCallback(() => {
@@ -841,6 +1005,33 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         );
 
         // ===== 다중 필터 (Phase 10) =====
+
+        // 셀 우클릭 "이 값만 보기 / 이 값 제외": 해당 컬럼에 ^값$ 정규식 field 규칙을 추가한다
+        const handleFieldFilter = useCallback(
+            (field: string, value: string, kind: RuleKind) => {
+                setFilterSpec((prev) => ({
+                    ...prev,
+                    rules: [
+                        ...prev.rules,
+                        {
+                            pattern: `^${escapeRegex(value)}$`,
+                            regex: true,
+                            caseSensitive: true,
+                            kind,
+                            enabled: true,
+                            color: pickRuleColor(prev.rules),
+                            field,
+                        },
+                    ],
+                }));
+                setToast(
+                    kind === "exclude"
+                        ? `필드 '${field}' 제외 규칙 추가`
+                        : `필드 '${field}' 포함 규칙 추가`,
+                );
+            },
+            [],
+        );
 
         // 첫 progress/done 시점에 새 필터 결과로 화면을 전환한다.
         // 전환 직전 화면 맨 위의 실제 줄 번호를 filter_index_of로 변환해 보던 위치를 유지한다.
@@ -1348,6 +1539,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         const handleTruncatedLineClick = useCallback((lineNo: number) => {
             const current = currentFileRef.current;
             if (!current) return;
+            // 오른쪽 사이드 패널은 하나만 열린다
+            setBookmarkPanelOpen(false);
             setFullLinePanel({ fileId: current.id, no: lineNo });
         }, []);
 
@@ -1365,6 +1558,306 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 end: Math.max(lineSelection.anchor, lineSelection.focus),
             };
         }, [isFilterMode, filterViewActive, lineSelection]);
+
+        // ===== 북마크 (Phase 15) =====
+
+        // 비동기 북마크 핸들러에서 최신 검색 결과를 읽기 위한 ref
+        useEffect(() => {
+            currentHitRef.current = currentHit;
+        }, [currentHit]);
+
+        // 북마크 토글/이동의 기준 줄 (실제 파일 줄 번호, 0-based):
+        // 줄 선택이 있으면 선택 시작 줄 → 없으면 현재 검색 결과 줄 → 없으면 화면 위 1/3 지점 줄
+        const bookmarkTargetLine = useCallback((): number | null => {
+            if (currentFileRef.current === null) return null;
+            const sel = lineSelectionRef.current;
+            if (
+                sel !== null &&
+                !isFilterModeRef.current &&
+                !filterViewActiveRef.current
+            ) {
+                return Math.min(sel.anchor, sel.focus);
+            }
+            if (currentHitRef.current !== null) {
+                return currentHitRef.current.line;
+            }
+            const visibleRows =
+                viewportHeightRef.current > 0
+                    ? viewportHeightRef.current / rowHeightRef.current
+                    : 30;
+            const index =
+                Math.floor(topLineRef.current) + Math.floor(visibleRows / 3);
+            return actualLineAtIndex(index);
+        }, [actualLineAtIndex]);
+
+        // 지정한 실제 줄 번호의 북마크를 추가/제거한다
+        const toggleBookmarkAt = useCallback(
+            (lineNo: number) => {
+                if (currentFileRef.current === null) return;
+                const prev = bookmarksRef.current;
+                const next = prev.some((b) => b.line === lineNo)
+                    ? prev.filter((b) => b.line !== lineNo)
+                    : [
+                          ...prev,
+                          {
+                              line: lineNo,
+                              note: "",
+                              color: DEFAULT_BOOKMARK_COLOR,
+                              createdAt: Math.floor(Date.now() / 1000),
+                          },
+                      ].sort((a, b) => a.line - b.line);
+                bookmarksRef.current = next;
+                setBookmarkItems(next);
+                scheduleBookmarkSave();
+            },
+            [scheduleBookmarkSave],
+        );
+
+        // Cmd+B: 기준 줄의 북마크 토글
+        const handleToggleBookmark = useCallback(() => {
+            const line = bookmarkTargetLine();
+            if (line !== null) toggleBookmarkAt(line);
+        }, [bookmarkTargetLine, toggleBookmarkAt]);
+
+        // 실제 파일 줄 번호로 스크롤한다 (줄이 화면 위 1/3 지점에 오도록).
+        // 인덱스 기반 보기에서는 보이는 줄 인덱스로 변환한다.
+        // 반환값: 이동한 줄이 현재 보기에 있어 실제로 이동했으면 true.
+        const navigateToBookmarkLine = useCallback(
+            async (actualLine: number): Promise<boolean> => {
+                const visibleRows =
+                    viewportHeightRef.current > 0
+                        ? viewportHeightRef.current / rowHeightRef.current
+                        : 30;
+                const offset = Math.floor(visibleRows / 3);
+                const scrollToIndex = (targetIndex: number) => {
+                    const targetTop = targetIndex - offset;
+                    const maxTop = Math.max(
+                        0,
+                        displayCountRef.current - visibleRows,
+                    );
+                    handleTopLineChange(
+                        Math.max(0, Math.min(maxTop, targetTop)),
+                    );
+                };
+
+                if (isFilterModeRef.current) {
+                    // 검색 결과만 보기: 북마크 줄이 검색 결과에 있을 때만
+                    // 그 결과 인덱스로 이동한다
+                    const sid = activeSearchIdRef.current;
+                    if (sid === null || actualLine <= 0) return false;
+                    try {
+                        const hit = await searchNav(sid, actualLine - 1, true);
+                        if (hit === null || hit.line !== actualLine) {
+                            return false;
+                        }
+                        scrollToIndex(hit.index);
+                        return true;
+                    } catch {
+                        return false;
+                    }
+                }
+                if (
+                    filterViewActiveRef.current &&
+                    activeFilterIdRef.current !== null
+                ) {
+                    const fid = activeFilterIdRef.current;
+                    try {
+                        // line 이상인 첫 보이는 줄의 필터 인덱스
+                        const idx = await filterIndexOf(fid, actualLine);
+                        scrollToIndex(idx);
+                    } catch {
+                        scrollToIndex(actualLine);
+                    }
+                    return true;
+                }
+                scrollToIndex(actualLine);
+                return true;
+            },
+            [handleTopLineChange],
+        );
+
+        // 마지막 북마크 이동 시각 — 네이티브 메뉴 go_top/go_bottom이
+        // Cmd+Option+↑/↓ 조합에서도 발화하는 경우를 대비해 중복 이동을 막는다
+        const lastBookmarkNavAtRef = useRef(0);
+
+        // F2 / Shift+F2 (또는 Cmd+Option+↓/↑): 다음/이전 북마크로 순환 이동
+        const handleBookmarkNav = useCallback(
+            async (forward: boolean) => {
+                lastBookmarkNavAtRef.current = Date.now();
+                const items = bookmarksRef.current;
+                if (items.length === 0 || currentFileRef.current === null) {
+                    return;
+                }
+                const ref = bookmarkTargetLine();
+                if (ref === null) return;
+
+                const ordered = forward ? items : [...items].reverse();
+                // 기준 줄 다음/이전 후보부터 시도하고, 끝에 도달하면 처음으로 순환한다
+                const candidates = [
+                    ...ordered.filter((b) =>
+                        forward ? b.line > ref : b.line < ref,
+                    ),
+                    ...ordered.filter((b) =>
+                        forward ? b.line <= ref : b.line >= ref,
+                    ),
+                ];
+                for (const b of candidates) {
+                    if (await navigateToBookmarkLine(b.line)) return;
+                }
+                // 검색 결과만 보기에서 결과에 속한 북마크가 하나도 없는 경우
+                setToast("현재 보기에 북마크가 없습니다");
+            },
+            [bookmarkTargetLine, navigateToBookmarkLine],
+        );
+
+        // 북마크 패널 토글 (Cmd+Shift+B). 사이드 패널은 하나만 열린다
+        const handleToggleBookmarkPanel = useCallback(() => {
+            setBookmarkPanelOpen((prev) => !prev);
+            setFullLinePanel(null);
+        }, []);
+
+        // 패널에서 북마크 속성을 고친다 (메모/색상/삭제 공통 패턴)
+        const updateBookmarkItem = useCallback(
+            (line: number, patch: (b: Bookmark) => Bookmark | null) => {
+                const next = bookmarksRef.current
+                    .map((b) => (b.line === line ? patch(b) : b))
+                    .filter((b): b is Bookmark => b !== null);
+                bookmarksRef.current = next;
+                setBookmarkItems(next);
+                scheduleBookmarkSave();
+            },
+            [scheduleBookmarkSave],
+        );
+
+        const handleBookmarkNoteChange = useCallback(
+            (line: number, note: string) => {
+                updateBookmarkItem(line, (b) => ({ ...b, note }));
+            },
+            [updateBookmarkItem],
+        );
+
+        const handleBookmarkColorChange = useCallback(
+            (line: number, color: string) => {
+                updateBookmarkItem(line, (b) => ({ ...b, color }));
+            },
+            [updateBookmarkItem],
+        );
+
+        const handleBookmarkDelete = useCallback(
+            (line: number) => {
+                updateBookmarkItem(line, () => null);
+            },
+            [updateBookmarkItem],
+        );
+
+        // 패널 항목 클릭: 해당 줄로 이동
+        const handleBookmarkPanelNavigate = useCallback(
+            (line: number) => {
+                void navigateToBookmarkLine(line);
+            },
+            [navigateToBookmarkLine],
+        );
+
+        // stale 안내 [확인]: 현재 상태로 다시 저장해 지문을 갱신한다
+        const handleConfirmStaleBookmarks = useCallback(() => {
+            const current = currentFileRef.current;
+            if (current === null) return;
+            saveBookmarksIpc(current.id, bookmarksRef.current)
+                .then(() => setBookmarksStale(false))
+                .catch((err) => {
+                    const msg =
+                        typeof err === "string"
+                            ? err
+                            : "북마크 저장에 실패했습니다.";
+                    setErrorMessage(msg);
+                });
+        }, []);
+
+        // 북마크 단축키: Cmd+B 토글, Cmd+Shift+B 패널, F2/Shift+F2(또는 Cmd+Option+↓/↑) 이동.
+        // 메뉴에 넣지 않고 keydown으로 처리한다 (WKWebView가 Cmd+B를 막으면 안 된다).
+        useEffect(() => {
+            const handleKeyDown = (e: KeyboardEvent) => {
+                if (!isActiveRef.current) return;
+                if (e.defaultPrevented) return;
+                const active = document.activeElement;
+                const inInput =
+                    active instanceof HTMLInputElement ||
+                    active instanceof HTMLTextAreaElement;
+
+                // Cmd+Shift+B: 북마크 패널 토글 (입력창에서도 동작)
+                if (
+                    e.metaKey &&
+                    e.shiftKey &&
+                    !e.ctrlKey &&
+                    !e.altKey &&
+                    e.code === "KeyB"
+                ) {
+                    e.preventDefault();
+                    if (currentFileRef.current !== null) {
+                        handleToggleBookmarkPanel();
+                    }
+                    return;
+                }
+
+                if (inInput) return;
+                if (
+                    document.querySelector('[aria-modal="true"]') !== null ||
+                    gotoLineOpen
+                ) {
+                    return;
+                }
+
+                // Cmd+B: 기준 줄 북마크 토글
+                if (
+                    e.metaKey &&
+                    !e.ctrlKey &&
+                    !e.altKey &&
+                    !e.shiftKey &&
+                    e.code === "KeyB"
+                ) {
+                    e.preventDefault();
+                    handleToggleBookmark();
+                    return;
+                }
+
+                // F2 / Shift+F2: 다음/이전 북마크
+                if (e.key === "F2" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    e.preventDefault();
+                    void handleBookmarkNav(!e.shiftKey);
+                    return;
+                }
+                // Cmd+Option+↓/↑: 다음/이전 북마크
+                if (
+                    e.metaKey &&
+                    e.altKey &&
+                    !e.ctrlKey &&
+                    !e.shiftKey &&
+                    (e.key === "ArrowDown" || e.key === "ArrowUp")
+                ) {
+                    e.preventDefault();
+                    void handleBookmarkNav(e.key === "ArrowDown");
+                }
+            };
+            window.addEventListener("keydown", handleKeyDown);
+            return () => window.removeEventListener("keydown", handleKeyDown);
+        }, [
+            gotoLineOpen,
+            handleToggleBookmark,
+            handleToggleBookmarkPanel,
+            handleBookmarkNav,
+        ]);
+
+        // 거터 색 점용 맵 (실제 파일 줄 번호 → 색상)
+        const bookmarkLineMap = useMemo(
+            () => new Map(bookmarks.map((b) => [b.line, b.color])),
+            [bookmarks],
+        );
+
+        // 스크롤바 마커용 배열
+        const bookmarkMarkers = useMemo(
+            () => bookmarks.map((b) => ({ line: b.line, color: b.color })),
+            [bookmarks],
+        );
 
         // 네이티브 메뉴 이벤트 수신 — 파일(탭) 범위 명령만 처리한다.
         // 비활성 탭은 무시해 활성 탭에만 동작이 적용되게 한다.
@@ -1389,13 +1882,25 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         handleOpenGotoLine();
                         break;
                     case "go_top":
+                        // 북마크 이동(Cmd+Option+↑) 직후의 go_top은 중복 이동이므로 무시
+                        if (Date.now() - lastBookmarkNavAtRef.current < 100) {
+                            break;
+                        }
                         handleTopLineChange(0);
                         break;
                     case "go_bottom":
+                        // 북마크 이동(Cmd+Option+↓) 직후의 go_bottom은 중복 이동이므로 무시
+                        if (Date.now() - lastBookmarkNavAtRef.current < 100) {
+                            break;
+                        }
                         handleScrollToBottom();
                         break;
                     case "toggle_tail":
                         handleToggleTail();
+                        break;
+                    case "toggle_columns":
+                        // 컬럼 형식이 감지되지 않은 탭이면 토글 내부에서 무시된다
+                        handleToggleColumnView();
                         break;
                     default:
                         break;
@@ -1453,7 +1958,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 ) {
                     return;
                 }
-                if (gotoLineOpen || fullLinePanel !== null) return;
+                if (gotoLineOpen || fullLinePanel !== null || bookmarkPanelOpen)
+                    return;
                 // 전역 모달(업데이트 등)이 열려 있으면 무시한다
                 if (document.querySelector('[aria-modal="true"]') !== null) {
                     return;
@@ -1462,7 +1968,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             };
             window.addEventListener("keydown", handleKeyDown);
             return () => window.removeEventListener("keydown", handleKeyDown);
-        }, [gotoLineOpen, fullLinePanel]);
+        }, [gotoLineOpen, fullLinePanel, bookmarkPanelOpen]);
 
         // 토스트 메시지는 2초 후 자동으로 사라진다
         useEffect(() => {
@@ -1550,6 +2056,43 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         </div>
                     )}
                     <div className="flex items-center space-x-2 shrink-0">
+                        {/* 컬럼 뷰 토글: CSV / JSONL 감지 시에만 표시 */}
+                        {columns !== null && columns.format !== "plain" && (
+                            <button
+                                type="button"
+                                onClick={handleToggleColumnView}
+                                title={
+                                    columns.format === "csv"
+                                        ? `컬럼 뷰 토글 (⌘⇧C) — CSV 감지 (구분자 "${columns.delimiter ?? ","}"${columns.hasHeader ? ", 헤더 있음" : ""})`
+                                        : "컬럼 뷰 토글 (⌘⇧C) — JSON Lines 감지"
+                                }
+                                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center space-x-1.5 cursor-pointer ${
+                                    columnViewActive
+                                        ? "bg-blue-600 text-white hover:bg-blue-500 shadow-xs"
+                                        : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                }`}
+                            >
+                                <span>컬럼</span>
+                                <span
+                                    className={`text-[10px] px-1 py-0.5 rounded font-mono ${
+                                        columnViewActive
+                                            ? "bg-blue-700 text-blue-100"
+                                            : "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400"
+                                    }`}
+                                >
+                                    {columns.format === "csv" ? "CSV" : "JSONL"}
+                                </span>
+                                <kbd
+                                    className={`text-[10px] px-1 py-0.5 rounded font-mono ${
+                                        columnViewActive
+                                            ? "bg-blue-700 text-blue-100"
+                                            : "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400"
+                                    }`}
+                                >
+                                    ⌘⇧C
+                                </kbd>
+                            </button>
+                        )}
                         <button
                             type="button"
                             onClick={handleToggleTail}
@@ -1596,6 +2139,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         onSpecChange={setFilterSpec}
                         focusSignal={filterFocusSignal}
                         isActive={isActive}
+                        fileId={file.id}
+                        columns={columns}
                     />
                 )}
 
@@ -1614,6 +2159,32 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         >
                             닫기
                         </button>
+                    </div>
+                )}
+
+                {/* 북마크 stale 안내 바: 저장 이후 파일 내용이 바뀐 경우 */}
+                {bookmarksStale && (
+                    <div className="px-4 py-2 bg-amber-50 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300 text-xs flex items-center justify-between border-b border-amber-200 dark:border-amber-900">
+                        <span className="select-text">
+                            파일 내용이 바뀌어 북마크 위치가 다를 수 있습니다.
+                        </span>
+                        <div className="flex items-center gap-3 ml-4 shrink-0">
+                            <button
+                                type="button"
+                                onClick={handleConfirmStaleBookmarks}
+                                className="font-bold hover:underline cursor-pointer"
+                                title="현재 파일 기준으로 북마크를 다시 저장합니다"
+                            >
+                                확인
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setBookmarksStale(false)}
+                                className="hover:underline cursor-pointer"
+                            >
+                                닫기
+                            </button>
+                        </div>
                     </div>
                 )}
 
@@ -1657,6 +2228,12 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 onTruncatedLineClick={handleTruncatedLineClick}
                                 onPinchZoom={onFontSizeAdjust}
                                 isActive={isActive}
+                                bookmarks={bookmarkLineMap}
+                                bookmarkMarkers={bookmarkMarkers}
+                                onBookmarkToggle={toggleBookmarkAt}
+                                columns={columns}
+                                columnView={columnViewActive}
+                                onFieldFilter={handleFieldFilter}
                             />
                             {isActive &&
                                 fullLinePanel !== null &&
@@ -1668,6 +2245,17 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                         onClose={handleCloseFullLinePanel}
                                     />
                                 )}
+                            {isActive && bookmarkPanelOpen && (
+                                <BookmarkPanel
+                                    fileId={file.id}
+                                    items={bookmarks}
+                                    onClose={handleToggleBookmarkPanel}
+                                    onNavigate={handleBookmarkPanelNavigate}
+                                    onChangeNote={handleBookmarkNoteChange}
+                                    onChangeColor={handleBookmarkColorChange}
+                                    onDelete={handleBookmarkDelete}
+                                />
+                            )}
                         </>
                     ) : (
                         <div className="flex-1 flex items-center justify-center">
