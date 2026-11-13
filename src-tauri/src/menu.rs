@@ -32,8 +32,18 @@ pub fn apply_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<()> {
 
 /// 앱 메뉴바 전체를 구성한다.
 fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
-    // 파일 메뉴: 열기, 최근 파일, 닫기
+    // 파일 메뉴: 열기, 최근 파일, 탭 닫기, 창 닫기
     let open_item = MenuItem::with_id(app, "open", "열기…", true, Some("CmdOrCtrl+O"))?;
+    let close_tab_item = MenuItem::with_id(app, "close_tab", "탭 닫기", true, Some("CmdOrCtrl+W"))?;
+    // PredefinedMenuItem::close_window는 macOS에서 단축키가 ⌘W로 고정되어
+    // 탭 닫기(⌘W)와 충돌하므로, 일반 항목 + 네이티브 close로 ⌘⇧W를 지원한다.
+    let close_window_item = MenuItem::with_id(
+        app,
+        "close_window",
+        "창 닫기",
+        true,
+        Some("CmdOrCtrl+Shift+W"),
+    )?;
 
     // 최근 파일 서브메뉴: 비어 있으면 비활성 "(없음)" 항목 하나
     let recent_entries: Vec<MenuItem<Wry>> = if recent.is_empty() {
@@ -77,7 +87,8 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
             &open_item,
             &recent_menu,
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::close_window(app, Some("닫기"))?,
+            &close_tab_item,
+            &close_window_item,
         ],
     )?;
 
@@ -119,7 +130,19 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
         ],
     )?;
 
-    let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&file_menu, &edit_menu, &move_menu, &view_menu];
+    // 윈도우 메뉴: 탭 이동
+    let window_menu = Submenu::with_items(
+        app,
+        "윈도우",
+        true,
+        &[
+            &MenuItem::with_id(app, "next_tab", "다음 탭", true, Some("CmdOrCtrl+Shift+]"))?,
+            &MenuItem::with_id(app, "prev_tab", "이전 탭", true, Some("CmdOrCtrl+Shift+["))?,
+        ],
+    )?;
+
+    let mut items: Vec<&dyn IsMenuItem<Wry>> =
+        vec![&file_menu, &edit_menu, &move_menu, &view_menu, &window_menu];
 
     // macOS 앱 메뉴 (About, Services, Hide, Quit 등)
     #[cfg(target_os = "macos")]
@@ -134,12 +157,21 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
         // 업데이트 확인 항목과 시작 시 자동 확인 체크 항목 (About 바로 아래)
         let check_updates_item =
             MenuItem::with_id(app, "check_updates", "업데이트 확인…", true, None::<&str>)?;
+        let settings = crate::settings::load_settings(app);
         let auto_update_item = CheckMenuItem::with_id(
             app,
             "toggle_auto_update",
             "시작 시 업데이트 자동 확인",
             true,
-            crate::settings::load_settings(app).auto_check_updates,
+            settings.auto_check_updates,
+            None::<&str>,
+        )?;
+        let restore_session_item = CheckMenuItem::with_id(
+            app,
+            "toggle_restore_session",
+            "시작 시 이전 탭 복원",
+            true,
+            settings.restore_session,
             None::<&str>,
         )?;
         Submenu::with_items(
@@ -151,6 +183,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
                 &PredefinedMenuItem::separator(app)?,
                 &check_updates_item,
                 &auto_update_item,
+                &restore_session_item,
                 &PredefinedMenuItem::separator(app)?,
                 &PredefinedMenuItem::services(app, None)?,
                 &PredefinedMenuItem::separator(app)?,
@@ -180,6 +213,25 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         let current = crate::settings::load_settings(app).auto_check_updates;
         if let Err(e) = crate::settings::update_auto_check_setting(app, !current) {
             eprintln!("업데이트 설정 변경 실패: {e}");
+        }
+        return;
+    }
+
+    // 탭 세션 복원 토글도 설정 저장과 메뉴 갱신까지 Rust에서 완결한다
+    if id == "toggle_restore_session" {
+        let current = crate::settings::load_settings(app).restore_session;
+        if let Err(e) = crate::settings::update_restore_session_setting(app, !current) {
+            eprintln!("세션 복원 설정 변경 실패: {e}");
+        }
+        return;
+    }
+
+    // 창 닫기는 네이티브로 처리한다 (프론트엔드 이벤트를 보내지 않는다)
+    if id == "close_window" {
+        if let Some(window) = app.get_webview_window("main")
+            && let Err(e) = window.close()
+        {
+            eprintln!("창 닫기 실패: {e}");
         }
         return;
     }

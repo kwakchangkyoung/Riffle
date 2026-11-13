@@ -158,6 +158,7 @@ interface LogViewportProps {
     selectedRange?: { start: number; end: number } | null; // 줄 단위 선택 범위 (0-based, 일반 모드만)
     onGutterLineClick?: (index: number, shiftKey: boolean) => void;
     onTruncatedLineClick?: (lineNo: number) => void; // 잘린 줄의 "…" 클릭 시 원문 줄 번호(0-based)
+    isActive?: boolean; // 활성 탭 여부 — false이면 뷰어 단축키를 무시한다
 }
 
 /**
@@ -184,6 +185,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         selectedRange,
         onGutterLineClick,
         onTruncatedLineClick,
+        isActive = true,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyScrollRef = useRef<HTMLDivElement>(null);
@@ -314,6 +316,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         // 키보드 내비게이션
         useEffect(() => {
             const handleKeyDown = (e: KeyboardEvent) => {
+                // 숨겨진 탭(비활성)은 스크롤 단축키를 처리하지 않는다
+                if (!isActive) return;
                 // 모달(aria-modal)이 열려 있으면 뷰어 단축키를 무시한다
                 // (SearchBar의 전역 Enter 핸들러와 같은 가드)
                 if (document.querySelector('[aria-modal="true"]') !== null) {
@@ -372,6 +376,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
             visibleRows,
             rowHeight,
             onTopLineChange,
+            isActive,
         ]);
 
         const getLineCallback = useCallback(

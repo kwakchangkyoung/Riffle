@@ -129,8 +129,8 @@ pub struct AppState {
     pub next_filter_id: AtomicU32,
     /// 최근 파일 목록 (최근 순, 네이티브 메뉴 표시용)
     pub recent_files: Mutex<Vec<String>>,
-    /// Finder 파일 연결로 열린 경로 (콜드 스타트 시 프론트 리스너 등록 전 도착분)
-    pub pending_open: Mutex<Option<String>>,
+    /// Finder 파일 연결로 열린 경로 목록 (콜드 스타트 시 프론트 리스너 등록 전 도착분)
+    pub pending_open: Mutex<Vec<String>>,
     /// 프론트가 take_pending_open을 호출했는지 여부 (호출 = 프론트 준비 완료)
     pub front_ready: AtomicBool,
 }
@@ -145,7 +145,7 @@ impl Default for AppState {
             next_search_id: AtomicU32::new(1),
             next_filter_id: AtomicU32::new(1),
             recent_files: Mutex::new(Vec::new()),
-            pending_open: Mutex::new(None),
+            pending_open: Mutex::new(Vec::new()),
             front_ready: AtomicBool::new(false),
         }
     }
@@ -380,19 +380,19 @@ impl AppState {
             .clone()
     }
 
-    /// Finder에서 연 파일 경로를 임시 보관한다 (여러 개면 마지막 것만 유지).
-    pub fn set_pending_open(&self, path: String) {
-        *self.pending_open.lock().unwrap_or_else(|p| p.into_inner()) = Some(path);
-    }
-
-    /// 보관된 대기 경로를 꺼내고 비운다. 한 번만 값을 반환한다.
-    /// 호출 시점에 프론트 준비가 완료된 것으로 표시한다.
-    pub fn take_pending_open(&self) -> Option<String> {
-        self.front_ready.store(true, Ordering::Relaxed);
+    /// Finder에서 연 파일 경로들을 대기 목록에 순서대로 추가한다 (프론트 준비 전 누적용).
+    pub fn push_pending_open(&self, paths: Vec<String>) {
         self.pending_open
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take()
+            .extend(paths);
+    }
+
+    /// 보관된 대기 경로 목록을 꺼내고 비운다.
+    /// 호출 시점에 프론트 준비가 완료된 것으로 표시한다.
+    pub fn take_pending_open(&self) -> Vec<String> {
+        self.front_ready.store(true, Ordering::Relaxed);
+        std::mem::take(&mut *self.pending_open.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// 프론트가 준비 완료(take_pending_open 호출)했는지 반환한다.
@@ -784,17 +784,24 @@ mod tests {
     fn test_pending_open_take_once() {
         let state = AppState::default();
 
-        // 비어 있으면 None
-        assert_eq!(state.take_pending_open(), None);
+        // 비어 있으면 빈 목록
+        assert!(state.take_pending_open().is_empty());
 
-        // 설정 후 take하면 경로가 반환되고 비워진다
-        state.set_pending_open("/tmp/a.log".to_string());
-        assert_eq!(state.take_pending_open().as_deref(), Some("/tmp/a.log"));
-        assert_eq!(state.take_pending_open(), None);
+        // 설정 후 take하면 경로 목록이 반환되고 비워진다
+        state.push_pending_open(vec!["/tmp/a.log".to_string()]);
+        assert_eq!(state.take_pending_open(), vec!["/tmp/a.log".to_string()]);
+        assert!(state.take_pending_open().is_empty());
 
-        // 여러 번 설정하면 마지막 경로만 남는다
-        state.set_pending_open("/tmp/a.log".to_string());
-        state.set_pending_open("/tmp/b.log".to_string());
-        assert_eq!(state.take_pending_open().as_deref(), Some("/tmp/b.log"));
+        // 여러 번 추가하면 순서대로 모두 누적된다
+        state.push_pending_open(vec!["/tmp/a.log".to_string(), "/tmp/b.log".to_string()]);
+        state.push_pending_open(vec!["/tmp/c.log".to_string()]);
+        assert_eq!(
+            state.take_pending_open(),
+            vec![
+                "/tmp/a.log".to_string(),
+                "/tmp/b.log".to_string(),
+                "/tmp/c.log".to_string(),
+            ]
+        );
     }
 }

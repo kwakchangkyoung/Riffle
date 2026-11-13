@@ -16,6 +16,8 @@ interface FilterBarProps {
     onSpecChange: (spec: FilterSpec) => void;
     /** 증가할 때마다 규칙 입력창에 포커스 (네이티브 메뉴 "필터 규칙 추가" 이벤트용) */
     focusSignal?: number;
+    /** 활성 탭 여부 — false이면 Cmd+Shift+F 포커스 단축키를 무시한다 */
+    isActive?: boolean;
 }
 
 /** 레벨 칩 정의. 색은 LogViewport의 로그 레벨 색상과 동일하게 맞춘다 */
@@ -74,7 +76,7 @@ const EMPTY_DRAFT: DraftRule = {
  * 레벨 칩, 규칙 칩(추가/수정/삭제/색상), AND/OR 전환, 프리셋 관리를 담당한다.
  */
 export const FilterBar: React.FC<FilterBarProps> = React.memo(
-    ({ spec, onSpecChange, focusSignal }) => {
+    ({ spec, onSpecChange, focusSignal, isActive = true }) => {
         const ruleInputRef = useRef<HTMLInputElement>(null);
 
         const [draft, setDraft] = useState<DraftRule>(EMPTY_DRAFT);
@@ -218,6 +220,8 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
         // keydown이 도달하지 않을 수 있으므로, App의 메뉴 이벤트 경로(focusSignal)도 함께 둔다.
         useEffect(() => {
             const handler = (e: KeyboardEvent) => {
+                // 숨겨진 탭(비활성)은 포커스 단축키를 처리하지 않는다
+                if (!isActive) return;
                 if (e.metaKey && e.shiftKey && e.code === "KeyF") {
                     e.preventDefault();
                     ruleInputRef.current?.focus();
@@ -226,7 +230,7 @@ export const FilterBar: React.FC<FilterBarProps> = React.memo(
             };
             window.addEventListener("keydown", handler);
             return () => window.removeEventListener("keydown", handler);
-        }, []);
+        }, [isActive]);
 
         // ===== 프리셋 =====
 

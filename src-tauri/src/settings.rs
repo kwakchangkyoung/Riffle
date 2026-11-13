@@ -11,12 +11,15 @@ use tauri::{AppHandle, Manager};
 pub struct Settings {
     /// 시작 시 업데이트 자동 확인 여부 (기본 true)
     pub auto_check_updates: bool,
+    /// 시작 시 이전 탭 세션 복원 여부 (기본 true)
+    pub restore_session: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_check_updates: true,
+            restore_session: true,
         }
     }
 }
@@ -77,12 +80,20 @@ pub fn save_settings(app: &AppHandle, settings: &Settings) -> Result<(), String>
 /// 자동 업데이트 확인 설정을 변경·저장하고 메뉴 체크 상태를 갱신한다.
 /// 메뉴의 토글 항목과 set_auto_check_updates 커맨드가 공통으로 사용한다.
 pub fn update_auto_check_setting(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    save_settings(
-        app,
-        &Settings {
-            auto_check_updates: enabled,
-        },
-    )?;
+    let mut settings = load_settings(app);
+    settings.auto_check_updates = enabled;
+    save_settings(app, &settings)?;
+    // 체크 항목 상태 반영을 위해 네이티브 메뉴를 재구성한다
+    let recent = app.state::<crate::state::AppState>().recent_files();
+    crate::menu::apply_menu(app, &recent).map_err(|e| e.to_string())
+}
+
+/// 시작 시 탭 세션 복원 설정을 변경·저장하고 메뉴 체크 상태를 갱신한다.
+/// 앱 메뉴의 토글 항목이 사용한다 (프론트엔드에는 이벤트를 보내지 않는다).
+pub fn update_restore_session_setting(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = load_settings(app);
+    settings.restore_session = enabled;
+    save_settings(app, &settings)?;
     // 체크 항목 상태 반영을 위해 네이티브 메뉴를 재구성한다
     let recent = app.state::<crate::state::AppState>().recent_files();
     crate::menu::apply_menu(app, &recent).map_err(|e| e.to_string())
@@ -106,16 +117,19 @@ mod tests {
 
     #[test]
     fn test_settings_default() {
-        assert!(Settings::default().auto_check_updates);
+        let settings = Settings::default();
+        assert!(settings.auto_check_updates);
+        assert!(settings.restore_session);
     }
 
     #[test]
     fn test_settings_serde_roundtrip() {
         let settings = Settings {
             auto_check_updates: false,
+            restore_session: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
-        assert_eq!(json, r#"{"autoCheckUpdates":false}"#);
+        assert_eq!(json, r#"{"autoCheckUpdates":false,"restoreSession":false}"#);
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, settings);
     }
@@ -125,6 +139,12 @@ mod tests {
         // 필드가 없는 JSON도 기본값(true)으로 채워진다
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.auto_check_updates);
+        assert!(parsed.restore_session);
+
+        // restore_session이 없는 기존 settings.json도 호환된다
+        let parsed: Settings = serde_json::from_str(r#"{"autoCheckUpdates":false}"#).unwrap();
+        assert!(!parsed.auto_check_updates);
+        assert!(parsed.restore_session);
     }
 
     #[test]
@@ -146,6 +166,7 @@ mod tests {
         let path = crate::testutil::temp_log_path("settings_rw");
         let settings = Settings {
             auto_check_updates: false,
+            restore_session: false,
         };
         write_settings_file(&path, &settings).unwrap();
         assert_eq!(read_settings_file(&path), settings);

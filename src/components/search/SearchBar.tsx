@@ -27,6 +27,7 @@ interface SearchBarProps {
     currentHit: SearchHit | null;
     setCurrentHit: React.Dispatch<React.SetStateAction<SearchHit | null>>;
     decompressing: boolean; // gzip 해제 진행 중 여부 (검색 시작 시점 판정용)
+    isActive?: boolean; // 활성 탭 여부 — false이면 전역 Enter 탐색을 무시한다
 }
 
 /**
@@ -51,6 +52,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         currentHit,
         setCurrentHit,
         decompressing,
+        isActive = true,
     }) => {
         const inputRef = useRef<HTMLInputElement>(null);
 
@@ -378,6 +380,8 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
         // 이벤트(defaultPrevented)는 무시한다 (예: 줄 이동 다이얼로그 Enter).
         useEffect(() => {
             const handleGlobalKeyDown = (e: KeyboardEvent) => {
+                // 숨겨진 탭(비활성)은 검색 결과 이동 단축키를 처리하지 않는다
+                if (!isActive) return;
                 if (e.key !== "Enter" || e.defaultPrevented) return;
                 const active = document.activeElement;
                 if (
@@ -404,7 +408,7 @@ export const SearchBar: React.FC<SearchBarProps> = React.memo(
             window.addEventListener("keydown", handleGlobalKeyDown);
             return () =>
                 window.removeEventListener("keydown", handleGlobalKeyDown);
-        }, [handleNext, handlePrev]);
+        }, [handleNext, handlePrev, isActive]);
 
         // 검색 세션이 살아 있고(isSearching/isSearchDone) 결과가 있을 때만
         // 필터/이동 버튼을 활성화한다. ref가 아닌 state로 판단해 리렌더에 반영된다.

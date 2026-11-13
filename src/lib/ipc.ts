@@ -351,11 +351,36 @@ export function getRecentFiles(): Promise<string[]> {
 }
 
 /**
- * Finder 파일 연결로 보관된 대기 경로를 한 번만 가져옵니다 (콜드 스타트 대응).
+ * Finder 파일 연결로 보관된 대기 경로 목록을 한 번만 가져옵니다 (콜드 스타트 대응).
  * 반환 후 백엔드에서 비워지므로 같은 경로가 두 번 열리지 않습니다.
  */
-export function takePendingOpen(): Promise<string | null> {
-    return invoke<string | null>("take_pending_open");
+export async function takePendingOpen(): Promise<string[]> {
+    const value = await invoke<string[] | string | null>("take_pending_open");
+    // 구버전 백엔드(단일 경로 문자열)와의 호환을 위해 배열로 정규화한다
+    if (value === null) return [];
+    return Array.isArray(value) ? value : [value];
+}
+
+/**
+ * 종료 시 저장된 탭 세션 (열린 탭 경로 목록 + 활성 탭 인덱스).
+ */
+export interface Session {
+    paths: string[];
+    activeIndex: number | null;
+}
+
+/**
+ * 현재 탭 세션을 저장합니다.
+ */
+export function saveSession(session: Session): Promise<void> {
+    return invoke<void>("save_session", { session });
+}
+
+/**
+ * 저장된 탭 세션을 조회합니다. 복원 설정이 꺼져 있거나 세션이 없으면 null.
+ */
+export function loadSession(): Promise<Session | null> {
+    return invoke<Session | null>("load_session");
 }
 
 /**
@@ -372,6 +397,8 @@ export interface MenuEvent {
  */
 export interface Settings {
     autoCheckUpdates: boolean;
+    /** 시작 시 이전 탭 세션 복원 여부 (기본 true) */
+    restoreSession: boolean;
 }
 
 /**

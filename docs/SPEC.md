@@ -140,7 +140,7 @@ pub struct Line {
 
 | 커맨드               | 입력                                                                                                   | 출력                          | 비고                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------- | ------------------------------------------------------- |
-| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size }` | 인덱싱을 백그라운드로 시작하고 즉시 반환                |
+| `open_file`          | `path`, `on_progress: Channel<IndexProgress>`                                                          | `FileInfo { id, path, size }` | 인덱싱을 백그라운드로 시작하고 즉시 반환. `path`는 canonical 경로 |
 | `get_lines`          | `id`, `start`, `count`, `query?`, `spec?`                                                              | `Vec<Line>` (+ 하이라이트)    | count 상한 1,000. spec은 규칙 하이라이트용               |
 | `search`             | `id`, `query`, `filter_id?`, `on_result: Channel<SearchEvent>`                                          | `search_id`                   | 이전 검색 자동 취소. filter_id 지정 시 필터와 교집합     |
 | `cancel_search`      | `search_id`                                                                                            | `()`                          |                                                         |
@@ -156,8 +156,13 @@ pub struct Line {
 | `delete_filter_preset`| `name`                                                                                                | `()`                          | 없으면 에러                                              |
 | `copy_lines`         | `id`, `start`, `end`                                                                                   | `()`                          | Rust에서 직접 클립보드에 기록 (대량 복사 대비)            |
 | `close_file`         | `id`                                                                                                   | `()`                          | 인덱싱/검색/필터 취소 및 자원 해제                       |
+| `take_pending_open`  | -                                                                                                      | `string[]`                    | Finder 연결 대기 경로 목록 (콜드 스타트, 1회 수령)        |
+| `save_session`       | `session: { paths, activeIndex }`                                                                      | `()`                          | 탭 세션을 session.json에 원자적 저장                      |
+| `load_session`       | -                                                                                                      | `Session \| null`             | 탭 세션 로드. `restoreSession` 꺼짐/파일 없음/경로 전멸 시 null |
 
 - `IndexProgress { indexed_bytes, total_bytes, line_count, done }`
+- (Phase 11) Finder "다음으로 열기"·다중 선택·드래그 앤 드롭으로 열린 파일은 `"open-files"` 이벤트(`string[]`, 순서 유지)로 프론트에 전달한다. 콜드 스타트처럼 프론트 준비 전에 도착한 경로는 Rust가 `pending_open`에 누적하고 `take_pending_open`으로 한 번에 수령한다. 파일 열기·드래그 앤 드롭·최근 파일·세션 복원은 모두 새 탭으로 열고, 이미 열린 같은 경로(canonical `FileInfo.path` 기준)면 해당 탭으로 전환한다.
+- (Phase 11) 탭 세션은 `session.json`에 `{ paths, activeIndex }`로 저장한다. 프론트가 탭 목록/활성 탭 변경 시 500ms 디바운스로 `save_session`을 호출하고, 시작 시 `load_session`으로 복원한다(`restoreSession` 설정, 기본 켜짐). 존재하지 않는 경로는 로드 시 걸러낸다.
 - `SearchEvent`는 `Progress { scanned_bytes, total_bytes, match_count }`, `Done { total, capped }`, `Cancelled`, `Error { message }` 중 하나. `start_filter`도 같은 이벤트 형식을 쓴다.
 - `Line`에는 `highlights`(검색 매치, UTF-16)와 `rule_highlights`(규칙 매치 `[start, end, ruleIdx]`, UTF-16)가 있다.
 - `FilterSpec { rules: [{ pattern, regex, caseSensitive, kind: "include"|"exclude", enabled, color }], combine: "and"|"or", levels: ["error"|"warn"|"info"|"debug"|"trace"] }`. `color`는 프론트 표시용이며 Rust는 저장만 한다.
@@ -191,13 +196,20 @@ pub struct Line {
 
 | 키                  | 동작                     |
 | ------------------- | ------------------------ |
-| Cmd+O               | 파일 열기                |
+| Cmd+O               | 파일 열기 (새 탭)        |
+| Cmd+W               | 탭 닫기                  |
+| Cmd+Shift+W         | 창 닫기                  |
+| Cmd+Shift+] / [     | 다음 / 이전 탭           |
+| Cmd+1~9             | N번째 탭으로 이동        |
+| Ctrl+Tab / Ctrl+Shift+Tab | 다음 / 이전 탭    |
 | Cmd+F               | 검색창 포커스            |
 | Enter / Shift+Enter | 다음 / 이전 결과         |
 | Cmd+L               | 줄 번호로 이동           |
 | ↑↓, PageUp/PageDown | 스크롤                   |
 | Cmd+↑ / Cmd+↓       | 파일 처음 / 끝           |
 | Cmd+T               | tail 모드 토글 (Phase 4) |
+
+- (Phase 11) "창 닫기"는 `PredefinedMenuItem::close_window` 대신 커스텀 `MenuItem`(⌘⇧W)를 쓴다. predefined 항목은 macOS에서 단축키가 ⌘W로 고정되어 "탭 닫기"(⌘W)와 충돌하므로, 메뉴 이벤트를 받아 Rust에서 `window.close()`를 호출한다.
 
 ### 5.5 UI 구성
 

@@ -586,11 +586,16 @@ pub async fn open_file(
 ) -> Result<FileInfo, String> {
     // 파일 열기(무거운 IO)를 블로킹 스레드에서 수행.
     // AppHandle을 통해 블로킹 스레드 안에서 AppState를 다시 얻는다.
+    // 탭 중복 판별과 최근 파일 기록에 쓸 수 있게 canonical 경로로 변환한다
+    // (심볼릭 링크 등으로 같은 파일을 가리키는 경로를 하나로 맞춤, 실패 시 원래 경로).
     let open_app = app.clone();
-    let open_path = path.clone();
+    let open_path = path;
     let opened = tauri::async_runtime::spawn_blocking(move || {
         let st = open_app.state::<AppState>();
-        open_file_internal(st.inner(), &open_path)
+        let canonical = std::fs::canonicalize(&open_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(open_path);
+        open_file_internal(st.inner(), &canonical)
     })
     .await
     .map_err(|e| format!("파일 열기 비동기 태스크 실패: {e}"))??;
@@ -614,8 +619,9 @@ pub async fn open_file(
 
     // 최근 파일 기록 + 메뉴의 "최근 파일" 서브메뉴 재구성.
     // 기록/메뉴 갱신 실패는 파일 열기 자체를 실패시키지 않는다.
+    // FileInfo.path는 canonical 경로이므로 그대로 기록한다.
     let recent_app = app.clone();
-    let recent_path = path.clone();
+    let recent_path = opened.info.path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::recent::with_recent_lock(|| {
             match crate::recent::record_open(&recent_app, &recent_path) {
@@ -872,12 +878,10 @@ pub async fn get_recent_files(app: tauri::AppHandle) -> Result<Vec<String>, Stri
         .map_err(|e| format!("최근 파일 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
-/// Finder 파일 연결로 보관된 대기 경로를 한 번만 반환한다 (콜드 스타트 대응).
+/// Finder 파일 연결로 보관된 대기 경로 목록을 한 번만 반환한다 (콜드 스타트 대응).
 /// 반환 후에는 비워지므로 같은 경로가 두 번 열리지 않는다.
 #[tauri::command]
-pub async fn take_pending_open(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<String>, String> {
+pub async fn take_pending_open(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(state.take_pending_open())
 }
 

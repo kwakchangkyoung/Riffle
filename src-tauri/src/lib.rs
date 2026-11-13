@@ -6,6 +6,7 @@ pub mod menu;
 pub mod opened;
 pub mod presets;
 pub mod recent;
+pub mod session;
 pub mod settings;
 pub mod state;
 pub mod tail;
@@ -18,6 +19,7 @@ use commands::{
     get_recent_files, list_filter_presets, open_file, save_filter_preset, search, search_density,
     search_hit_at, search_nav, start_filter, take_pending_open, validate_filter, validate_query,
 };
+use session::{load_session, save_session};
 use settings::{get_settings, set_auto_check_updates};
 use state::AppState;
 use tail::set_tail;
@@ -49,6 +51,8 @@ pub fn run() {
             take_pending_open,
             get_settings,
             set_auto_check_updates,
+            save_session,
+            load_session,
             validate_filter,
             start_filter,
             cancel_filter,
