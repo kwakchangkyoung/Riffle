@@ -1,5 +1,6 @@
 import React from "react";
 import type { Line } from "@/lib/ipc";
+import { s3DisplayPath } from "@/lib/remote";
 
 /** 병합 원본 칩 정보 (원본 순번 → 색·짧은 이름) */
 export interface MergeChipInfo {
@@ -80,7 +81,7 @@ export const MergeChipColumn: React.FC<MergeChipColumnProps> = React.memo(
                                 fontSize: `${Math.max(9, fontSize - 3)}px`,
                                 lineHeight: `${rowHeight}px`,
                             }}
-                            title={`${src.path} — 클릭하면 이 원본 탭으로 이동`}
+                            title={`${s3DisplayPath(src.path, null)} — 클릭하면 이 원본 탭으로 이동`}
                         >
                             <span
                                 className="w-1.5 h-1.5 rounded-full shrink-0"

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use riffle_core::{
     DecompressProgress, LogFile, Matcher, SearchOptions, is_gzip_reader, open_gzip_remote, search,
 };
-use riffle_remote::{RemoteError, S3Pool, S3Uri, list_aws_profiles_from};
+use riffle_remote::{RemoteError, S3Auth, S3Pool, S3StaticCreds, S3Uri, list_aws_profiles_from};
 
 // ---------------------------------------------------------------------------
 // 가짜 S3 서버
@@ -26,6 +26,8 @@ struct RecordedRequest {
     target: String,
     /// Range 헤더 값 (없으면 None).
     range: Option<String>,
+    /// Authorization 헤더 값 (서명 검증용, 없으면 None).
+    authorization: Option<String>,
 }
 
 struct FakeState {
@@ -220,6 +222,7 @@ fn handle_conn(
         method: req.method.clone(),
         target: req.target.clone(),
         range: req.headers.get("range").cloned(),
+        authorization: req.headers.get("authorization").cloned(),
     });
     let cur = inflight.fetch_add(1, Ordering::Relaxed) + 1;
     max_inflight.fetch_max(cur, Ordering::Relaxed);
@@ -316,6 +319,18 @@ fn route(req: &Request, st: &FakeState) -> Response {
     let bucket = percent_decode(segs.next().unwrap_or_default());
     let key = percent_decode(segs.next().unwrap_or_default());
 
+    // 서명 검증 흉내: 특정 액세스 키는 잘못된 키 / 서명 불일치로 거부한다.
+    let auth = req
+        .headers
+        .get("authorization")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if auth.contains("Credential=AKIABADKEY/") {
+        return error_response(403, "InvalidAccessKeyId", "키가 없습니다");
+    }
+    if auth.contains("Credential=AKIABADSIG/") {
+        return error_response(403, "SignatureDoesNotMatch", "서명이 맞지 않습니다");
+    }
     if st.forbidden_buckets.contains(&bucket) {
         return error_response(403, "AccessDenied", "접근이 거부되었습니다");
     }
@@ -669,9 +684,160 @@ fn aws_profiles_from_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn s3_uri_conn_parse_roundtrip() {
+    // `s3://<연결id>@버킷/키` 를 파싱하고 Display 로 원형을 복원한다.
+    let u = S3Uri::parse("s3://c1a2b3c4d5e6@my-bucket/logs/app.log").unwrap();
+    assert_eq!(u.conn.as_deref(), Some("c1a2b3c4d5e6"));
+    assert_eq!(u.bucket, "my-bucket");
+    assert_eq!(u.key, "logs/app.log");
+    assert_eq!(u.to_string(), "s3://c1a2b3c4d5e6@my-bucket/logs/app.log");
+
+    // 연결 없는 기존 형태는 conn=None.
+    let u = S3Uri::parse("s3://my-bucket/k").unwrap();
+    assert_eq!(u.conn, None);
+    assert_eq!(u.to_string(), "s3://my-bucket/k");
+
+    // 연결id@버킷만 (키 없음) 도 왕복된다.
+    let u = S3Uri::parse("s3://conn@b").unwrap();
+    assert_eq!(u.conn.as_deref(), Some("conn"));
+    assert_eq!(u.bucket, "b");
+    assert_eq!(u.key, "");
+    assert_eq!(u.to_string(), "s3://conn@b/");
+
+    // 빈 연결 id, 빈 버킷은 거부한다.
+    assert!(S3Uri::parse("s3://@b/k").is_none());
+    assert!(S3Uri::parse("s3://c@/k").is_none());
+    assert!(S3Uri::parse("s3://c@").is_none());
+}
+
 // ---------------------------------------------------------------------------
 // 가짜 서버를 통한 S3Pool / RandomRead
 // ---------------------------------------------------------------------------
+
+/// SigV4 Authorization 헤더에서 `Credential=` 스코프를 뽑는다.
+fn authz_credential(authz: &str) -> &str {
+    authz
+        .split_whitespace()
+        .flat_map(|part| part.split(','))
+        .find_map(|kv| kv.strip_prefix("Credential="))
+        .unwrap_or("")
+}
+
+/// 가짜 서버가 받은 요청들의 `Credential=` 앞부분(액세스 키) 목록을 반환한다.
+fn recorded_access_keys(s: &FakeS3) -> Vec<String> {
+    s.requests()
+        .into_iter()
+        .filter_map(|r| r.authorization)
+        .map(|a| {
+            authz_credential(&a)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn s3_static_creds_sign_with_own_key() {
+    let s = FakeS3::start();
+    s.add_bucket("b1");
+    s.put_object("b1", "app.log", &log_content(10));
+    let pool = make_pool(&s);
+
+    let creds = S3StaticCreds {
+        id: "caaaaaaaaaaa".to_string(),
+        access_key_id: "AKIACONNAAAAAAAA".to_string(),
+        secret_access_key: "secret-a".to_string(),
+        region: None,
+    };
+    let auth = S3Auth::Static(creds);
+    let uri = S3Uri::parse("s3://caaaaaaaaaaa@b1/app.log").unwrap();
+
+    let size = pool.head(&auth, &uri).expect("head 실패");
+    assert_eq!(size, log_content(10).len() as u64);
+    let r = pool.open_object(&auth, &uri).expect("open_object 실패");
+    let mut buf = vec![0u8; 64];
+    assert!(r.read_at(&mut buf, 0).unwrap() > 0);
+    let _ = pool.list_prefix(&auth, "b1", "").expect("list_prefix 실패");
+
+    // 모든 요청이 이 연결의 액세스 키로 서명됐다.
+    let keys = recorded_access_keys(&s);
+    assert!(!keys.is_empty());
+    assert!(
+        keys.iter().all(|k| k == "AKIACONNAAAAAAAA"),
+        "다른 키로 서명된 요청이 있습니다: {keys:?}"
+    );
+}
+
+#[test]
+fn s3_static_creds_distinct_per_connection() {
+    let s = FakeS3::start();
+    s.add_bucket("b1");
+    s.put_object("b1", "a.log", b"x");
+    let pool = make_pool(&s);
+
+    let auth_a = S3Auth::Static(S3StaticCreds {
+        id: "c11111111111".to_string(),
+        access_key_id: "AKIACONN1".to_string(),
+        secret_access_key: "secret-1".to_string(),
+        region: None,
+    });
+    let auth_b = S3Auth::Static(S3StaticCreds {
+        id: "c22222222222".to_string(),
+        access_key_id: "AKIACONN2".to_string(),
+        secret_access_key: "secret-2".to_string(),
+        region: None,
+    });
+    let uri = S3Uri::parse("s3://b1/a.log").unwrap();
+
+    pool.head(&auth_a, &uri).unwrap();
+    let after_a = s.requests().len();
+    pool.head(&auth_b, &uri).unwrap();
+
+    // 두 연결이 같은 풀을 공유해도 각자의 키로 서명한다.
+    let keys = recorded_access_keys(&s);
+    assert!(keys[..after_a].iter().all(|k| k == "AKIACONN1"));
+    assert!(
+        keys[after_a..].iter().all(|k| k == "AKIACONN2"),
+        "연결 B의 키로 서명되지 않은 요청: {keys:?}"
+    );
+}
+
+#[test]
+fn s3_static_creds_key_change_does_not_reuse_client() {
+    let s = FakeS3::start();
+    s.add_bucket("b1");
+    s.put_object("b1", "a.log", b"x");
+    let pool = make_pool(&s);
+    let uri = S3Uri::parse("s3://b1/a.log").unwrap();
+
+    // 같은 연결 id로 키를 바꾸면 이전 자격 증명의 클라이언트를 재사용하면 안 된다.
+    let auth_v1 = S3Auth::Static(S3StaticCreds {
+        id: "c33333333333".to_string(),
+        access_key_id: "AKIAOLD".to_string(),
+        secret_access_key: "secret-old".to_string(),
+        region: None,
+    });
+    pool.head(&auth_v1, &uri).unwrap();
+    let boundary = s.requests().len();
+
+    let auth_v2 = S3Auth::Static(S3StaticCreds {
+        id: "c33333333333".to_string(),
+        access_key_id: "AKIANEW".to_string(),
+        secret_access_key: "secret-new".to_string(),
+        region: None,
+    });
+    pool.head(&auth_v2, &uri).unwrap();
+
+    let keys = recorded_access_keys(&s);
+    assert!(keys[..boundary].iter().all(|k| k == "AKIAOLD"));
+    assert!(
+        keys[boundary..].iter().all(|k| k == "AKIANEW"),
+        "키 변경 후에도 옛 키로 서명된 요청: {keys:?}"
+    );
+}
 
 #[test]
 fn s3_read_various_ranges() {
@@ -681,7 +847,9 @@ fn s3_read_various_ranges() {
     s.put_object("b1", "app.log", &content);
     let pool = make_pool(&s);
     let uri = S3Uri::parse("s3://b1/app.log").unwrap();
-    let r = pool.open_object(None, &uri).expect("open_object 실패");
+    let r = pool
+        .open_object(&S3Auth::Profile(None), &uri)
+        .expect("open_object 실패");
 
     assert_eq!(r.uri(), "s3://b1/app.log");
     assert_eq!(r.stat_len().unwrap(), content.len() as u64);
@@ -731,7 +899,10 @@ fn s3_large_read_is_parallel() {
     s.set_range_rendezvous(8);
     let pool = make_pool(&s);
     let r = pool
-        .open_object(None, &S3Uri::parse("s3://big/big.log").unwrap())
+        .open_object(
+            &S3Auth::Profile(None),
+            &S3Uri::parse("s3://big/big.log").unwrap(),
+        )
         .unwrap();
 
     let mut buf = vec![0u8; 64 * 1024 * 1024];
@@ -788,10 +959,13 @@ fn s3_list_and_errors() {
     let pool = make_pool(&s);
 
     // 버킷 목록
-    assert_eq!(pool.list_buckets(None).unwrap(), vec!["bkt", "noaccess"]);
+    assert_eq!(
+        pool.list_buckets(&S3Auth::Profile(None)).unwrap(),
+        vec!["bkt", "noaccess"]
+    );
 
     // 루트: 디렉터리 먼저, 이름순.
-    let root = pool.list_prefix(None, "bkt", "").unwrap();
+    let root = pool.list_prefix(&S3Auth::Profile(None), "bkt", "").unwrap();
     assert_eq!(
         root.iter()
             .map(|e| (e.name.as_str(), e.is_dir))
@@ -800,7 +974,9 @@ fn s3_list_and_errors() {
     );
 
     // logs/ 아래: 페이지네이션을 거쳐 전부 온다 (3개씩 × 2페이지).
-    let entries = pool.list_prefix(None, "bkt", "logs/").unwrap();
+    let entries = pool
+        .list_prefix(&S3Auth::Profile(None), "bkt", "logs/")
+        .unwrap();
     let names: Vec<(&str, bool)> = entries
         .iter()
         .map(|e| (e.name.as_str(), e.is_dir))
@@ -823,21 +999,30 @@ fn s3_list_and_errors() {
     assert!(list_reqs >= 2, "페이지네이션 요청 부족: {list_reqs}");
 
     // 폴더 안으로 한 단계 더.
-    let inner = pool.list_prefix(None, "bkt", "logs/2024/").unwrap();
+    let inner = pool
+        .list_prefix(&S3Auth::Profile(None), "bkt", "logs/2024/")
+        .unwrap();
     assert_eq!(
         inner.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
         vec!["a.log", "b.log"]
     );
 
     // 403 → S3AccessDenied
-    let err = pool.list_prefix(None, "noaccess", "").unwrap_err();
+    let err = pool
+        .list_prefix(&S3Auth::Profile(None), "noaccess", "")
+        .unwrap_err();
     assert!(matches!(err, RemoteError::S3AccessDenied(_)), "{err}");
     // 404 → S3NotFound (객체 / 버킷 모두)
     let err = pool
-        .head(None, &S3Uri::parse("s3://bkt/none.log").unwrap())
+        .head(
+            &S3Auth::Profile(None),
+            &S3Uri::parse("s3://bkt/none.log").unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(err, RemoteError::S3NotFound(_)), "{err}");
-    let err = pool.list_prefix(None, "ghost", "").unwrap_err();
+    let err = pool
+        .list_prefix(&S3Auth::Profile(None), "ghost", "")
+        .unwrap_err();
     assert!(matches!(err, RemoteError::S3NotFound(_)), "{err}");
 }
 
@@ -849,7 +1034,10 @@ fn s3_logfile_parity() {
     s.put_object("b1", "app.log", &content);
     let pool = make_pool(&s);
     let r = pool
-        .open_object(None, &S3Uri::parse("s3://b1/app.log").unwrap())
+        .open_object(
+            &S3Auth::Profile(None),
+            &S3Uri::parse("s3://b1/app.log").unwrap(),
+        )
         .unwrap();
 
     // 로컬과 원격을 나란히 인덱싱해 결과를 비교한다.
@@ -909,7 +1097,10 @@ fn s3_gzip_remote() {
     s.put_object("b1", "logs.gz", gz);
     let pool = make_pool(&s);
     let r = pool
-        .open_object(None, &S3Uri::parse("s3://b1/logs.gz").unwrap())
+        .open_object(
+            &S3Auth::Profile(None),
+            &S3Uri::parse("s3://b1/logs.gz").unwrap(),
+        )
         .unwrap();
 
     assert!(is_gzip_reader(r.as_ref()).unwrap());
@@ -949,7 +1140,10 @@ fn s3_index_1gb() {
     s.put_object("big", "1gb.log", &content);
     let pool = make_pool(&s);
     let r = pool
-        .open_object(None, &S3Uri::parse("s3://big/1gb.log").unwrap())
+        .open_object(
+            &S3Auth::Profile(None),
+            &S3Uri::parse("s3://big/1gb.log").unwrap(),
+        )
         .unwrap();
     let file = LogFile::open_remote(r).unwrap();
     let cancel = AtomicBool::new(false);
@@ -959,5 +1153,40 @@ fn s3_index_1gb() {
         "1GiB S3(가짜 서버) 인덱싱: {:?} ({}줄)",
         t.elapsed(),
         file.index().line_count()
+    );
+}
+
+#[test]
+fn s3_invalid_key_errors_are_specific() {
+    let s = FakeS3::start();
+    s.add_bucket("bkt");
+    let pool = make_pool(&s);
+    let auth_with = |access: &str| {
+        S3Auth::Static(S3StaticCreds {
+            id: "cbad00000000".to_string(),
+            access_key_id: access.to_string(),
+            secret_access_key: "secret".to_string(),
+            region: Some("us-east-1".to_string()),
+        })
+    };
+
+    // 존재하지 않는 액세스 키 → 액세스 키 안내
+    let err = pool
+        .list_prefix(&auth_with("AKIABADKEY"), "bkt", "")
+        .unwrap_err();
+    assert!(matches!(err, RemoteError::S3InvalidKey(..)), "{err}");
+    assert!(
+        err.to_string().contains("액세스 키가 올바르지 않습니다"),
+        "{err}"
+    );
+
+    // 비밀 키 불일치 → 비밀 키 안내
+    let err = pool
+        .list_prefix(&auth_with("AKIABADSIG"), "bkt", "")
+        .unwrap_err();
+    assert!(matches!(err, RemoteError::S3InvalidKey(..)), "{err}");
+    assert!(
+        err.to_string().contains("비밀 키가 올바르지 않습니다"),
+        "{err}"
     );
 }

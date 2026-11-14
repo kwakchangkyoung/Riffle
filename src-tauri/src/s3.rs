@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use riffle_core::LogFile;
-use riffle_remote::S3Uri;
+use riffle_remote::{S3Auth, S3Uri};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -25,17 +25,27 @@ pub struct S3EntryDto {
 }
 
 /// s3:// URI 객체를 열어 OpenedFile을 반환한다.
-/// 프로필은 URI가 아니라 AppState의 s3_profile(마지막 선택)을 사용한다.
+/// `s3://<연결id>@버킷/키` 면 저장 연결의 Static 인증을 쓰고,
+/// 아니면 AppState의 s3_profile(마지막 선택)로 프로필 인증을 쓴다.
 /// close 시 별도 해제가 필요 없다 — S3Pool의 클라이언트는 캐시에서 재사용된다.
 pub fn open_s3_internal(state: &AppState, path: &str) -> Result<OpenedFile, String> {
     let uri = S3Uri::parse(path).ok_or_else(|| {
         format!("잘못된 S3 경로입니다: '{path}' (s3://버킷/키 형식이어야 합니다)")
     })?;
-    let profile = state.s3_profile();
+    let (auth, conn_name) = match &uri.conn {
+        Some(id) => {
+            let (creds, name) = crate::s3_connections::resolve_for_open(state, id)?;
+            (S3Auth::Static(creds), Some(name))
+        }
+        None => (S3Auth::Profile(state.s3_profile()), None),
+    };
     let reader = state
         .s3_pool
-        .open_object(profile.as_deref(), &uri)
+        .open_object(&auth, &uri)
         .map_err(|e| format!("S3 객체를 열 수 없습니다 ('{path}'): {e}"))?;
+    if let Some(id) = &uri.conn {
+        crate::s3_connections::touch_last_used(state, id);
+    }
     // FileInfo.size는 원격의 압축 크기(gz면 압축 바이트 수)를 표시한다
     let size = reader
         .stat_len()
@@ -72,6 +82,7 @@ pub fn open_s3_internal(state: &AppState, path: &str) -> Result<OpenedFile, Stri
             remote: true,
             source: "s3".to_string(),
             agent: false,
+            s3_connection_name: conn_name,
         },
         file,
         cancel,
@@ -94,38 +105,58 @@ pub async fn list_aws_profiles() -> Vec<String> {
     }
 }
 
+/// connectionId 가 있으면 그 저장 연결의 Static 인증을 쓰고,
+/// 없으면 profile 인증을 쓴다 (기존 동작).
+fn s3_auth_arg(
+    state: &AppState,
+    connection_id: Option<&str>,
+    profile: Option<String>,
+) -> Result<S3Auth, String> {
+    crate::s3_connections::auth_for(state, connection_id, profile)
+}
+
 /// ListBuckets로 계정의 버킷 이름 목록을 반환한다.
 /// s3:ListAllMyBuckets 권한이 없으면 오류를 반환하며,
 /// 프론트는 이 경우 버킷 이름 직접 입력을 안내한다.
+/// connectionId 를 지정하면 저장 연결의 Static 인증을 쓰고 lastUsed 를 갱신한다.
 #[tauri::command]
 pub async fn s3_list_buckets(
     app: tauri::AppHandle,
     profile: Option<String>,
+    connection_id: Option<String>,
 ) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        state
+        let auth = s3_auth_arg(state.inner(), connection_id.as_deref(), profile)?;
+        let buckets = state
             .s3_pool
-            .list_buckets(profile.as_deref())
-            .map_err(|e| e.to_string())
+            .list_buckets(&auth)
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = connection_id {
+            crate::s3_connections::touch_last_used(state.inner(), &id);
+        }
+        Ok(buckets)
     })
     .await
     .map_err(|e| format!("S3 버킷 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
 /// 버킷의 접두사 아래 항목을 '/' 구분자로 나열한다 (폴더 먼저, 이름순).
+/// connectionId 를 지정하면 저장 연결의 Static 인증을 쓰고 lastUsed 를 갱신한다.
 #[tauri::command]
 pub async fn s3_list_prefix(
     app: tauri::AppHandle,
     profile: Option<String>,
+    connection_id: Option<String>,
     bucket: String,
     prefix: String,
 ) -> Result<Vec<S3EntryDto>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        state
+        let auth = s3_auth_arg(state.inner(), connection_id.as_deref(), profile)?;
+        let entries = state
             .s3_pool
-            .list_prefix(profile.as_deref(), &bucket, &prefix)
+            .list_prefix(&auth, &bucket, &prefix)
             .map(|entries| {
                 entries
                     .into_iter()
@@ -137,17 +168,23 @@ pub async fn s3_list_prefix(
                     })
                     .collect()
             })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = connection_id {
+            crate::s3_connections::touch_last_used(state.inner(), &id);
+        }
+        Ok(entries)
     })
     .await
     .map_err(|e| format!("S3 접두사 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
 /// HeadObject로 S3 객체의 크기(바이트)를 반환한다.
+/// connectionId 또는 URI 의 `s3://<id>@버킷/키` 형태면 저장 연결의 Static 인증을 쓴다.
 #[tauri::command]
 pub async fn s3_head(
     app: tauri::AppHandle,
     profile: Option<String>,
+    connection_id: Option<String>,
     uri: String,
 ) -> Result<u64, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -155,9 +192,12 @@ pub async fn s3_head(
             format!("잘못된 S3 경로입니다: '{uri}' (s3://버킷/키 형식이어야 합니다)")
         })?;
         let state = app.state::<AppState>();
+        // connectionId 인자가 우선하고, 없으면 URI 안의 연결 id 를 본다.
+        let conn = connection_id.as_deref().or(parsed.conn.as_deref());
+        let auth = s3_auth_arg(state.inner(), conn, profile)?;
         state
             .s3_pool
-            .head(profile.as_deref(), &parsed)
+            .head(&auth, &parsed)
             .map_err(|e| e.to_string())
     })
     .await

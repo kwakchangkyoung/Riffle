@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use riffle_core::{Columns, FilterSet, LineSet, LogFile, MergeIndex};
-use riffle_remote::{AgentSession, S3Pool, SftpPool, Transport};
+use riffle_remote::{AgentSession, S3Pool, S3StaticCreds, SftpPool, Transport};
 
 use crate::commands::FilterSpecDto;
 use crate::tail::TailLoopMsg;
@@ -198,6 +198,13 @@ pub struct AppState {
     /// 로컬 에이전트 바이너리 디렉터리 (리소스 agents/).
     /// setup에서 설정하며, RIFFLE_AGENT_DIR 환경 변수가 이 경로보다 우선한다.
     pub agent_dir: Mutex<Option<PathBuf>>,
+    /// s3-connections.json 파일 경로 (setup에서 1회 설정).
+    /// 단위 테스트처럼 미설정이면 저장 연결 기능은 "연결 없음"으로 동작한다.
+    pub s3_connections_path: Mutex<Option<PathBuf>>,
+    /// S3 연결 id → Static 자격 증명 캐시.
+    /// 파일 열기·탐색마다 키체인을 읽지 않기 위한 캐시이며,
+    /// 연결 저장/삭제 시 해당 id가 무효화된다.
+    pub s3_creds: Mutex<HashMap<String, S3StaticCreds>>,
 }
 
 impl Default for AppState {
@@ -217,6 +224,8 @@ impl Default for AppState {
             s3_profile: Mutex::new(None),
             agent_hosts: Mutex::new(Vec::new()),
             agent_dir: Mutex::new(None),
+            s3_connections_path: Mutex::new(None),
+            s3_creds: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -611,6 +620,47 @@ impl AppState {
     /// 로컬 에이전트 바이너리 디렉터리를 설정한다 (setup에서 1회).
     pub fn set_agent_dir(&self, dir: Option<PathBuf>) {
         *self.agent_dir.lock().unwrap_or_else(|p| p.into_inner()) = dir;
+    }
+
+    /// s3-connections.json 파일 경로를 반환한다 (미설정이면 None).
+    pub fn s3_connections_path(&self) -> Option<PathBuf> {
+        self.s3_connections_path
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// s3-connections.json 파일 경로를 설정한다 (setup에서 1회).
+    pub fn set_s3_connections_path(&self, path: Option<PathBuf>) {
+        *self
+            .s3_connections_path
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = path;
+    }
+
+    /// 캐시된 S3 연결 자격 증명을 반환한다 (없으면 None).
+    pub fn s3_creds_get(&self, id: &str) -> Option<S3StaticCreds> {
+        self.s3_creds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// S3 연결 자격 증명을 캐시에 넣는다.
+    pub fn s3_creds_put(&self, creds: S3StaticCreds) {
+        self.s3_creds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(creds.id.clone(), creds);
+    }
+
+    /// 연결 저장/삭제 시 해당 id의 자격 증명 캐시를 버린다.
+    pub fn s3_creds_remove(&self, id: &str) {
+        self.s3_creds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
     }
 }
 

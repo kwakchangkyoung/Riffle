@@ -315,6 +315,7 @@ pub async fn open_merge(
         remote: false,
         source: "merge".to_string(),
         agent: false,
+        s3_connection_name: None,
     })
 }
 

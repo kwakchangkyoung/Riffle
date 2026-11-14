@@ -10,6 +10,7 @@ pub mod presets;
 pub mod recent;
 pub mod remote;
 pub mod s3;
+pub mod s3_connections;
 pub mod session;
 pub mod settings;
 pub mod state;
@@ -31,6 +32,7 @@ use s3::{
     get_s3_bookmarks, list_aws_profiles, s3_head, s3_list_buckets, s3_list_prefix,
     set_s3_bookmarks, set_s3_profile,
 };
+use s3_connections::{delete_s3_connection, list_s3_connections, save_s3_connection};
 use session::{load_session, save_session};
 use settings::{get_agent_hosts, get_settings, set_agent_enabled, set_auto_check_updates};
 use state::AppState;
@@ -86,6 +88,9 @@ pub fn run() {
             s3_list_prefix,
             s3_head,
             set_s3_profile,
+            list_s3_connections,
+            save_s3_connection,
+            delete_s3_connection,
             get_s3_bookmarks,
             set_s3_bookmarks,
             get_bookmarks,
@@ -110,6 +115,13 @@ pub fn run() {
             // (RIFFLE_AGENT_DIR 환경 변수가 이 경로보다 우선한다)
             let agent_dir = app.path().resource_dir().ok().map(|d| d.join("agents"));
             app.state::<AppState>().set_agent_dir(agent_dir);
+            // 저장 S3 연결 목록 파일 경로 (비밀 키는 키체인에 따로 보관)
+            let conns_path = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("s3-connections.json"));
+            app.state::<AppState>().set_s3_connections_path(conns_path);
             menu::apply_menu(&handle, &recent)?;
             Ok(())
         })

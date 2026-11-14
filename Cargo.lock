@@ -4194,6 +4194,7 @@ dependencies = [
  "notify",
  "riffle-core",
  "riffle-remote",
+ "security-framework",
  "serde",
  "serde_json",
  "tauri",

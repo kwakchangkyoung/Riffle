@@ -36,7 +36,7 @@ import {
     type TailEvent,
 } from "@/lib/ipc";
 import { isMergePath, mergeShortName, mergeSourceColor } from "@/lib/merge";
-import { isRemotePath } from "@/lib/remote";
+import { isRemotePath, s3DisplayPath } from "@/lib/remote";
 import { LineCache } from "@/lib/lineCache";
 import { useTauriListener } from "@/lib/useTauriListener";
 import { loadScrollPos, saveScrollPos } from "@/lib/scrollPos";
@@ -2386,7 +2386,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 type="button"
                                 onClick={() => handleLegendClick(s.index)}
                                 className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 cursor-pointer shrink-0"
-                                title={`${s.path} — 클릭하면 이 원본 탭으로 이동`}
+                                title={`${s3DisplayPath(s.path, null)} — 클릭하면 이 원본 탭으로 이동`}
                             >
                                 <span
                                     className="w-2 h-2 rounded-full shrink-0"

@@ -14,6 +14,8 @@ export interface FileInfo {
     source: FileSource;
     /** 서버 측 에이전트로 인덱싱·검색·필터를 처리 중인지 여부 (sftp 파일만) */
     agent: boolean;
+    /** 저장된 S3 연결로 연 파일의 연결 이름 (그 외 null) */
+    s3ConnectionName: string | null;
 }
 
 export interface IndexProgress {
@@ -539,29 +541,45 @@ export function listAwsProfiles(): Promise<string[]> {
 }
 
 /**
- * 선택한 프로필(없으면 기본 체인)로 버킷 목록을 조회합니다.
+ * 선택한 프로필(없으면 기본 체인) 또는 저장된 연결로 버킷 목록을 조회합니다.
+ * connectionId가 있으면 연결 자격 증명을 사용하고 profile은 무시됩니다.
  * ListBuckets 권한이 없으면 에러를 반환합니다.
  */
-export function s3ListBuckets(profile: string | null): Promise<string[]> {
-    return invoke<string[]>("s3_list_buckets", { profile });
+export function s3ListBuckets(
+    profile: string | null,
+    connectionId: string | null,
+): Promise<string[]> {
+    return invoke<string[]>("s3_list_buckets", { profile, connectionId });
 }
 
 /**
  * 버킷의 접두사 아래 항목을 "/" 구분으로 조회합니다 (폴더 먼저, 이름순).
+ * connectionId가 있으면 저장된 연결 자격 증명을 사용합니다.
  */
 export function s3ListPrefix(
     profile: string | null,
+    connectionId: string | null,
     bucket: string,
     prefix: string,
 ): Promise<S3Entry[]> {
-    return invoke<S3Entry[]>("s3_list_prefix", { profile, bucket, prefix });
+    return invoke<S3Entry[]>("s3_list_prefix", {
+        profile,
+        connectionId,
+        bucket,
+        prefix,
+    });
 }
 
 /**
- * S3 객체의 크기(바이트)를 조회합니다. uri는 "s3://bucket/key" 형식입니다.
+ * S3 객체의 크기(바이트)를 조회합니다. uri는 "s3://bucket/key"
+ * 또는 "s3://<연결id>@bucket/key" 형식입니다.
  */
-export function s3Head(profile: string | null, uri: string): Promise<number> {
-    return invoke<number>("s3_head", { profile, uri });
+export function s3Head(
+    profile: string | null,
+    connectionId: string | null,
+    uri: string,
+): Promise<number> {
+    return invoke<number>("s3_head", { profile, connectionId, uri });
 }
 
 /**
@@ -583,6 +601,60 @@ export function getS3Bookmarks(): Promise<string[]> {
  */
 export function setS3Bookmarks(items: string[]): Promise<void> {
     return invoke<void>("set_s3_bookmarks", { items });
+}
+
+// ===== S3 저장된 연결 (Phase 19) =====
+
+/**
+ * 저장된 S3 액세스 키 연결 (비밀 키는 키체인에만 있고 여기엔 없다).
+ * lastUsed는 unix 초, 사용 기록이 없으면 null.
+ */
+export interface S3Connection {
+    id: string;
+    name: string;
+    accessKeyId: string;
+    region: string | null;
+    /** 시작 버킷 (선택) */
+    bucket: string | null;
+    /** 시작 경로/접두사 (선택) */
+    prefix: string | null;
+    lastUsed: number | null;
+}
+
+/** save_s3_connection 의 입력. 편집 시 secretKey가 null이면 기존 키 유지 */
+export interface SaveS3ConnectionInput {
+    /** null이면 새 연결 */
+    id: string | null;
+    name: string;
+    accessKeyId: string;
+    /** 새 연결은 필수, 편집 시 null이면 기존 키 유지 */
+    secretKey: string | null;
+    region: string | null;
+    bucket: string | null;
+    prefix: string | null;
+}
+
+/**
+ * 저장된 S3 연결 목록을 조회합니다 (최근 사용순, 미사용은 뒤에 이름순).
+ */
+export function listS3Connections(): Promise<S3Connection[]> {
+    return invoke<S3Connection[]>("list_s3_connections");
+}
+
+/**
+ * S3 연결을 저장(생성·편집)합니다. 비밀 키는 macOS 키체인에 보관됩니다.
+ */
+export function saveS3Connection(
+    input: SaveS3ConnectionInput,
+): Promise<S3Connection> {
+    return invoke<S3Connection>("save_s3_connection", { input });
+}
+
+/**
+ * S3 연결을 삭제합니다. 키체인의 비밀 키도 함께 지워집니다.
+ */
+export function deleteS3Connection(id: string): Promise<void> {
+    return invoke<void>("delete_s3_connection", { id });
 }
 
 // ===== 로그 시간순 병합 (Phase 17) =====

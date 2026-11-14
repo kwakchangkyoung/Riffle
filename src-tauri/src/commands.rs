@@ -30,6 +30,9 @@ pub struct FileInfo {
     pub source: String,
     /// 서버 측 에이전트로 인덱싱·검색·필터를 처리 중인지 여부 (sftp 파일만)
     pub agent: bool,
+    /// 저장된 S3 연결로 연 파일이면 그 연결 이름, 아니면 null
+    /// (`s3://<연결id>@버킷/키` 로 연 경우만).
+    pub s3_connection_name: Option<String>,
 }
 
 /// 인덱싱/해제 진행률 DTO
@@ -505,6 +508,7 @@ pub fn open_file_internal(state: &AppState, path: &str) -> Result<OpenedFile, St
             remote: false,
             source: "local".to_string(),
             agent: false,
+            s3_connection_name: None,
         },
         file,
         cancel,

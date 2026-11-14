@@ -1,7 +1,7 @@
 import React from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
 import { formatBytes } from "@/lib/format";
-import { remoteHostOf, s3BucketOf } from "@/lib/remote";
+import { remoteHostOf, s3BucketOf, s3DisplayPath } from "@/lib/remote";
 
 export interface SearchStatusInfo {
     currentHitIndex: number | null;
@@ -75,6 +75,10 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         const remoteHost = file.remote ? remoteHostOf(file.path) : null;
         // S3 객체의 버킷 (S3가 아니면 null)
         const s3Bucket = file.remote ? s3BucketOf(file.path) : null;
+        // 저장된 연결로 연 S3 파일이면 연결 이름 (경로·배지에 버킷과 함께 표시)
+        const s3ConnName = file.s3ConnectionName;
+        // 표시용 경로: "s3://<id>@버킷/키"의 id 부분은 연결 이름으로 치환
+        const displayPath = s3DisplayPath(file.path, s3ConnName);
         const normalCurrentLine =
             lineCount === 0 ? 0 : Math.min(lineCount, Math.floor(topLine) + 1);
         const displayCurrentLine = indexView
@@ -181,8 +185,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                             </span>
                         </>
                     ) : (
-                        <span className="truncate" title={file.path}>
-                            {file.path}
+                        <span className="truncate" title={displayPath}>
+                            {displayPath}
                         </span>
                     )}
                     {remoteHost !== null && (
@@ -204,9 +208,16 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                     {s3Bucket !== null && (
                         <span
                             className="px-1.5 py-0.2 rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 font-semibold text-[10px] shrink-0"
-                            title={`S3 버킷: ${s3Bucket}`}
+                            title={
+                                s3ConnName !== null
+                                    ? `S3 연결: ${s3ConnName} · 버킷: ${s3Bucket}`
+                                    : `S3 버킷: ${s3Bucket}`
+                            }
                         >
-                            S3: {s3Bucket}
+                            S3:{" "}
+                            {s3ConnName !== null
+                                ? `${s3ConnName} · ${s3Bucket}`
+                                : s3Bucket}
                         </span>
                     )}
                     {isFilterMode && (

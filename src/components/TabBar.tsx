@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import type { FileInfo, IndexProgress } from "@/lib/ipc";
-import { remoteHostOf, s3BucketOf } from "@/lib/remote";
+import { remoteHostOf, s3BucketOf, s3DisplayPath } from "@/lib/remote";
 
 /** App이 관리하는 탭 메타데이터 (TabBar 표시용) */
 export interface TabMeta {
@@ -90,6 +90,8 @@ export const TabBar: React.FC<TabBarProps> = ({
                         tab.file?.source === "merge";
                     const remoteHost = isMerge ? null : remoteHostOf(fullPath);
                     const s3Bucket = isMerge ? null : s3BucketOf(fullPath);
+                    // 저장된 연결로 연 S3 파일이면 연결 이름 (배지에 버킷 대신 표시)
+                    const s3ConnName = tab.file?.s3ConnectionName ?? null;
                     return (
                         <div
                             key={tab.id}
@@ -119,7 +121,7 @@ export const TabBar: React.FC<TabBarProps> = ({
                                     onClose(tab.id);
                                 }
                             }}
-                            title={fullPath}
+                            title={s3DisplayPath(fullPath, s3ConnName)}
                             className={`group relative flex items-center h-8 mx-0.5 px-2.5 rounded-md text-xs cursor-default select-none shrink-0 max-w-[220px] ${
                                 active
                                     ? "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-sm font-medium"
@@ -162,9 +164,13 @@ export const TabBar: React.FC<TabBarProps> = ({
                             {s3Bucket !== null && (
                                 <span
                                     className="mr-1 text-[9px] font-bold px-1 py-px rounded bg-orange-100 dark:bg-orange-900/60 text-orange-700 dark:text-orange-300 shrink-0"
-                                    title={`S3 버킷: ${s3Bucket}`}
+                                    title={
+                                        s3ConnName !== null
+                                            ? `S3 연결: ${s3ConnName} · 버킷: ${s3Bucket}`
+                                            : `S3 버킷: ${s3Bucket}`
+                                    }
                                 >
-                                    s3:{s3Bucket}
+                                    s3:{s3ConnName ?? s3Bucket}
                                 </span>
                             )}
                             <span className="truncate">{tabName(tab)}</span>

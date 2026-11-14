@@ -43,26 +43,87 @@ const LIST_MAX_ENTRIES: usize = 10_000;
 /// 리전을 알 수 없을 때 첫 시도에 쓰는 리전. S3 는 잘못된 리전을 리다이렉트로 알려준다.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// `s3://버킷/키` 형태의 URI.
+/// S3 접근 인증 방식.
+#[derive(Debug, Clone)]
+pub enum S3Auth {
+    /// `~/.aws` 프로필 (`None` 이면 기본 자격 증명 체인).
+    Profile(Option<String>),
+    /// 저장된 연결의 액세스 키/비밀 키.
+    Static(S3StaticCreds),
+}
+
+/// 이름+액세스 키로 접속하는 저장 연결의 자격 증명.
+/// `Debug` 출력에는 비밀 키를 `***` 로 가린다.
+#[derive(Clone)]
+pub struct S3StaticCreds {
+    /// 연결 id (`s3://<id>@버킷/키` 의 `@` 앞 부분, 캐시 구분용).
+    pub id: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// 첫 시도 리전 (`None` 이면 리다이렉트로 결정).
+    pub region: Option<String>,
+}
+
+impl fmt::Debug for S3StaticCreds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3StaticCreds")
+            .field("id", &self.id)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"***")
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
+/// 인증 방식별 클라이언트·리전 캐시의 식별 키.
+/// Static 은 id 와 자격 증명 해시를 함께 써서, 같은 id 라도 키를 바꾸면
+/// 이전 자격 증명으로 만든 클라이언트를 재사용하지 않게 한다.
+fn auth_key(auth: &S3Auth) -> String {
+    match auth {
+        S3Auth::Profile(p) => format!("p:{}", p.as_deref().unwrap_or_default()),
+        S3Auth::Static(c) => format!("s:{}:{:016x}", c.id, creds_fingerprint(c)),
+    }
+}
+
+/// 액세스 키+비밀 키의 지문 (비밀 키 자체는 캐시 키에 넣지 않는다).
+fn creds_fingerprint(c: &S3StaticCreds) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    c.access_key_id.hash(&mut h);
+    c.secret_access_key.hash(&mut h);
+    h.finish()
+}
+
+/// `s3://[<연결id>@]버킷/키` 형태의 URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Uri {
+    /// 저장 연결 id (`s3://id@버킷/키` 의 `@` 앞). 없으면 프로필 인증.
+    pub conn: Option<String>,
     pub bucket: String,
     pub key: String,
 }
 
 impl S3Uri {
-    /// `"s3://bucket/key"` 를 파싱한다. 키가 없으면 빈 문자열이다 (버킷 루트).
+    /// `"s3://bucket/key"` 또는 `"s3://conn@bucket/key"` 를 파싱한다.
+    /// 키가 없으면 빈 문자열이다 (버킷 루트).
+    /// 버킷 이름에는 `@` 가 올 수 없으므로 첫 `/` 이전 구간에 `@` 가 있으면
+    /// 앞부분을 저장 연결 id 로 본다.
     /// 키 안의 `/`, 공백, 한글, 특수문자는 그대로 보존한다 (percent 인코딩하지 않는다).
     pub fn parse(s: &str) -> Option<S3Uri> {
         let rest = s.strip_prefix("s3://")?;
-        let (bucket, key) = match rest.split_once('/') {
-            Some((b, k)) => (b, k),
+        let (authority, key) = match rest.split_once('/') {
+            Some((a, k)) => (a, k),
             None => (rest, ""),
         };
-        if bucket.is_empty() {
+        let (conn, bucket) = match authority.split_once('@') {
+            Some((c, b)) => (Some(c.to_string()), b),
+            None => (None, authority),
+        };
+        if bucket.is_empty() || conn.as_deref() == Some("") {
             return None;
         }
         Some(S3Uri {
+            conn,
             bucket: bucket.to_string(),
             key: key.to_string(),
         })
@@ -71,7 +132,11 @@ impl S3Uri {
 
 impl fmt::Display for S3Uri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "s3://{}/{}", self.bucket, self.key)
+        write!(f, "s3://")?;
+        if let Some(conn) = &self.conn {
+            write!(f, "{conn}@")?;
+        }
+        write!(f, "{}/{}", self.bucket, self.key)
     }
 }
 
@@ -143,9 +208,10 @@ struct S3PoolInner {
     rt: Runtime,
     /// 고정 엔드포인트(테스트용). `Some` 이면 path-style + 정적 자격 증명 + 고정 리전.
     endpoint: Option<String>,
-    /// (프로필, 리전) → 클라이언트 캐시. endpoint 모드는 `("", "")` 하나만 쓴다.
+    /// (인증 키, 리전) → 클라이언트 캐시.
+    /// 인증 키는 프로필 이름 또는 `연결id+자격증명 해시` (auth_key 참고).
     clients: StdMutex<HashMap<(String, String), Client>>,
-    /// (프로필, 버킷) → 리전 캐시.
+    /// (인증 키, 버킷) → 리전 캐시.
     regions: StdMutex<HashMap<(String, String), String>>,
 }
 
@@ -169,46 +235,57 @@ impl S3PoolInner {
         self.rt.block_on(f)
     }
 
-    /// 프로필·리전에 맞는 클라이언트를 반환한다. 없으면 만들어 캐시한다.
-    /// endpoint 모드에서는 프로필·리전을 무시하고 고정 클라이언트 하나를 재사용한다.
-    async fn client_for(&self, profile: Option<&str>, region: Option<&str>) -> Client {
-        let key = if self.endpoint.is_some() {
-            (String::new(), String::new())
-        } else {
-            (
-                profile.unwrap_or_default().to_string(),
-                region.unwrap_or_default().to_string(),
-            )
-        };
+    /// 인증·리전에 맞는 클라이언트를 반환한다. 없으면 만들어 캐시한다.
+    /// endpoint 모드에서는 리전 설정을 무시하되 Static 자격 증명은 그대로 쓴다.
+    async fn client_for(&self, auth: &S3Auth, region: Option<&str>) -> Client {
+        let key = (auth_key(auth), region.unwrap_or_default().to_string());
         if let Some(c) = self.clients.lock().unwrap().get(&key) {
             return c.clone();
         }
         let client = match &self.endpoint {
             Some(url) => {
+                // Static 연결은 지정된 자격 증명으로 서명한다 (서명 검증 테스트용).
+                // 프로필 인증은 endpoint 모드에서 파일을 읽지 않으므로 고정값을 쓴다.
+                let (access, secret) = match auth {
+                    S3Auth::Static(c) => (c.access_key_id.clone(), c.secret_access_key.clone()),
+                    S3Auth::Profile(_) => ("riffle-test".to_string(), "riffle-test".to_string()),
+                };
                 let conf = aws_sdk_s3::config::Builder::new()
                     .endpoint_url(url.clone())
                     .force_path_style(true)
                     .region(Region::new(DEFAULT_REGION))
-                    .credentials_provider(Credentials::new(
-                        "riffle-test",
-                        "riffle-test",
-                        None,
-                        None,
-                        "riffle-test",
-                    ))
+                    .credentials_provider(Credentials::new(access, secret, None, None, "riffle"))
                     .behavior_version(BehaviorVersion::latest())
                     .build();
                 Client::from_conf(conf)
             }
             None => {
                 let mut loader = aws_config::defaults(BehaviorVersion::latest());
-                if let Some(p) = profile {
-                    loader = loader.profile_name(p.to_string());
+                match auth {
+                    S3Auth::Profile(p) => {
+                        if let Some(p) = p {
+                            loader = loader.profile_name(p.clone());
+                        }
+                    }
+                    S3Auth::Static(c) => {
+                        loader = loader.credentials_provider(Credentials::new(
+                            c.access_key_id.clone(),
+                            c.secret_access_key.clone(),
+                            None,
+                            None,
+                            "riffle",
+                        ));
+                    }
                 }
                 let conf = loader.load().await;
-                // 우선순위: 명시 리전 > 프로필/환경 설정 > us-east-1.
+                // 우선순위: 명시 리전 > 연결 지정 리전 > 프로필/환경 설정 > us-east-1.
+                let conn_region = match auth {
+                    S3Auth::Static(c) => c.region.clone(),
+                    S3Auth::Profile(_) => None,
+                };
                 let region = region
                     .map(str::to_string)
+                    .or(conn_region)
                     .or_else(|| conf.region().map(|r| r.to_string()))
                     .unwrap_or_else(|| DEFAULT_REGION.to_string());
                 let s3conf = aws_sdk_s3::config::Builder::from(&conf)
@@ -224,15 +301,23 @@ impl S3PoolInner {
     /// 버킷의 리전을 결정한다. 캐시 → HeadBucket(기본 리전) → 리다이렉트 헤더 순.
     /// HeadBucket 권한이 없는 계정을 위해 실패해도 기본 리전으로 진행해
     /// 실제 호출의 리다이렉트 응답이 올바른 리전을 알려주게 한다.
-    async fn resolve_region(&self, profile: Option<&str>, bucket: &str) -> String {
-        let key = (profile.unwrap_or_default().to_string(), bucket.to_string());
+    /// Static 연결에 리전이 지정돼 있으면 그것이 기본 리전 자리에 들어간다.
+    async fn resolve_region(&self, auth: &S3Auth, bucket: &str) -> String {
+        let key = (auth_key(auth), bucket.to_string());
         if let Some(r) = self.regions.lock().unwrap().get(&key) {
             return r.clone();
         }
-        let client = self.client_for(profile, None).await;
+        let fallback = match auth {
+            S3Auth::Static(c) => c
+                .region
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REGION.to_string()),
+            S3Auth::Profile(_) => DEFAULT_REGION.to_string(),
+        };
+        let client = self.client_for(auth, None).await;
         let region = match client.head_bucket().bucket(bucket).send().await {
-            Ok(out) => out.bucket_region().unwrap_or(DEFAULT_REGION).to_string(),
-            Err(e) => s3_redirect_region(&e).unwrap_or_else(|| DEFAULT_REGION.to_string()),
+            Ok(out) => out.bucket_region().map(str::to_string).unwrap_or(fallback),
+            Err(e) => s3_redirect_region(&e).unwrap_or(fallback),
         };
         self.regions.lock().unwrap().insert(key, region.clone());
         region
@@ -242,7 +327,7 @@ impl S3PoolInner {
     /// 리전 리다이렉트 응답이 오면 캐시를 갱신하고 새 리전으로 1회 재시도한다.
     async fn run_op<F, Fut, T, E>(
         &self,
-        profile: Option<&str>,
+        auth: &S3Auth,
         bucket: &str,
         what: &str,
         op: F,
@@ -252,19 +337,19 @@ impl S3PoolInner {
         Fut: Future<Output = Result<T, SdkError<E>>>,
         E: ProvideErrorMetadata,
     {
-        let mut region = self.resolve_region(profile, bucket).await;
+        let mut region = self.resolve_region(auth, bucket).await;
         for attempt in 0..2 {
-            let client = self.client_for(profile, Some(&region)).await;
+            let client = self.client_for(auth, Some(&region)).await;
             match op(client).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     if attempt == 0
                         && let Some(new_region) = s3_redirect_region(&e).filter(|r| *r != region)
                     {
-                        self.regions.lock().unwrap().insert(
-                            (profile.unwrap_or_default().to_string(), bucket.to_string()),
-                            new_region.clone(),
-                        );
+                        self.regions
+                            .lock()
+                            .unwrap()
+                            .insert((auth_key(auth), bucket.to_string()), new_region.clone());
                         region = new_region;
                         continue;
                     }
@@ -275,8 +360,8 @@ impl S3PoolInner {
         unreachable!()
     }
 
-    async fn list_buckets_async(&self, profile: Option<&str>) -> Result<Vec<String>, RemoteError> {
-        let client = self.client_for(profile, None).await;
+    async fn list_buckets_async(&self, auth: &S3Auth) -> Result<Vec<String>, RemoteError> {
+        let client = self.client_for(auth, None).await;
         let out = client
             .list_buckets()
             .send()
@@ -293,7 +378,7 @@ impl S3PoolInner {
 
     async fn list_prefix_async(
         &self,
-        profile: Option<&str>,
+        auth: &S3Auth,
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<S3Entry>, RemoteError> {
@@ -302,7 +387,7 @@ impl S3PoolInner {
         loop {
             let page_token = token.clone();
             let out = self
-                .run_op(profile, bucket, bucket, |client| {
+                .run_op(auth, bucket, bucket, |client| {
                     let (bucket, prefix) = (bucket.to_string(), prefix.to_string());
                     let token = page_token.clone();
                     async move {
@@ -363,9 +448,9 @@ impl S3PoolInner {
         Ok(entries)
     }
 
-    async fn head_async(&self, profile: Option<&str>, uri: &S3Uri) -> Result<u64, RemoteError> {
+    async fn head_async(&self, auth: &S3Auth, uri: &S3Uri) -> Result<u64, RemoteError> {
         let out = self
-            .run_op(profile, &uri.bucket, &uri.to_string(), |client| {
+            .run_op(auth, &uri.bucket, &uri.to_string(), |client| {
                 let (bucket, key) = (uri.bucket.clone(), uri.key.clone());
                 async move { client.head_object().bucket(bucket).key(key).send().await }
             })
@@ -398,37 +483,37 @@ impl S3Pool {
     }
 
     /// 계정의 버킷 이름 목록. ListBuckets 권한이 없으면 오류를 반환한다.
-    pub fn list_buckets(&self, profile: Option<&str>) -> Result<Vec<String>, RemoteError> {
-        self.inner.block_on(self.inner.list_buckets_async(profile))
+    pub fn list_buckets(&self, auth: &S3Auth) -> Result<Vec<String>, RemoteError> {
+        self.inner.block_on(self.inner.list_buckets_async(auth))
     }
 
     /// `prefix` 아래를 delimiter `/` 로 나열한다.
     /// 디렉터리 먼저, 이름순. 페이지네이션을 끝까지 따라가며 최대 10,000개까지 반환한다.
     pub fn list_prefix(
         &self,
-        profile: Option<&str>,
+        auth: &S3Auth,
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<S3Entry>, RemoteError> {
         self.inner
-            .block_on(self.inner.list_prefix_async(profile, bucket, prefix))
+            .block_on(self.inner.list_prefix_async(auth, bucket, prefix))
     }
 
     /// 객체 크기(바이트).
-    pub fn head(&self, profile: Option<&str>, uri: &S3Uri) -> Result<u64, RemoteError> {
-        self.inner.block_on(self.inner.head_async(profile, uri))
+    pub fn head(&self, auth: &S3Auth, uri: &S3Uri) -> Result<u64, RemoteError> {
+        self.inner.block_on(self.inner.head_async(auth, uri))
     }
 
     /// 객체를 `RandomRead` 로 연다. 먼저 HeadObject 로 크기를 확인한다.
     pub fn open_object(
         &self,
-        profile: Option<&str>,
+        auth: &S3Auth,
         uri: &S3Uri,
     ) -> Result<Arc<dyn RandomRead>, RemoteError> {
-        let size = self.inner.block_on(self.inner.head_async(profile, uri))?;
+        let size = self.inner.block_on(self.inner.head_async(auth, uri))?;
         Ok(Arc::new(S3Object {
             inner: self.inner.clone(),
-            profile: profile.map(str::to_string),
+            auth: auth.clone(),
             uri: uri.clone(),
             uri_str: uri.to_string(),
             size: AtomicU64::new(size),
@@ -450,7 +535,7 @@ type RangeResult = Result<Vec<u8>, RemoteError>;
 /// 요청 범위가 전부 객체 밖이면(객체가 교체돼 줄어든 경우) 빈 벡터를 반환한다.
 async fn fetch_range(
     inner: &S3PoolInner,
-    profile: Option<&str>,
+    auth: &S3Auth,
     uri: &S3Uri,
     off: u64,
     len: u64,
@@ -465,7 +550,7 @@ async fn fetch_range(
     let mut attempt = 0;
     loop {
         let out = inner
-            .run_op(profile, &uri.bucket, &what, |client| {
+            .run_op(auth, &uri.bucket, &what, |client| {
                 let (bucket, key, range) = (uri.bucket.clone(), uri.key.clone(), range.clone());
                 async move {
                     match client
@@ -508,7 +593,7 @@ struct Piece {
 /// S3 객체의 `RandomRead` 구현. 객체는 불변이라고 가정한다 (크기 변화 시 캐시 전체 무효화).
 struct S3Object {
     inner: Arc<S3PoolInner>,
-    profile: Option<String>,
+    auth: S3Auth,
     uri: S3Uri,
     uri_str: String,
     /// 마지막으로 확인한 객체 크기.
@@ -527,7 +612,7 @@ impl S3Object {
     async fn stat_len_async(&self) -> io::Result<u64> {
         let size = self
             .inner
-            .head_async(self.profile.as_deref(), &self.uri)
+            .head_async(&self.auth, &self.uri)
             .await
             .map_err(remote_to_io)?;
         self.note_size(size);
@@ -653,14 +738,9 @@ impl S3Object {
                 let idx = next;
                 let (off, len) = ranges[next];
                 let inner = self.inner.clone();
-                let profile = self.profile.clone();
+                let auth = self.auth.clone();
                 let uri = self.uri.clone();
-                set.spawn(async move {
-                    (
-                        idx,
-                        fetch_range(&inner, profile.as_deref(), &uri, off, len).await,
-                    )
-                });
+                set.spawn(async move { (idx, fetch_range(&inner, &auth, &uri, off, len).await) });
                 next += 1;
             }
             match set.join_next().await {

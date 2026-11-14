@@ -6,16 +6,20 @@ import React, {
     useState,
 } from "react";
 import {
+    deleteS3Connection,
     getS3Bookmarks,
     getSettings,
     listAwsProfiles,
+    listS3Connections,
     s3ListBuckets,
     s3ListPrefix,
+    saveS3Connection,
     setS3Bookmarks,
     setS3Profile,
+    type S3Connection,
     type S3Entry,
 } from "@/lib/ipc";
-import { s3UriOf } from "@/lib/remote";
+import { s3ConnUriOf, s3UriOf } from "@/lib/remote";
 import { formatBytes, formatMtime } from "@/lib/format";
 
 /** 이 크기 이상의 객체는 열기 전 데이터 전송 안내를 표시한다 (1 GiB) */
@@ -45,10 +49,29 @@ function skipLargeConfirm(): boolean {
     }
 }
 
-/** "bucket/prefix/" 형태의 위치 문자열을 { bucket, prefix }로 분해한다 */
-function parseLocation(item: string): { bucket: string; prefix: string } {
-    const segs = item.split("/").filter((s) => s.length > 0);
+interface S3Location {
+    /** 저장된 연결 id (위치 문자열이 "<id>@버킷/..." 형식일 때) */
+    conn: string | null;
+    bucket: string;
+    prefix: string;
+}
+
+/**
+ * "bucket/prefix/" 또는 "<연결id>@bucket/prefix/" 형태의 위치 문자열을 분해한다.
+ * 버킷 이름에는 '@'가 올 수 없으므로 첫 '/' 이전의 '@'는 연결 구분자다.
+ */
+function parseLocation(item: string): S3Location {
+    let conn: string | null = null;
+    let rest = item;
+    const firstSlash = item.indexOf("/");
+    const at = item.indexOf("@");
+    if (at > 0 && (firstSlash < 0 || at < firstSlash)) {
+        conn = item.slice(0, at);
+        rest = item.slice(at + 1);
+    }
+    const segs = rest.split("/").filter((s) => s.length > 0);
     return {
+        conn,
         bucket: segs[0] ?? "",
         prefix: segs
             .slice(1)
@@ -57,16 +80,58 @@ function parseLocation(item: string): { bucket: string; prefix: string } {
     };
 }
 
+/** 액세스 키를 "앞 4자 + … + 뒤 4자"로 가린다 (짧으면 앞 2자 + …) */
+function maskAccessKey(key: string): string {
+    if (key.length > 8) return `${key.slice(0, 4)}…${key.slice(-4)}`;
+    return `${key.slice(0, 2)}…`;
+}
+
+/** unix 초 시각을 "방금 전/3분 전/5시간 전/2일 전" 같은 상대 표현으로 바꾼다 */
+function relativeTime(unixSec: number): string {
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+    if (diff < 60) return "방금 전";
+    if (diff < 3600) return `${Math.floor(diff / 60)}분 전`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}시간 전`;
+    if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}일 전`;
+    return formatMtime(unixSec);
+}
+
+/** 연결 편집 양식 상태 (비밀 키는 저장 직후 양식과 함께 폐기한다) */
+interface ConnFormState {
+    /** null이면 새 연결 */
+    id: string | null;
+    name: string;
+    accessKeyId: string;
+    secretKey: string;
+    region: string;
+    bucket: string;
+    prefix: string;
+    /** 복제로 만든 양식이면 비밀 키 재입력 안내를 표시한다 */
+    duplicated: boolean;
+}
+
 /**
  * S3 객체 탐색 패널 (원격 파일 열기 대화상자의 S3 탭).
- * AWS 기본 자격 증명 체인(또는 선택한 프로필)으로 버킷과 접두사를 탐색해
- * s3:// URI로 객체를 연다. 읽기 전용 API만 사용한다.
+ * AWS 기본 자격 증명 체인(또는 선택한 프로필), 또는 저장된 액세스 키 연결로
+ * 버킷과 접두사를 탐색해 s3:// URI로 객체를 연다. 읽기 전용 API만 사용한다.
  */
 export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
     const [profiles, setProfiles] = useState<string[]>([]);
     // null = 기본 자격 증명 체인
     const [profile, setProfile] = useState<string | null>(null);
     const [bookmarks, setBookmarks] = useState<string[]>([]);
+
+    // 저장된 액세스 키 연결 (Phase 19)
+    const [connections, setConnections] = useState<S3Connection[]>([]);
+    const [connId, setConnId] = useState<string | null>(null);
+    // 인증 섹션에서 보이는 탭: 연결 목록 또는 AWS 프로필 선택
+    const [authTab, setAuthTab] = useState<"conn" | "profile">("profile");
+    const [connListError, setConnListError] = useState<string | null>(null);
+    const [connForm, setConnForm] = useState<ConnFormState | null>(null);
+    const [connFormError, setConnFormError] = useState<string | null>(null);
+    const [connSaving, setConnSaving] = useState(false);
+    const [connDelete, setConnDelete] = useState<S3Connection | null>(null);
+    const [connDeleting, setConnDeleting] = useState(false);
 
     const [buckets, setBuckets] = useState<string[]>([]);
     const [bucketsError, setBucketsError] = useState<string | null>(null);
@@ -89,75 +154,172 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
     } | null>(null);
     const [dontAskAgain, setDontAskAgain] = useState(false);
 
+    // 연결 탭을 보는 동안엔 선택된 연결로 인증한다
+    const activeConnId = authTab === "conn" ? connId : null;
+
     const objectEntries = useMemo(
         () => entries.filter((e) => !e.isDir),
         [entries],
     );
 
     // 버킷 목록을 불러온다. 실패(권한 없음 등) 시 수동 입력으로 진행할 수 있다.
-    const loadBuckets = useCallback(async (p: string | null) => {
-        setLoading(true);
-        setError(null);
-        setBucketsError(null);
-        try {
-            const list = await s3ListBuckets(p);
-            setBuckets(list);
-        } catch (err) {
-            setBuckets([]);
-            setBucketsError(toErrorMessage(err));
-        } finally {
-            setLoading(false);
-        }
-    }, []);
+    const loadBuckets = useCallback(
+        async (conn: string | null, prof: string | null) => {
+            setLoading(true);
+            setError(null);
+            setBucketsError(null);
+            try {
+                const list = await s3ListBuckets(prof, conn);
+                setBuckets(list);
+            } catch (err) {
+                setBuckets([]);
+                setBucketsError(toErrorMessage(err));
+            } finally {
+                setLoading(false);
+            }
+        },
+        [],
+    );
 
     // 접두사 목록을 불러오고 현재 위치를 갱신한다.
     const loadPrefix = useCallback(
-        async (bkt: string, pfx: string) => {
+        async (
+            conn: string | null,
+            prof: string | null,
+            bkt: string,
+            pfx: string,
+        ) => {
             setLoading(true);
             setError(null);
             try {
-                const list = await s3ListPrefix(profile, bkt, pfx);
+                const list = await s3ListPrefix(prof, conn, bkt, pfx);
                 setBucket(bkt);
                 setPrefix(pfx);
                 setEntries(list);
                 setSelected(new Set());
                 anchorRef.current = null;
             } catch (err) {
+                // 실패해도 대상 위치를 유지해 위치 표시와 [다시 시도]가 같은 곳을 가리키게 한다
+                setBucket(bkt);
+                setPrefix(pfx);
+                setEntries([]);
+                setSelected(new Set());
                 setError(toErrorMessage(err));
             } finally {
                 setLoading(false);
             }
         },
-        [profile],
+        [],
     );
 
-    // 초기화: 저장된 프로필·프로필 목록·즐겨찾기를 읽고 버킷 목록을 요청한다
+    // 연결 선택: 시작 버킷/경로가 있으면 그곳부터, 없으면 버킷 목록부터 탐색한다
+    const activateConnection = useCallback(
+        (conn: S3Connection) => {
+            setAuthTab("conn");
+            setConnId(conn.id);
+            setConnForm(null);
+            setConnFormError(null);
+            setBucket(null);
+            setPrefix("");
+            setEntries([]);
+            setSelected(new Set());
+            setError(null);
+            if (conn.bucket !== null && conn.bucket.length > 0) {
+                // 시작 경로는 디렉터리 접두사로 취급한다
+                let pfx = conn.prefix ?? "";
+                if (pfx.length > 0 && !pfx.endsWith("/")) pfx = `${pfx}/`;
+                // 연결 인증이면 profile 인자는 백엔드에서 무시된다
+                void loadPrefix(conn.id, null, conn.bucket, pfx);
+            } else {
+                void loadBuckets(conn.id, null);
+            }
+        },
+        [loadBuckets, loadPrefix],
+    );
+
+    // 초기화: 저장된 설정·프로필·연결·즐겨찾기를 읽는다.
+    // 연결이 하나라도 있으면 가장 최근 사용 연결로, 없으면 프로필로 시작한다.
     useEffect(() => {
         let cancelled = false;
         (async () => {
             let savedProfile: string | null = null;
+            let conns: S3Connection[] = [];
             try {
-                const [settings, profs, bms] = await Promise.all([
+                const [settings, profs, bms, cs] = await Promise.all([
                     getSettings(),
                     listAwsProfiles(),
                     getS3Bookmarks(),
+                    listS3Connections(),
                 ]);
                 if (cancelled) return;
                 setProfiles(profs);
                 setBookmarks(bms);
+                setConnections(cs);
+                conns = cs;
                 savedProfile = settings.s3Profile;
                 setProfile(savedProfile);
             } catch (err) {
                 console.warn("S3 설정 초기화 실패:", err);
             }
-            if (!cancelled) {
-                void loadBuckets(savedProfile);
+            if (cancelled) return;
+            if (conns.length > 0) {
+                setAuthTab("conn");
+                setConnId(conns[0].id);
+                activateConnection(conns[0]);
+            } else {
+                void loadBuckets(null, savedProfile);
             }
         })();
         return () => {
             cancelled = true;
         };
-    }, [loadBuckets]);
+    }, [loadBuckets, activateConnection]);
+
+    // 인증 탭 전환: 연결이면 선택된(또는 첫) 연결로, 프로필이면 프로필로 다시 탐색
+    const selectAuthTab = useCallback(
+        (tab: "conn" | "profile") => {
+            if (tab === authTab) return;
+            setConnForm(null);
+            setConnFormError(null);
+            if (tab === "profile") {
+                setAuthTab("profile");
+                setBucket(null);
+                setPrefix("");
+                setEntries([]);
+                setSelected(new Set());
+                setError(null);
+                void loadBuckets(null, profile);
+                return;
+            }
+            const target =
+                (connId !== null
+                    ? connections.find((c) => c.id === connId)
+                    : undefined) ??
+                connections[0] ??
+                null;
+            if (target !== null) {
+                activateConnection(target);
+            } else {
+                setAuthTab("conn");
+                setConnId(null);
+                setBucket(null);
+                setPrefix("");
+                setEntries([]);
+                setSelected(new Set());
+                setError(null);
+                setBuckets([]);
+                setBucketsError(null);
+            }
+        },
+        [
+            authTab,
+            connId,
+            connections,
+            profile,
+            loadBuckets,
+            activateConnection,
+        ],
+    );
 
     // 프로필 변경: 설정에 저장하고 탐색 상태를 루트로 되돌린 뒤 버킷을 다시 읽는다
     const handleProfileChange = useCallback(
@@ -171,26 +333,43 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             setPrefix("");
             setEntries([]);
             setSelected(new Set());
-            void loadBuckets(next);
+            void loadBuckets(null, next);
         },
         [loadBuckets],
     );
 
-    // "bucket" 또는 "bucket/prefix/" 형태의 위치로 이동한다
+    // "bucket" / "bucket/prefix/" / "<연결id>@bucket/..." 형태의 위치로 이동한다.
+    // 연결이 달린 위치는 그 연결로, 없으면 프로필 인증으로 탐색한다.
     const enterLocation = useCallback(
         (item: string) => {
             const loc = parseLocation(item);
             if (loc.bucket.length === 0) return;
-            void loadPrefix(loc.bucket, loc.prefix);
+            if (loc.conn !== null) {
+                setAuthTab("conn");
+                setConnId(loc.conn);
+                void loadPrefix(loc.conn, profile, loc.bucket, loc.prefix);
+                return;
+            }
+            if (authTab === "conn") {
+                setAuthTab("profile");
+                setConnId(null);
+            }
+            void loadPrefix(null, profile, loc.bucket, loc.prefix);
         },
-        [loadPrefix],
+        [authTab, profile, loadPrefix],
     );
 
-    // 버킷 직접 입력 처리 (s3:// 접두사·슬래시는 관대하게 허용)
+    // 버킷 직접 입력 처리 (s3:// 접두사·슬래시는 관대하게 허용).
+    // 연결 탐색 중 연결 표기 없는 입력은 현재 연결로 본다.
     const handleEnterBucketInput = useCallback(() => {
         const raw = bucketInput.trim().replace(/^s3:\/\//, "");
-        enterLocation(raw);
-    }, [bucketInput, enterLocation]);
+        const loc = parseLocation(raw);
+        const item =
+            loc.conn === null && activeConnId !== null
+                ? `${activeConnId}@${raw}`
+                : raw;
+        enterLocation(item);
+    }, [bucketInput, enterLocation, activeConnId]);
 
     // 상위 위치로 이동: 접두사 안이면 한 단계 위, 접두사 루트면 버킷 목록으로
     const goUp = useCallback(() => {
@@ -205,8 +384,8 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
         const trimmed = prefix.replace(/\/+$/, "");
         const idx = trimmed.lastIndexOf("/");
         const parent = idx < 0 ? "" : `${trimmed.slice(0, idx + 1)}`;
-        void loadPrefix(bucket, parent);
-    }, [bucket, prefix, loadPrefix]);
+        void loadPrefix(activeConnId, profile, bucket, parent);
+    }, [bucket, prefix, activeConnId, profile, loadPrefix]);
 
     // 브레드크럼 세그먼트 이동: null이면 버킷 목록, ""이면 버킷 루트, 그 외 접두사
     const navigateTo = useCallback(
@@ -221,20 +400,147 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                 return;
             }
             if (bucket !== null) {
-                void loadPrefix(bucket, pfx);
+                void loadPrefix(activeConnId, profile, bucket, pfx);
             }
         },
-        [bucket, loadPrefix],
+        [bucket, activeConnId, profile, loadPrefix],
     );
 
-    // 현재 위치의 즐겨찾기 항목 ("bucket" 또는 "bucket/prefix/")
+    // 현재 위치의 즐겨찾기 항목 ("bucket[/prefix/]" 또는 "<연결id>@bucket[/prefix/]")
     const currentBookmark = useMemo(() => {
         if (bucket === null) return null;
-        return prefix.length === 0 ? bucket : `${bucket}/${prefix}`;
-    }, [bucket, prefix]);
+        const base = prefix.length === 0 ? bucket : `${bucket}/${prefix}`;
+        return activeConnId !== null ? `${activeConnId}@${base}` : base;
+    }, [bucket, prefix, activeConnId]);
 
     const isBookmarked =
         currentBookmark !== null && bookmarks.includes(currentBookmark);
+
+    // 탐색 중인 버킷의 즐겨찾기 항목 문자열 (연결 탐색 중이면 연결 표기를 붙인다)
+    const bookmarkKeyOf = useCallback(
+        (bkt: string) =>
+            activeConnId !== null ? `${activeConnId}@${bkt}` : bkt,
+        [activeConnId],
+    );
+
+    // 즐겨찾기 항목의 표시 문자열: "<연결id>@..."는 연결 이름으로 바꿔 보여준다
+    const bookmarkLabel = useCallback(
+        (item: string): string => {
+            const loc = parseLocation(item);
+            if (loc.conn === null) return item;
+            const conn = connections.find((c) => c.id === loc.conn);
+            const name = conn?.name ?? "(삭제된 연결)";
+            return `${name}@${item.slice(loc.conn.length + 1)}`;
+        },
+        [connections],
+    );
+
+    // 새 연결 양식. from을 주면 복제(비밀 키는 복사되지 않으므로 재입력 필요)
+    const openNewConnForm = useCallback((from?: S3Connection) => {
+        setConnFormError(null);
+        setConnForm({
+            id: null,
+            name: from !== undefined ? `${from.name} 사본` : "",
+            accessKeyId: from?.accessKeyId ?? "",
+            secretKey: "",
+            region: from?.region ?? "",
+            bucket: from?.bucket ?? "",
+            prefix: from?.prefix ?? "",
+            duplicated: from !== undefined,
+        });
+    }, []);
+
+    // 기존 연결 편집 양식 (비밀 키는 비워 두면 기존 값 유지)
+    const openEditConnForm = useCallback((conn: S3Connection) => {
+        setConnFormError(null);
+        setConnForm({
+            id: conn.id,
+            name: conn.name,
+            accessKeyId: conn.accessKeyId,
+            secretKey: "",
+            region: conn.region ?? "",
+            bucket: conn.bucket ?? "",
+            prefix: conn.prefix ?? "",
+            duplicated: false,
+        });
+    }, []);
+
+    const updateConnForm = useCallback((patch: Partial<ConnFormState>) => {
+        setConnForm((prev) => (prev === null ? prev : { ...prev, ...patch }));
+    }, []);
+
+    // 연결 저장: 성공하면 목록을 새로 고치고 저장된 연결을 선택해 탐색한다
+    const handleSaveConn = useCallback(async () => {
+        const form = connForm;
+        if (form === null) return;
+        const name = form.name.trim();
+        const accessKeyId = form.accessKeyId.trim();
+        if (name.length === 0) {
+            setConnFormError("이름을 입력하세요.");
+            return;
+        }
+        if (accessKeyId.length === 0) {
+            setConnFormError("액세스 키를 입력하세요.");
+            return;
+        }
+        if (form.id === null && form.secretKey.trim().length === 0) {
+            setConnFormError("비밀 키를 입력하세요.");
+            return;
+        }
+        setConnSaving(true);
+        setConnFormError(null);
+        const trimOrNull = (s: string) => {
+            const t = s.trim();
+            return t.length > 0 ? t : null;
+        };
+        try {
+            const saved = await saveS3Connection({
+                id: form.id,
+                name,
+                accessKeyId,
+                secretKey: form.secretKey.length > 0 ? form.secretKey : null,
+                region: trimOrNull(form.region),
+                bucket: trimOrNull(form.bucket),
+                prefix: trimOrNull(form.prefix),
+            });
+            // 비밀 키가 담긴 양식 상태는 즉시 폐기한다
+            setConnForm(null);
+            const list = await listS3Connections();
+            setConnections(list);
+            activateConnection(saved);
+        } catch (err) {
+            setConnFormError(toErrorMessage(err));
+        } finally {
+            setConnSaving(false);
+        }
+    }, [connForm, activateConnection]);
+
+    // 연결 삭제: 목록을 새로 고치고, 탐색 중이던 연결이면 프로필로 되돌린다
+    const handleDeleteConn = useCallback(async () => {
+        const target = connDelete;
+        if (target === null) return;
+        setConnDeleting(true);
+        try {
+            await deleteS3Connection(target.id);
+            const list = await listS3Connections();
+            setConnections(list);
+            if (connId === target.id) {
+                setConnId(null);
+                setAuthTab("profile");
+                setBucket(null);
+                setPrefix("");
+                setEntries([]);
+                setSelected(new Set());
+                setError(null);
+                void loadBuckets(null, profile);
+            }
+        } catch (err) {
+            setConnListError(toErrorMessage(err));
+        } finally {
+            setConnDeleting(false);
+            setConnDelete(null);
+        }
+    }, [connDelete, connId, profile, loadBuckets]);
 
     // 즐겨찾기 토글: 목록을 갱신하고 백엔드(s3-bookmarks.json)에 저장한다
     const toggleBookmark = useCallback((item: string) => {
@@ -287,7 +593,11 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
     const openObjects = useCallback(
         (names: string[]) => {
             if (bucket === null || names.length === 0) return;
-            const uris = names.map((n) => s3UriOf(bucket, `${prefix}${n}`));
+            const uris = names.map((n) =>
+                activeConnId !== null
+                    ? s3ConnUriOf(activeConnId, bucket, `${prefix}${n}`)
+                    : s3UriOf(bucket, `${prefix}${n}`),
+            );
             const objs = entries.filter(
                 (e) => !e.isDir && names.includes(e.name),
             );
@@ -303,7 +613,7 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             onOpenPaths(uris);
             onClose();
         },
-        [bucket, prefix, entries, onOpenPaths, onClose],
+        [bucket, prefix, entries, activeConnId, onOpenPaths, onClose],
     );
 
     const handleOpenSelected = useCallback(() => {
@@ -328,11 +638,11 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
     // 에러 시 재시도: 버킷 안이면 현재 접두사, 버킷 목록이면 목록 재조회
     const handleRetry = useCallback(() => {
         if (bucket !== null) {
-            void loadPrefix(bucket, prefix);
+            void loadPrefix(activeConnId, profile, bucket, prefix);
         } else {
-            void loadBuckets(profile);
+            void loadBuckets(activeConnId, profile);
         }
-    }, [bucket, prefix, loadPrefix, loadBuckets, profile]);
+    }, [bucket, prefix, loadPrefix, loadBuckets, activeConnId, profile]);
 
     const canOpen = selected.size > 0 && !loading;
     const prefixSegments = useMemo(
@@ -342,27 +652,280 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
 
     return (
         <>
-            {/* AWS 프로필 선택 */}
+            {/* 인증: 저장된 연결 또는 AWS 프로필 */}
             <div className="px-4 pt-3">
-                <label
-                    htmlFor="s3-profile-select"
-                    className="block text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1"
-                >
-                    AWS 프로필 (~/.aws/config)
-                </label>
-                <select
-                    id="s3-profile-select"
-                    value={profile ?? ""}
-                    onChange={(e) => handleProfileChange(e.target.value)}
-                    className="w-full h-8 px-2 text-sm font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
-                >
-                    <option value="">기본 자격 증명 체인</option>
-                    {profiles.map((p) => (
-                        <option key={p} value={p}>
-                            {p}
-                        </option>
-                    ))}
-                </select>
+                <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                        인증
+                    </span>
+                    <div className="flex rounded-md border border-zinc-300 dark:border-zinc-700 overflow-hidden">
+                        <button
+                            type="button"
+                            onClick={() => selectAuthTab("conn")}
+                            className={`px-2.5 py-1 text-[11px] font-medium cursor-pointer ${
+                                authTab === "conn"
+                                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
+                                    : "bg-white dark:bg-zinc-950 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            }`}
+                        >
+                            저장된 연결
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => selectAuthTab("profile")}
+                            className={`px-2.5 py-1 text-[11px] font-medium cursor-pointer ${
+                                authTab === "profile"
+                                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
+                                    : "bg-white dark:bg-zinc-950 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            }`}
+                        >
+                            AWS 프로필
+                        </button>
+                    </div>
+                </div>
+
+                {authTab === "conn" ? (
+                    connForm !== null ? (
+                        /* 연결 편집/생성 양식 */
+                        <div className="rounded border border-zinc-300 dark:border-zinc-700 p-2 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                                <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                                    {connForm.id === null
+                                        ? "새 연결"
+                                        : "연결 편집"}
+                                </span>
+                                {connForm.duplicated && (
+                                    <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                                        비밀 키를 다시 입력하세요
+                                    </span>
+                                )}
+                            </div>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">이름 *</span>
+                                <input
+                                    type="text"
+                                    value={connForm.name}
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            name: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">
+                                    액세스 키 *
+                                </span>
+                                <input
+                                    type="text"
+                                    value={connForm.accessKeyId}
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            accessKeyId: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">비밀 키 *</span>
+                                <input
+                                    type="password"
+                                    value={connForm.secretKey}
+                                    placeholder={
+                                        connForm.id === null
+                                            ? ""
+                                            : "변경하지 않으려면 비워 두세요"
+                                    }
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            secretKey: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                />
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">리전</span>
+                                <input
+                                    type="text"
+                                    value={connForm.region}
+                                    placeholder="자동 감지"
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            region: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">버킷</span>
+                                <input
+                                    type="text"
+                                    value={connForm.bucket}
+                                    placeholder="선택 (시작 버킷)"
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            bucket: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            <label className="flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                <span className="w-14 shrink-0">경로</span>
+                                <input
+                                    type="text"
+                                    value={connForm.prefix}
+                                    placeholder="선택 (시작 경로)"
+                                    onChange={(e) =>
+                                        updateConnForm({
+                                            prefix: e.target.value,
+                                        })
+                                    }
+                                    className="flex-1 h-7 px-2 text-xs font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            {connFormError !== null && (
+                                <div className="text-[11px] text-rose-600 dark:text-rose-400 whitespace-pre-wrap break-all">
+                                    {connFormError}
+                                </div>
+                            )}
+                            <div className="flex justify-end gap-1.5 pt-0.5">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setConnForm(null);
+                                        setConnFormError(null);
+                                    }}
+                                    disabled={connSaving}
+                                    className="h-7 px-2.5 text-[11px] font-medium rounded bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 disabled:opacity-40 cursor-pointer"
+                                >
+                                    취소
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => void handleSaveConn()}
+                                    disabled={connSaving}
+                                    className="h-7 px-2.5 text-[11px] font-medium rounded bg-zinc-900 text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 disabled:opacity-40 cursor-pointer"
+                                >
+                                    {connSaving ? "저장 중…" : "저장"}
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        /* 저장된 연결 목록 */
+                        <>
+                            <div className="max-h-28 overflow-y-auto rounded border border-zinc-300 dark:border-zinc-700 divide-y divide-zinc-100 dark:divide-zinc-800">
+                                {connections.map((conn) => (
+                                    <div
+                                        key={conn.id}
+                                        onClick={() => activateConnection(conn)}
+                                        className={`flex items-center gap-1 px-2 py-1 cursor-pointer ${
+                                            conn.id === connId
+                                                ? "bg-blue-50 dark:bg-blue-950/40"
+                                                : "hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                        }`}
+                                    >
+                                        <div className="flex-1 min-w-0">
+                                            <div className="text-xs font-medium text-zinc-800 dark:text-zinc-200 truncate">
+                                                {conn.name}
+                                            </div>
+                                            <div className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500 truncate">
+                                                {maskAccessKey(
+                                                    conn.accessKeyId,
+                                                )}
+                                                {" · "}
+                                                {conn.lastUsed !== null
+                                                    ? relativeTime(
+                                                          conn.lastUsed,
+                                                      )
+                                                    : "사용 기록 없음"}
+                                            </div>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                openEditConnForm(conn);
+                                            }}
+                                            className="px-1.5 py-0.5 text-[10px] rounded text-zinc-500 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 cursor-pointer shrink-0"
+                                        >
+                                            편집
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                openNewConnForm(conn);
+                                            }}
+                                            className="px-1.5 py-0.5 text-[10px] rounded text-zinc-500 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 cursor-pointer shrink-0"
+                                        >
+                                            복제
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                setConnDelete(conn);
+                                            }}
+                                            className="px-1.5 py-0.5 text-[10px] rounded text-rose-500 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/50 cursor-pointer shrink-0"
+                                        >
+                                            삭제
+                                        </button>
+                                    </div>
+                                ))}
+                                {connections.length === 0 && (
+                                    <div className="px-3 py-4 text-center text-xs text-zinc-400 dark:text-zinc-500">
+                                        저장된 연결이 없습니다
+                                    </div>
+                                )}
+                            </div>
+                            {connListError !== null && (
+                                <div className="mt-1 text-[11px] text-rose-600 dark:text-rose-400 whitespace-pre-wrap break-all">
+                                    {connListError}
+                                </div>
+                            )}
+                            <div className="mt-1.5 flex justify-end">
+                                <button
+                                    type="button"
+                                    onClick={() => openNewConnForm()}
+                                    className="h-7 px-2.5 text-[11px] font-medium rounded bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
+                                >
+                                    새 연결
+                                </button>
+                            </div>
+                        </>
+                    )
+                ) : (
+                    /* AWS 프로필 선택 */
+                    <select
+                        id="s3-profile-select"
+                        value={profile ?? ""}
+                        onChange={(e) => handleProfileChange(e.target.value)}
+                        className="w-full h-8 px-2 text-sm font-mono bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-zinc-900 dark:text-zinc-100"
+                    >
+                        <option value="">기본 자격 증명 체인</option>
+                        {profiles.map((p) => (
+                            <option key={p} value={p}>
+                                {p}
+                            </option>
+                        ))}
+                    </select>
+                )}
             </div>
 
             {/* 위치 바: 브레드크럼 + 즐겨찾기 토글 + 상위로 */}
@@ -537,7 +1100,7 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                                     key={`bm-${item}`}
                                     onDoubleClick={() => enterLocation(item)}
                                     onClick={() => enterLocation(item)}
-                                    title={`s3://${item}`}
+                                    title={`s3://${bookmarkLabel(item)}`}
                                     className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                     style={{ height: 26 }}
                                 >
@@ -553,7 +1116,9 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                                         >
                                             ★
                                         </button>
-                                        <span className="truncate">{item}</span>
+                                        <span className="truncate">
+                                            {bookmarkLabel(item)}
+                                        </span>
                                     </span>
                                     <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
                                         -
@@ -565,13 +1130,20 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                             ))}
                             {/* 버킷 목록 */}
                             {buckets
-                                .filter((b) => !bookmarks.includes(b))
+                                .filter(
+                                    (b) =>
+                                        !bookmarks.includes(bookmarkKeyOf(b)),
+                                )
                                 .map((b) => (
                                     <div
                                         key={`bucket-${b}`}
-                                        onDoubleClick={() => enterLocation(b)}
-                                        onClick={() => enterLocation(b)}
-                                        title={`s3://${b}`}
+                                        onDoubleClick={() =>
+                                            enterLocation(bookmarkKeyOf(b))
+                                        }
+                                        onClick={() =>
+                                            enterLocation(bookmarkKeyOf(b))
+                                        }
+                                        title={`s3://${bookmarkLabel(bookmarkKeyOf(b))}`}
                                         className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                         style={{ height: 26 }}
                                     >
@@ -580,7 +1152,9 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                                                 type="button"
                                                 onClick={(e) => {
                                                     e.stopPropagation();
-                                                    toggleBookmark(b);
+                                                    toggleBookmark(
+                                                        bookmarkKeyOf(b),
+                                                    );
                                                 }}
                                                 className="mr-1.5 shrink-0 text-zinc-400 hover:text-amber-500 cursor-pointer"
                                                 title="즐겨찾기에 추가"
@@ -629,6 +1203,8 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                                     onDoubleClick={() => {
                                         if (entry.isDir) {
                                             void loadPrefix(
+                                                activeConnId,
+                                                profile,
                                                 bucket,
                                                 `${prefix}${entry.name}/`,
                                             );
@@ -772,6 +1348,49 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                                 className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-900 text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 cursor-pointer"
                             >
                                 열기
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* 연결 삭제 확인 창 */}
+            {connDelete !== null && (
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="S3 연결 삭제 확인"
+                    className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 dark:bg-black/50"
+                    onMouseDown={(e) => {
+                        if (e.target === e.currentTarget && !connDeleting) {
+                            setConnDelete(null);
+                        }
+                    }}
+                >
+                    <div className="w-[24rem] max-w-[92vw] rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl p-4">
+                        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
+                            연결 삭제
+                        </div>
+                        <p className="text-xs text-zinc-700 dark:text-zinc-300">
+                            연결 '{connDelete.name}'을(를) 삭제합니다. 키체인의
+                            비밀 키도 함께 지워집니다.
+                        </p>
+                        <div className="mt-3.5 flex justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setConnDelete(null)}
+                                disabled={connDeleting}
+                                className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 disabled:opacity-40 cursor-pointer"
+                            >
+                                취소
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => void handleDeleteConn()}
+                                disabled={connDeleting}
+                                className="px-3 py-1.5 text-xs font-medium rounded-md bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-40 cursor-pointer"
+                            >
+                                {connDeleting ? "삭제 중…" : "삭제"}
                             </button>
                         </div>
                     </div>

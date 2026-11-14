@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import type { TabMeta } from "@/components/TabBar";
 import { baseNameOf } from "@/lib/merge";
-import { remoteHostOf, s3BucketOf } from "@/lib/remote";
+import { remoteHostOf, s3BucketOf, s3DisplayPath } from "@/lib/remote";
 
 /** 병합에 참여할 수 있는 원본 탭 수 범위 (Rust MIN/MAX_MERGE_SOURCES와 동일) */
 export const MIN_MERGE_SOURCES = 2;
@@ -106,7 +106,7 @@ export const MergeDialog: React.FC<MergeDialogProps> = ({
                         return (
                             <label
                                 key={tab.id}
-                                title={path}
+                                title={s3DisplayPath(path, null)}
                                 className="flex items-center gap-2 px-2.5 py-1.5 text-xs cursor-pointer border-b border-zinc-100 dark:border-zinc-800 last:border-b-0 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
                             >
                                 <input
@@ -155,7 +155,7 @@ export const MergeDialog: React.FC<MergeDialogProps> = ({
                                 <div
                                     key={id}
                                     className="flex items-center gap-1.5 px-2.5 py-1 text-xs border-b border-zinc-100 dark:border-zinc-800 last:border-b-0"
-                                    title={path}
+                                    title={s3DisplayPath(path, null)}
                                 >
                                     <span className="w-4 text-center font-mono text-[10px] text-zinc-400">
                                         {i + 1}

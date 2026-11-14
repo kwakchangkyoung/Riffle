@@ -35,8 +35,11 @@ pub enum RemoteError {
     #[error("SFTP 오류: {0}")]
     Sftp(String),
     /// S3 접근 권한 부족 (HTTP 403).
-    #[error("권한이 없습니다(403). 프로필/버킷 정책을 확인하세요: {0}")]
+    #[error("권한이 없습니다(403). 자격 증명(프로필·액세스 키)과 버킷 정책을 확인하세요: {0}")]
     S3AccessDenied(String),
+    /// 액세스 키가 없거나 비밀 키 서명이 맞지 않는다 (InvalidAccessKeyId / SignatureDoesNotMatch).
+    #[error("{0}: {1}")]
+    S3InvalidKey(String, &'static str),
     /// S3 버킷·객체가 없다 (HTTP 404).
     #[error("찾을 수 없습니다: {0}")]
     S3NotFound(String),
@@ -154,6 +157,14 @@ pub(crate) fn map_s3_error<E: ProvideErrorMetadata>(e: &SdkError<E>, what: &str)
             .as_service_error()
             .and_then(|se| se.meta().code().map(str::to_string));
         return match (status, code.as_deref()) {
+            (_, Some("InvalidAccessKeyId")) => RemoteError::S3InvalidKey(
+                what.to_string(),
+                "액세스 키가 올바르지 않습니다. 연결의 액세스 키를 확인하세요",
+            ),
+            (_, Some("SignatureDoesNotMatch")) => RemoteError::S3InvalidKey(
+                what.to_string(),
+                "비밀 키가 올바르지 않습니다. 연결을 편집해 비밀 키를 다시 입력하세요",
+            ),
             (403, _) | (_, Some("AccessDenied")) => RemoteError::S3AccessDenied(what.to_string()),
             (404, _) | (_, Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "404")) => {
                 RemoteError::S3NotFound(what.to_string())
@@ -200,6 +211,9 @@ pub(crate) fn remote_to_io(e: RemoteError) -> io::Error {
             io::Error::new(io::ErrorKind::PermissionDenied, path)
         }
         RemoteError::S3AccessDenied(what) => io::Error::new(io::ErrorKind::PermissionDenied, what),
+        RemoteError::S3InvalidKey(what, hint) => {
+            io::Error::new(io::ErrorKind::PermissionDenied, format!("{what}: {hint}"))
+        }
         RemoteError::S3NotFound(what) => io::Error::new(io::ErrorKind::NotFound, what),
         RemoteError::Timeout(secs) => io::Error::new(
             io::ErrorKind::TimedOut,

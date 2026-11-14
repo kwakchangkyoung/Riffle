@@ -129,6 +129,7 @@ fn open_remote_inner(state: &AppState, path: &str, uri: &RemoteUri) -> Result<Op
             remote: true,
             source: "sftp".to_string(),
             agent: agent_session.is_some(),
+            s3_connection_name: None,
         },
         file,
         cancel,
