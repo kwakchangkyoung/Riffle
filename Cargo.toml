@@ -10,7 +10,7 @@ members = [
 # 앱 버전의 단일 출처는 src-tauri/tauri.conf.json 이다.
 # 릴리스 시 여기와 tauri.conf.json, package.json 세 곳을 함께 올린다.
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 
 [profile.release]
 codegen-units = 1
