@@ -100,13 +100,20 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
         ],
     )?;
 
-    // 편집 메뉴: 복사, 찾기 (모두 선택은 의도적으로 제외)
+    // 편집 메뉴: 실행 취소/다시 실행/오려두기/복사/붙여넣기, 찾기 (모두 선택은 의도적으로 제외)
+    // macOS 는 ⌘Z/⌘X/⌘V 를 메뉴 항목을 통해서만 입력창에 전달하므로 네이티브 항목이 필요하다.
+    // 복사는 줄 단위 선택 복사를 위해 커스텀 항목을 유지한다.
     let edit_menu = Submenu::with_items(
         app,
         "편집",
         true,
         &[
+            &PredefinedMenuItem::undo(app, Some("실행 취소"))?,
+            &PredefinedMenuItem::redo(app, Some("다시 실행"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, Some("오려두기"))?,
             &MenuItem::with_id(app, "copy", "복사", true, Some("CmdOrCtrl+C"))?,
+            &PredefinedMenuItem::paste(app, Some("붙여넣기"))?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "find", "찾기…", true, Some("CmdOrCtrl+F"))?,
         ],
