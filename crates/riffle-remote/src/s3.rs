@@ -12,7 +12,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aws_config::BehaviorVersion;
@@ -27,6 +27,7 @@ use crate::block_cache::BlockCache;
 use crate::error::{
     RemoteError, map_s3_error, remote_to_io, s3_is_invalid_range, s3_redirect_region,
 };
+use crate::{LIST_STREAM_MAX, ListSummary};
 
 /// 이 크기 이상의 read_at 은 캐시 없이 병렬 Range GET 으로 처리한다.
 const LARGE_READ: usize = 4 * 1024 * 1024;
@@ -38,8 +39,6 @@ const READ_PARALLEL: usize = 16;
 const BLOCK_SIZE: u64 = 1024 * 1024;
 /// 블록 캐시 최대 총량.
 const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-/// list_prefix 가 반환하는 항목 수 상한. 넘으면 나머지는 잘린다 (표시는 호출자 몫).
-const LIST_MAX_ENTRIES: usize = 10_000;
 /// 리전을 알 수 없을 때 첫 시도에 쓰는 리전. S3 는 잘못된 리전을 리다이렉트로 알려준다.
 const DEFAULT_REGION: &str = "us-east-1";
 
@@ -376,25 +375,43 @@ impl S3PoolInner {
         Ok(names)
     }
 
-    async fn list_prefix_async(
+    /// `prefix + name_prefix` 를 요청 접두사로 써 delimiter `/` 로 나열한다.
+    /// 응답 한 페이지(CommonPrefixes + Contents)마다 on_page 를 호출하고,
+    /// 반환 항목 name 은 `prefix` 기준 상대 이름(= name_prefix 로 시작)이다.
+    /// 페이지 사이마다 cancel 을 확인하고, 누적이 max 에 도달하면 잘라낸다.
+    // 목록 조건·상한·취소·콜백을 그대로 받으므로 인자가 많다
+    #[allow(clippy::too_many_arguments)]
+    async fn list_prefix_stream_async(
         &self,
         auth: &S3Auth,
         bucket: &str,
         prefix: &str,
-    ) -> Result<Vec<S3Entry>, RemoteError> {
-        let mut entries = Vec::new();
+        name_prefix: &str,
+        max: usize,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<S3Entry>),
+    ) -> Result<ListSummary, RemoteError> {
+        let request_prefix = format!("{prefix}{name_prefix}");
+        let mut total = 0usize;
         let mut token: Option<String> = None;
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(ListSummary {
+                    total,
+                    truncated: false,
+                    cancelled: true,
+                });
+            }
             let page_token = token.clone();
             let out = self
                 .run_op(auth, bucket, bucket, |client| {
-                    let (bucket, prefix) = (bucket.to_string(), prefix.to_string());
+                    let (bucket, request_prefix) = (bucket.to_string(), request_prefix.clone());
                     let token = page_token.clone();
                     async move {
                         let mut req = client
                             .list_objects_v2()
                             .bucket(bucket)
-                            .prefix(prefix)
+                            .prefix(request_prefix)
                             .delimiter("/");
                         if let Some(t) = token {
                             req = req.continuation_token(t);
@@ -404,6 +421,7 @@ impl S3PoolInner {
                 })
                 .await?;
 
+            let mut page = Vec::new();
             for cp in out.common_prefixes() {
                 if let Some(name) = cp
                     .prefix()
@@ -411,7 +429,7 @@ impl S3PoolInner {
                     .map(|s| s.trim_end_matches('/'))
                     .filter(|s| !s.is_empty())
                 {
-                    entries.push(S3Entry {
+                    page.push(S3Entry {
                         name: name.to_string(),
                         is_dir: true,
                         size: 0,
@@ -421,12 +439,13 @@ impl S3PoolInner {
             }
             for obj in out.contents() {
                 let key = obj.key().unwrap_or_default();
-                // 요청한 접두사 자체(0바이트 폴더 마커)와 '/' 로 끝나는 마커는 제외한다.
+                // 요청한 디렉터리 접두사 자체(0바이트 폴더 마커)와
+                // '/' 로 끝나는 마커는 제외한다.
                 if key == prefix || key.ends_with('/') {
                     continue;
                 }
                 if let Some(name) = key.strip_prefix(prefix).filter(|s| !s.is_empty()) {
-                    entries.push(S3Entry {
+                    page.push(S3Entry {
                         name: name.to_string(),
                         is_dir: false,
                         size: obj.size().unwrap_or(0).max(0) as u64,
@@ -435,17 +454,32 @@ impl S3PoolInner {
                 }
             }
 
-            if entries.len() >= LIST_MAX_ENTRIES {
-                break;
+            // 상한: 이번 페이지에서 넘치면 넘치는 만큼 버린다.
+            page.truncate(max.saturating_sub(total));
+            total += page.len();
+            if !page.is_empty() {
+                on_page(page);
             }
-            match out.next_continuation_token() {
+
+            let next = out.next_continuation_token();
+            if total >= max {
+                // 정확히 max 개로 마지막 페이지가 끝난 경우는 잘림이 아니다.
+                return Ok(ListSummary {
+                    total,
+                    truncated: next.is_some(),
+                    cancelled: false,
+                });
+            }
+            match next {
                 Some(t) => token = Some(t.to_string()),
                 None => break,
             }
         }
-        // 디렉터리 우선, 그다음 이름순.
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-        Ok(entries)
+        Ok(ListSummary {
+            total,
+            truncated: false,
+            cancelled: false,
+        })
     }
 
     async fn head_async(&self, auth: &S3Auth, uri: &S3Uri) -> Result<u64, RemoteError> {
@@ -488,15 +522,70 @@ impl S3Pool {
     }
 
     /// `prefix` 아래를 delimiter `/` 로 나열한다.
-    /// 디렉터리 먼저, 이름순. 페이지네이션을 끝까지 따라가며 최대 10,000개까지 반환한다.
+    /// 디렉터리 먼저, 이름순. 페이지네이션을 끝까지 따라가며
+    /// 최대 `LIST_STREAM_MAX` 개까지 반환한다.
     pub fn list_prefix(
         &self,
         auth: &S3Auth,
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<S3Entry>, RemoteError> {
-        self.inner
-            .block_on(self.inner.list_prefix_async(auth, bucket, prefix))
+        let mut entries = Vec::new();
+        let cancel = AtomicBool::new(false);
+        self.list_prefix_stream(auth, bucket, prefix, "", &cancel, &mut |page| {
+            entries.extend(page);
+        })?;
+        // 디렉터리 우선, 그다음 이름순.
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(entries)
+    }
+
+    /// `prefix + name_prefix` 아래를 delimiter `/` 로 나열하며
+    /// 응답 페이지마다 on_page 를 호출한다 (항목은 S3 정렬 순서 그대로).
+    /// cancel 은 페이지 사이마다 확인하고, 누적이 `LIST_STREAM_MAX` 에
+    /// 도달하면 잘라낸다.
+    pub fn list_prefix_stream(
+        &self,
+        auth: &S3Auth,
+        bucket: &str,
+        prefix: &str,
+        name_prefix: &str,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<S3Entry>),
+    ) -> Result<ListSummary, RemoteError> {
+        self.list_prefix_stream_max(
+            auth,
+            bucket,
+            prefix,
+            name_prefix,
+            LIST_STREAM_MAX,
+            cancel,
+            on_page,
+        )
+    }
+
+    /// 상한을 지정하는 `list_prefix_stream` 변형 (테스트용).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_prefix_stream_max(
+        &self,
+        auth: &S3Auth,
+        bucket: &str,
+        prefix: &str,
+        name_prefix: &str,
+        max: usize,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<S3Entry>),
+    ) -> Result<ListSummary, RemoteError> {
+        self.inner.block_on(self.inner.list_prefix_stream_async(
+            auth,
+            bucket,
+            prefix,
+            name_prefix,
+            max,
+            cancel,
+            on_page,
+        ))
     }
 
     /// 객체 크기(바이트).

@@ -503,14 +503,39 @@ export function listSshHosts(): Promise<SshHost[]> {
     return invoke<SshHost[]>("list_ssh_hosts");
 }
 
+/** 목록 스트리밍 이벤트 (s3_list_stream / sftp_list_stream 공통 형태) */
+export type ListEvent<E> =
+    | { kind: "page"; entries: E[] }
+    | { kind: "done"; total: number; truncated: boolean; cancelled: boolean }
+    | { kind: "error"; message: string };
+
 /**
- * 원격 호스트의 디렉터리 목록을 조회합니다 (이름순, 디렉터리 먼저).
+ * 원격 호스트의 디렉터리 목록을 스트리밍으로 조회합니다.
+ * namePrefix 가 있으면 해당 접두사로 시작하는 항목만 보냅니다.
+ * onEvent 에 page/done/error 이벤트가 차례로 전달되고,
+ * 반환값은 cancel_listing 으로 취소할 때 쓰는 목록 ID입니다.
  */
-export function listRemoteDir(
+export function sftpListStream(
     host: string,
     path: string,
-): Promise<RemoteEntry[]> {
-    return invoke<RemoteEntry[]>("list_remote_dir", { host, path });
+    namePrefix: string,
+    onEvent: (e: ListEvent<RemoteEntry>) => void,
+): Promise<number> {
+    const channel = new Channel<ListEvent<RemoteEntry>>();
+    channel.onmessage = onEvent;
+    return invoke<number>("sftp_list_stream", {
+        host,
+        path,
+        namePrefix,
+        onEvent: channel,
+    });
+}
+
+/**
+ * 진행 중인 목록 스트림을 취소합니다. 이미 끝난 ID는 무시됩니다.
+ */
+export function cancelListing(listId: number): Promise<void> {
+    return invoke<void>("cancel_listing", { listId });
 }
 
 /**
@@ -553,20 +578,28 @@ export function s3ListBuckets(
 }
 
 /**
- * 버킷의 접두사 아래 항목을 "/" 구분으로 조회합니다 (폴더 먼저, 이름순).
- * connectionId가 있으면 저장된 연결 자격 증명을 사용합니다.
+ * 버킷의 접두사 아래 항목을 스트리밍으로 조회합니다.
+ * namePrefix 가 있으면 서버 측에서 접두사 필터가 적용됩니다.
+ * onEvent 에 page/done/error 이벤트가 차례로 전달되고,
+ * 반환값은 cancel_listing 으로 취소할 때 쓰는 목록 ID입니다.
  */
-export function s3ListPrefix(
+export function s3ListStream(
     profile: string | null,
     connectionId: string | null,
     bucket: string,
     prefix: string,
-): Promise<S3Entry[]> {
-    return invoke<S3Entry[]>("s3_list_prefix", {
+    namePrefix: string,
+    onEvent: (e: ListEvent<S3Entry>) => void,
+): Promise<number> {
+    const channel = new Channel<ListEvent<S3Entry>>();
+    channel.onmessage = onEvent;
+    return invoke<number>("s3_list_stream", {
         profile,
         connectionId,
         bucket,
         prefix,
+        namePrefix,
+        onEvent: channel,
     });
 }
 

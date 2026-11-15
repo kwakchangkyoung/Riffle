@@ -1,21 +1,16 @@
-import React, {
-    useCallback,
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
-} from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
     getAgentHosts,
-    listRemoteDir,
     listSshHosts,
     remoteHome,
     setAgentEnabled,
+    sftpListStream,
+    type ListEvent,
     type RemoteEntry,
     type SshHost,
 } from "@/lib/ipc";
 import { remoteUriOf } from "@/lib/remote";
-import { formatBytes, formatMtime } from "@/lib/format";
+import { RemoteFileList } from "@/components/remote/RemoteFileList";
 import { S3Panel } from "@/components/remote/S3Panel";
 
 /** 최근 원격 위치 최대 개수 */
@@ -99,19 +94,11 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
 
     const [dirInput, setDirInput] = useState("");
     const [dir, setDir] = useState<string | null>(null);
-    const [entries, setEntries] = useState<RemoteEntry[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    const [selected, setSelected] = useState<Set<string>>(new Set());
-    const anchorRef = useRef<string | null>(null);
     // 최근 위치는 localStorage에서 동기적으로 읽어 초기값으로 사용한다
     const [recentLocs, setRecentLocs] = useState<RecentLoc[]>(loadRecentLocs);
-
-    const fileEntries = useMemo(
-        () => entries.filter((e) => !e.isDir),
-        [entries],
-    );
 
     // ~/.ssh/config 호스트 목록 로드
     useEffect(() => {
@@ -135,17 +122,20 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
         };
     }, []);
 
-    // 디렉터리 목록 조회. 성공 시 현재 경로/입력창/선택/최근 위치를 갱신한다.
-    const loadDir = useCallback(async (host: string, path: string) => {
-        setLoading(true);
+    // 디렉터리 이동. 목록 자체는 RemoteFileList 의 스트림이 불러오며,
+    // 완료되면 handleListFinished 가 최근 위치를 갱신한다.
+    const loadDir = useCallback((path: string) => {
         setError(null);
-        try {
-            const list = await listRemoteDir(host, path);
-            setDir(path);
-            setDirInput(path);
-            setEntries(list);
-            setSelected(new Set());
-            anchorRef.current = null;
+        setDir(path);
+        setDirInput(path);
+    }, []);
+
+    // 목록 스트림이 정상 종료하면 현재 경로를 최근 위치에 추가한다
+    const handleListFinished = useCallback(
+        (ok: boolean) => {
+            if (!ok || connectedHost === null || dir === null) return;
+            const host = connectedHost;
+            const path = dir;
             setRecentLocs((prev) => {
                 const next = [
                     { host, dir: path },
@@ -154,14 +144,18 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                 saveRecentLocs(next);
                 return next;
             });
-        } catch (err) {
-            setError(toErrorMessage(err));
-        } finally {
-            setLoading(false);
-        }
-    }, []);
+        },
+        [connectedHost, dir],
+    );
 
-    // 호스트 접속: 홈 디렉터리를 시작 경로로 잡고 목록을 불러온다.
+    // RemoteFileList 가 호출하는 스트림 시작 함수 (dir 이 null 이면 렌더되지 않는다)
+    const startStream = useCallback(
+        (namePrefix: string, onEvent: (e: ListEvent<RemoteEntry>) => void) =>
+            sftpListStream(connectedHost ?? "", dir ?? "", namePrefix, onEvent),
+        [connectedHost, dir],
+    );
+
+    // 호스트 접속: 홈 디렉터리를 시작 경로로 잡는다. 목록은 RemoteFileList 가 불러온다.
     // 성공 시 접속된 호스트를 반환한다 (실패 시 null).
     const connect = useCallback(
         async (host: string): Promise<string | null> => {
@@ -169,15 +163,13 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
             if (h.length === 0) return null;
             setError(null);
             setLoading(true);
-            setEntries([]);
-            setSelected(new Set());
             try {
                 const home = await remoteHome(h);
                 setConnectedHost(h);
                 setHostInput(h);
                 setDir(home);
                 setDirInput(home);
-                await loadDir(h, home);
+                setLoading(false);
                 return h;
             } catch (err) {
                 setError(toErrorMessage(err));
@@ -185,7 +177,7 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                 return null;
             }
         },
-        [loadDir],
+        [],
     );
 
     // 경로 입력창의 경로로 이동. 미접속 상태면 먼저 호스트 접속을 시도하고
@@ -198,11 +190,11 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
             if (connectedHost === null) {
                 const h = await connect(hostInput);
                 if (h !== null) {
-                    await loadDir(h, path);
+                    loadDir(path);
                 }
                 return;
             }
-            await loadDir(connectedHost, path);
+            loadDir(path);
         },
         [connectedHost, connect, hostInput, loadDir],
     );
@@ -232,15 +224,11 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
         [connectedHost],
     );
 
-    // 에러 시 재시도: 접속된 호스트가 있으면 현재 경로를 다시 읽고,
-    // 아니면 호스트 접속부터 다시 시도한다.
+    // 에러 시 재시도: 이 상자는 접속 단계 오류만 표시하므로 호스트 접속을 다시 시도한다.
+    // (목록 조회 오류는 RemoteFileList 안의 [다시 시도]가 처리한다)
     const handleRetry = useCallback(() => {
-        if (connectedHost !== null && dir !== null) {
-            void loadDir(connectedHost, dir);
-        } else {
-            void connect(hostInput);
-        }
-    }, [connectedHost, dir, loadDir, connect, hostInput]);
+        void connect(hostInput);
+    }, [connect, hostInput]);
 
     // 호스트 자동완성 후보 (입력 텍스트로 alias/hostname/user 부분 일치 필터)
     const hostSuggestions = useMemo(() => {
@@ -254,39 +242,6 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                 (h.user?.toLowerCase().includes(q) ?? false),
         );
     }, [hostFocused, hosts, hostInput]);
-
-    // 파일 항목 클릭: 일반=단일 선택, Cmd/Ctrl=토글 추가, Shift=범위 선택
-    const handleEntryClick = useCallback(
-        (entry: RemoteEntry, e: React.MouseEvent) => {
-            if (entry.isDir) return;
-            const name = entry.name;
-            if (e.shiftKey && anchorRef.current !== null) {
-                const names = fileEntries.map((f) => f.name);
-                const a = names.indexOf(anchorRef.current);
-                const b = names.indexOf(name);
-                if (a >= 0 && b >= 0) {
-                    const [lo, hi] = a < b ? [a, b] : [b, a];
-                    setSelected(new Set(names.slice(lo, hi + 1)));
-                    return;
-                }
-            }
-            if (e.metaKey || e.ctrlKey) {
-                setSelected((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(name)) {
-                        next.delete(name);
-                    } else {
-                        next.add(name);
-                    }
-                    return next;
-                });
-            } else {
-                setSelected(new Set([name]));
-            }
-            anchorRef.current = name;
-        },
-        [fileEntries],
-    );
 
     // 선택한 파일(또는 더블클릭한 파일)을 sftp:// URI로 열기 요청한다
     const openFiles = useCallback(
@@ -302,10 +257,6 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
         [connectedHost, dir, onOpenPaths, onClose],
     );
 
-    const handleOpenSelected = useCallback(() => {
-        openFiles([...selected]);
-    }, [openFiles, selected]);
-
     // Esc로 닫기 (입력창에서는 각 입력이 우선 처리)
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
@@ -317,8 +268,6 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
         return () => window.removeEventListener("keydown", handleKeyDown);
     }, [onClose]);
 
-    const canOpen = selected.size > 0 && !loading;
-
     return (
         <div
             role="dialog"
@@ -329,7 +278,7 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                 if (e.target === e.currentTarget) onClose();
             }}
         >
-            <div className="w-[46rem] max-w-[94vw] max-h-[80vh] rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl flex flex-col">
+            <div className="w-[46rem] max-w-[94vw] h-[80vh] rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl flex flex-col">
                 {/* 헤더 */}
                 <div className="flex items-center justify-between px-4 py-2.5 border-b border-zinc-200 dark:border-zinc-800">
                     <div className="flex items-center gap-3">
@@ -513,10 +462,7 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                                 type="button"
                                 onClick={() => {
                                     if (dir !== null) {
-                                        void loadDir(
-                                            connectedHost ?? hostInput.trim(),
-                                            parentDir(dir),
-                                        );
+                                        loadDir(parentDir(dir));
                                     }
                                 }}
                                 disabled={loading || dir === null}
@@ -537,7 +483,7 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                                         onClick={() => {
                                             setHostInput(loc.host);
                                             setConnectedHost(loc.host);
-                                            void loadDir(loc.host, loc.dir);
+                                            loadDir(loc.dir);
                                         }}
                                         className="px-2 py-0.5 rounded-full border border-zinc-200 dark:border-zinc-700 text-[11px] font-mono text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer truncate max-w-56"
                                         title={`${loc.host}:${loc.dir}`}
@@ -565,138 +511,53 @@ export const RemoteOpenDialog: React.FC<RemoteOpenDialogProps> = ({
                             </div>
                         )}
 
-                        {/* 디렉터리 목록 */}
-                        <div className="flex-1 min-h-0 mt-3 mx-4 mb-3 rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden flex flex-col">
-                            {/* 열 헤더 */}
-                            <div className="shrink-0 grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
-                                <span>이름</span>
-                                <span className="text-right">크기</span>
-                                <span className="text-right">수정 시각</span>
-                            </div>
-                            {/* 목록 본문 */}
-                            <div className="flex-1 min-h-0 overflow-auto">
-                                {loading && entries.length === 0 ? (
-                                    <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-                                        불러오는 중…
-                                    </div>
-                                ) : entries.length === 0 && error === null ? (
-                                    <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-                                        {connectedHost === null
-                                            ? "호스트를 선택하면 디렉터리를 표시합니다"
-                                            : "빈 디렉터리입니다"}
-                                    </div>
-                                ) : (
-                                    entries.map((entry) => {
-                                        const isSel = selected.has(entry.name);
-                                        return (
-                                            <div
-                                                key={entry.name}
-                                                onClick={(e) =>
-                                                    handleEntryClick(entry, e)
-                                                }
-                                                onDoubleClick={() => {
-                                                    if (
-                                                        entry.isDir &&
-                                                        dir !== null
-                                                    ) {
-                                                        const host =
-                                                            connectedHost ??
-                                                            hostInput.trim();
-                                                        if (host.length > 0) {
-                                                            void loadDir(
-                                                                host,
-                                                                joinPath(
-                                                                    dir,
-                                                                    entry.name,
-                                                                ),
-                                                            );
-                                                        }
-                                                    } else if (!entry.isDir) {
-                                                        openFiles([entry.name]);
-                                                    }
-                                                }}
-                                                title={
-                                                    entry.isDir
-                                                        ? `${entry.name}/`
-                                                        : entry.name
-                                                }
-                                                className={`grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none ${
-                                                    entry.isDir
-                                                        ? "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                                        : isSel
-                                                          ? "bg-blue-100 dark:bg-blue-900/50 text-zinc-900 dark:text-zinc-100"
-                                                          : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                                }`}
-                                                style={{ height: 26 }}
-                                            >
-                                                <span className="truncate flex items-center">
-                                                    {entry.isDir ? (
-                                                        <svg
-                                                            className="w-3.5 h-3.5 mr-1.5 shrink-0 text-amber-500"
-                                                            fill="currentColor"
-                                                            viewBox="0 0 20 20"
-                                                        >
-                                                            <path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
-                                                        </svg>
-                                                    ) : (
-                                                        <span className="w-3.5 mr-1.5 shrink-0" />
-                                                    )}
-                                                    <span className="truncate">
-                                                        {entry.name}
-                                                        {entry.isDir ? "/" : ""}
-                                                    </span>
-                                                </span>
-                                                <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                                    {entry.isDir
-                                                        ? "-"
-                                                        : formatBytes(
-                                                              entry.size,
-                                                          )}
-                                                </span>
-                                                <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                                    {formatMtime(entry.mtime)}
-                                                </span>
-                                            </div>
-                                        );
-                                    })
-                                )}
-                            </div>
-                            {/* 하단 로딩 표시 (목록 갱신 중) */}
-                            {loading && entries.length > 0 && (
-                                <div className="shrink-0 px-3 py-1 text-[10px] text-zinc-400 dark:text-zinc-500 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
-                                    불러오는 중…
+                        {/* 디렉터리 목록 (스트리밍 + 가상 스크롤) */}
+                        {dir === null ? (
+                            <>
+                                <div className="flex-1 min-h-0 mt-3 mx-4 mb-3 rounded-md border border-zinc-200 dark:border-zinc-800 flex items-center justify-center">
+                                    <span className="text-xs text-zinc-400 dark:text-zinc-500">
+                                        {loading
+                                            ? "접속하는 중…"
+                                            : "호스트를 선택하면 디렉터리를 표시합니다"}
+                                    </span>
                                 </div>
-                            )}
-                        </div>
-
-                        {/* 푸터: 선택 정보 + 열기 */}
-                        <div className="shrink-0 flex items-center justify-between px-4 py-2.5 border-t border-zinc-200 dark:border-zinc-800">
-                            <span className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
-                                {selected.size > 0
-                                    ? `${selected.size}개 파일 선택됨 (Shift/Cmd+클릭으로 다중 선택)`
-                                    : "파일을 더블클릭하거나 선택 후 [열기]"}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <button
-                                    type="button"
-                                    onClick={onClose}
-                                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
-                                >
-                                    취소
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleOpenSelected}
-                                    disabled={!canOpen}
-                                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-900 text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 disabled:opacity-40 cursor-pointer"
-                                >
-                                    열기
-                                    {selected.size > 1
-                                        ? ` (${selected.size})`
-                                        : ""}
-                                </button>
-                            </div>
-                        </div>
+                                <div className="shrink-0 flex items-center justify-between px-4 py-2.5 border-t border-zinc-200 dark:border-zinc-800">
+                                    <span className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
+                                        파일을 더블클릭하거나 선택 후 [열기]
+                                    </span>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={onClose}
+                                            className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
+                                        >
+                                            취소
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled
+                                            className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40 cursor-pointer"
+                                        >
+                                            열기
+                                        </button>
+                                    </div>
+                                </div>
+                            </>
+                        ) : (
+                            <RemoteFileList<RemoteEntry>
+                                location={dir}
+                                startStream={startStream}
+                                onEnterDir={(name) =>
+                                    loadDir(joinPath(dir, name))
+                                }
+                                onOpen={openFiles}
+                                onCancel={onClose}
+                                emptyText="빈 디렉터리입니다"
+                                itemName="파일"
+                                hintText="파일을 더블클릭하거나 선택 후 [열기]"
+                                onFinished={handleListFinished}
+                            />
+                        )}
                     </>
                 )}
             </div>

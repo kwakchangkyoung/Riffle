@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use crate::conn::{SftpConn, Transport, connect};
 use crate::error::{RemoteError, map_sftp_error, sftp_is_conn_error, sftp_is_timeout};
 use crate::remote_file::RemoteFile;
 use crate::uri::RemoteUri;
+use crate::{LIST_PAGE_SIZE, LIST_STREAM_MAX, ListSummary};
 
 /// 디렉터리 전용 연결의 유휴 종료 시간.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -278,16 +279,46 @@ impl PoolInner {
         }
     }
 
-    async fn list_dir_async(
+    /// `path` 아래를 나열하며 항목이 LIST_PAGE_SIZE 개 모일 때마다 on_page 를 호출한다.
+    /// name_prefix 로 시작하는 항목만 모으고 정렬은 하지 않는다.
+    /// 재시도는 첫 페이지를 보내기 전까지만 허용한다 — 보낸 항목이
+    /// 재시도로 다시 전달되면 호출자에게 중복이 쌓인다.
+    async fn list_dir_stream_async(
         &self,
         host: &str,
         path: &str,
-    ) -> Result<Vec<RemoteEntry>, RemoteError> {
-        self.with_conn(host, path, |conn| {
-            let path = path.to_string();
-            async move { sftp_list_dir(&conn.session, path.as_str()).await }
-        })
-        .await
+        name_prefix: &str,
+        max: usize,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<RemoteEntry>),
+    ) -> Result<ListSummary, RemoteError> {
+        let mut sent_any = false;
+        for attempt in 0..OP_ATTEMPTS {
+            let conn = self.ensure_conn(host).await?;
+            let delivered = &mut sent_any;
+            let result =
+                sftp_list_dir_stream(&conn.session, path, name_prefix, max, cancel, &mut |page| {
+                    *delivered = true;
+                    on_page(page);
+                })
+                .await;
+            match result {
+                Ok(summary) => return Ok(summary),
+                Err(e) => {
+                    if !sent_any
+                        && attempt < OP_ATTEMPTS - 1
+                        && (sftp_is_conn_error(&e) || sftp_is_timeout(&e))
+                    {
+                        self.drop_conn_if_current(host, &conn).await;
+                        tokio::time::sleep(RETRY_BACKOFF[attempt.min(RETRY_BACKOFF.len() - 1)])
+                            .await;
+                        continue;
+                    }
+                    return Err(map_sftp_error(e, path));
+                }
+            }
+        }
+        unreachable!()
     }
 
     async fn home_dir_async(&self, host: &str) -> Result<String, RemoteError> {
@@ -316,37 +347,86 @@ pub(crate) async fn open_remote_file(
     Ok((handle, size))
 }
 
-async fn sftp_list_dir(
+/// readdir 배치를 읽으며 name_prefix 로 시작하는 항목만 모아
+/// LIST_PAGE_SIZE 개마다 on_page 로 보낸다. `.`/`..`/빈 이름은 제외하고
+/// 정렬은 하지 않는다. 취소는 배치 안의 항목 단위로 확인하고,
+/// 누적이 max 에 도달하면 그 지점까지만 보내고 truncated 로 끝낸다.
+async fn sftp_list_dir_stream(
     session: &Arc<RawSftpSession>,
     path: &str,
-) -> Result<Vec<RemoteEntry>, SftpError> {
+    name_prefix: &str,
+    max: usize,
+    cancel: &AtomicBool,
+    on_page: &mut dyn FnMut(Vec<RemoteEntry>),
+) -> Result<ListSummary, SftpError> {
     let dir_handle = session.opendir(path).await?.handle;
-    let mut entries = Vec::new();
-    let result = loop {
+    let mut total = 0usize;
+    let mut buf: Vec<RemoteEntry> = Vec::new();
+    let result = 'read: loop {
+        if cancel.load(Ordering::Relaxed) {
+            break 'read Ok(ListSummary {
+                total,
+                truncated: false,
+                cancelled: true,
+            });
+        }
         match session.readdir(dir_handle.as_str()).await {
             Ok(name) => {
                 for f in name.files {
-                    if f.filename == "." || f.filename == ".." || f.filename.is_empty() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break 'read Ok(ListSummary {
+                            total,
+                            truncated: false,
+                            cancelled: true,
+                        });
+                    }
+                    if f.filename == "."
+                        || f.filename == ".."
+                        || f.filename.is_empty()
+                        || !f.filename.starts_with(name_prefix)
+                    {
                         continue;
                     }
-                    entries.push(RemoteEntry {
+                    buf.push(RemoteEntry {
                         name: f.filename,
                         is_dir: f.attrs.is_dir(),
                         size: f.attrs.size.unwrap_or(0),
                         mtime: f.attrs.mtime.map(u64::from),
                     });
+                    total += 1;
+                    if buf.len() >= LIST_PAGE_SIZE || total >= max {
+                        on_page(std::mem::take(&mut buf));
+                    }
+                    if total >= max {
+                        break 'read Ok(ListSummary {
+                            total,
+                            truncated: true,
+                            cancelled: false,
+                        });
+                    }
                 }
             }
-            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break Ok(()),
-            Err(e) => break Err(e),
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                break 'read Ok(ListSummary {
+                    total,
+                    truncated: false,
+                    cancelled: false,
+                });
+            }
+            Err(e) => break 'read Err(e),
         }
     };
+    // EOF 로 끝난 경우에만 남은 항목을 보낸다
+    // (취소는 즉시 멈추고, 상한·오류 종료는 버퍼가 이미 비었다).
+    if let Ok(summary) = &result
+        && !summary.cancelled
+        && !summary.truncated
+        && !buf.is_empty()
+    {
+        on_page(buf);
+    }
     let _ = session.close(dir_handle.as_str()).await;
-    result?;
-
-    // 디렉터리 우선, 그다음 이름순.
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    Ok(entries)
+    result
 }
 
 async fn sftp_real_path(session: &Arc<RawSftpSession>, path: &str) -> Result<String, SftpError> {
@@ -425,9 +505,46 @@ impl SftpPool {
     }
 
     /// 원격 디렉터리 목록. 이름순, 디렉터리 먼저, `.`/`..` 제외.
+    /// 최대 `LIST_STREAM_MAX` 개까지 반환한다.
     pub fn list_dir(&self, host: &str, path: &str) -> Result<Vec<RemoteEntry>, RemoteError> {
+        let mut entries = Vec::new();
+        let cancel = AtomicBool::new(false);
+        self.list_dir_stream(host, path, "", &cancel, &mut |page| {
+            entries.extend(page);
+        })?;
+        // 디렉터리 우선, 그다음 이름순.
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(entries)
+    }
+
+    /// 원격 디렉터리 목록 스트리밍.
+    /// name_prefix 로 시작하는 항목만 모아 1,000개마다 on_page 로 보낸다
+    /// (정렬하지 않으며 `.`/`..` 는 제외). 누적이 `LIST_STREAM_MAX` 에
+    /// 도달하면 잘라내고, cancel 은 항목 단위로 확인한다.
+    pub fn list_dir_stream(
+        &self,
+        host: &str,
+        path: &str,
+        name_prefix: &str,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<RemoteEntry>),
+    ) -> Result<ListSummary, RemoteError> {
+        self.list_dir_stream_max(host, path, name_prefix, LIST_STREAM_MAX, cancel, on_page)
+    }
+
+    /// 상한을 지정하는 `list_dir_stream` 변형 (테스트용).
+    #[doc(hidden)]
+    pub fn list_dir_stream_max(
+        &self,
+        host: &str,
+        path: &str,
+        name_prefix: &str,
+        max: usize,
+        cancel: &AtomicBool,
+        on_page: &mut dyn FnMut(Vec<RemoteEntry>),
+    ) -> Result<ListSummary, RemoteError> {
         let inner = self.inner.clone();
-        inner.block_on(inner.list_dir_async(host, path))
+        inner.block_on(inner.list_dir_stream_async(host, path, name_prefix, max, cancel, on_page))
     }
 
     /// 로그인 셸의 현재 디렉터리(`realpath "."`).

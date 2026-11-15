@@ -27,9 +27,9 @@ use commands::{
     validate_filter, validate_query,
 };
 use merge::{merge_position_at_time, merge_sources, open_merge};
-use remote::{list_remote_dir, list_ssh_hosts, remote_home};
+use remote::{cancel_listing, list_ssh_hosts, remote_home, sftp_list_stream};
 use s3::{
-    get_s3_bookmarks, list_aws_profiles, s3_head, s3_list_buckets, s3_list_prefix,
+    get_s3_bookmarks, list_aws_profiles, s3_head, s3_list_buckets, s3_list_stream,
     set_s3_bookmarks, set_s3_profile,
 };
 use s3_connections::{delete_s3_connection, list_s3_connections, save_s3_connection};
@@ -81,11 +81,12 @@ pub fn run() {
             save_filter_preset,
             delete_filter_preset,
             list_ssh_hosts,
-            list_remote_dir,
+            sftp_list_stream,
+            cancel_listing,
             remote_home,
             list_aws_profiles,
             s3_list_buckets,
-            s3_list_prefix,
+            s3_list_stream,
             s3_head,
             set_s3_profile,
             list_s3_connections,

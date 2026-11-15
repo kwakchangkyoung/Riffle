@@ -1190,3 +1190,168 @@ fn s3_invalid_key_errors_are_specific() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// list_prefix_stream
+// ---------------------------------------------------------------------------
+
+/// 스트리밍 목록: 25,000개 객체 + 하위 폴더가 페이지 단위로 중복 없이 도착한다.
+#[test]
+fn s3_list_stream_all_pages() {
+    let s = FakeS3::start();
+    s.add_bucket("big");
+    for i in 0..25_000u32 {
+        s.put_object("big", &format!("logs/f{i:05}.log"), b"x");
+    }
+    for d in ["a", "b"] {
+        s.put_object("big", &format!("logs/sub-{d}/x.log"), b"x");
+    }
+    let pool = make_pool(&s);
+    let cancel = AtomicBool::new(false);
+
+    let mut pages = 0usize;
+    let mut names: HashSet<(String, bool)> = HashSet::new();
+    let summary = pool
+        .list_prefix_stream(
+            &S3Auth::Profile(None),
+            "big",
+            "logs/",
+            "",
+            &cancel,
+            &mut |page| {
+                pages += 1;
+                for e in page {
+                    assert!(
+                        names.insert((e.name.clone(), e.is_dir)),
+                        "중복 항목: {}",
+                        e.name
+                    );
+                }
+            },
+        )
+        .expect("list_prefix_stream 실패");
+
+    assert_eq!(summary.total, 25_002);
+    assert!(!summary.truncated);
+    assert!(!summary.cancelled);
+    assert_eq!(names.len(), 25_002);
+    assert!(pages >= 25, "페이지 수 부족: {pages}");
+    assert!(names.contains(&("sub-a".to_string(), true)));
+    assert!(names.contains(&("f00000.log".to_string(), false)));
+}
+
+/// name_prefix 가 서버 요청 접두사에 붙어 결과가 정확히 줄어드는지 확인한다.
+#[test]
+fn s3_list_stream_name_prefix_filters_server_side() {
+    let s = FakeS3::start();
+    s.add_bucket("b");
+    for i in 0..50u32 {
+        s.put_object("b", &format!("logs/app-{i:02}.log"), b"x");
+        s.put_object("b", &format!("logs/sys-{i:02}.log"), b"x");
+    }
+    // "app" 으로 시작하는 하위 폴더도 걸러지지 않고 포함돼야 한다.
+    s.put_object("b", "logs/apple/x.log", b"x");
+    let pool = make_pool(&s);
+    let cancel = AtomicBool::new(false);
+
+    let mut got = Vec::new();
+    let summary = pool
+        .list_prefix_stream(
+            &S3Auth::Profile(None),
+            "b",
+            "logs/",
+            "app",
+            &cancel,
+            &mut |page| got.extend(page),
+        )
+        .unwrap();
+
+    assert_eq!(summary.total, 51);
+    assert!(got.iter().all(|e| e.name.starts_with("app")));
+    assert!(got.iter().any(|e| e.is_dir && e.name == "apple"));
+
+    // 서버에 실제로 prefix=logs/app 로 요청이 나갔는지 기록으로 확인한다.
+    let list_reqs: Vec<RecordedRequest> = s
+        .requests()
+        .into_iter()
+        .filter(|q| q.target.contains("list-type=2"))
+        .collect();
+    assert!(!list_reqs.is_empty());
+    for r in &list_reqs {
+        let (_, q) = r.target.split_once('?').expect("쿼리 없는 list 요청");
+        assert_eq!(query_param(q, "prefix").as_deref(), Some("logs/app"));
+    }
+}
+
+/// on_page 안에서 취소 플래그를 세우면 다음 요청 없이 멈춘다.
+#[test]
+fn s3_list_stream_cancel_stops_pagination() {
+    let s = FakeS3::start();
+    s.add_bucket("b");
+    s.set_page_size(500);
+    for i in 0..5_000u32 {
+        s.put_object("b", &format!("f{i:05}.log"), b"x");
+    }
+    let pool = make_pool(&s);
+    let cancel = AtomicBool::new(false);
+
+    let mut pages = 0usize;
+    let summary = pool
+        .list_prefix_stream(&S3Auth::Profile(None), "b", "", "", &cancel, &mut |page| {
+            pages += 1;
+            if pages == 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            drop(page);
+        })
+        .unwrap();
+
+    assert!(summary.cancelled);
+    assert!(!summary.truncated);
+    assert_eq!(summary.total, 1_000);
+    // 3페이지째 요청은 나가지 않아야 한다.
+    let list_reqs = s
+        .requests()
+        .into_iter()
+        .filter(|q| q.target.contains("list-type=2"))
+        .count();
+    assert_eq!(list_reqs, 2, "취소 후 추가 list 요청 발생: {list_reqs}");
+}
+
+/// 누적 상한 도달 시 그 지점까지만 보내고 truncated 를 세운다.
+#[test]
+fn s3_list_stream_truncates_at_max() {
+    let s = FakeS3::start();
+    s.add_bucket("b");
+    s.set_page_size(500);
+    for i in 0..3_000u32 {
+        s.put_object("b", &format!("f{i:05}.log"), b"x");
+    }
+    let pool = make_pool(&s);
+    let cancel = AtomicBool::new(false);
+
+    let mut got = Vec::new();
+    let summary = pool
+        .list_prefix_stream_max(
+            &S3Auth::Profile(None),
+            "b",
+            "",
+            "",
+            2_500,
+            &cancel,
+            &mut |page| got.extend(page),
+        )
+        .unwrap();
+
+    assert!(summary.truncated);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.total, 2_500);
+    assert_eq!(got.len(), 2_500);
+    // 상한에 정확히 도달한 5페이지에서 중단 — 6페이지째 요청은 없어야 한다.
+    let list_reqs = s
+        .requests()
+        .into_iter()
+        .filter(|q| q.target.contains("list-type=2"))
+        .count();
+    assert_eq!(list_reqs, 5);
+}

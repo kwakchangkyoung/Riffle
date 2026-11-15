@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use riffle_core::LogFile;
 use riffle_remote::{S3Auth, S3Uri};
 use serde::Serialize;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use crate::commands::{FileInfo, OpenedFile};
@@ -22,6 +23,25 @@ pub struct S3EntryDto {
     pub size: u64,
     /// 수정 시각 (unix 초, 폴더는 None)
     pub mtime: Option<u64>,
+}
+
+/// s3_list_stream 진행 이벤트 DTO (프론트 S3ListEvent와 1:1)
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum S3ListEvent {
+    /// 항목 한 페이지 (S3 응답 페이지마다, 최대 1,000개 안팎)
+    Page {
+        entries: Vec<S3EntryDto>,
+    },
+    /// 스트림 종료 (cancelled 면 이후 page 는 오지 않는다)
+    Done {
+        total: usize,
+        truncated: bool,
+        cancelled: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// s3:// URI 객체를 열어 OpenedFile을 반환한다.
@@ -141,41 +161,75 @@ pub async fn s3_list_buckets(
     .map_err(|e| format!("S3 버킷 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
-/// 버킷의 접두사 아래 항목을 '/' 구분자로 나열한다 (폴더 먼저, 이름순).
+/// 버킷 접두사 아래 항목을 백그라운드 스레드에서 페이지 단위로 스트리밍한다.
+/// 실제 요청 접두사는 `prefix + namePrefix` 이고, 항목 name 은 prefix 기준 상대 이름이다.
+/// 반환값은 취소용 listId (cancel_listing). 진행은 on_event 로 흐른다.
 /// connectionId 를 지정하면 저장 연결의 Static 인증을 쓰고 lastUsed 를 갱신한다.
 #[tauri::command]
-pub async fn s3_list_prefix(
+pub fn s3_list_stream(
     app: tauri::AppHandle,
     profile: Option<String>,
     connection_id: Option<String>,
     bucket: String,
     prefix: String,
-) -> Result<Vec<S3EntryDto>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let auth = s3_auth_arg(state.inner(), connection_id.as_deref(), profile)?;
-        let entries = state
-            .s3_pool
-            .list_prefix(&auth, &bucket, &prefix)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|e| S3EntryDto {
-                        name: e.name,
-                        is_dir: e.is_dir,
-                        size: e.size,
-                        mtime: e.mtime,
-                    })
-                    .collect()
-            })
-            .map_err(|e| e.to_string())?;
-        if let Some(id) = connection_id {
-            crate::s3_connections::touch_last_used(state.inner(), &id);
+    name_prefix: String,
+    on_event: Channel<S3ListEvent>,
+) -> Result<u32, String> {
+    let state = app.state::<AppState>();
+    let (list_id, cancel) = state.insert_listing();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let state = app2.state::<AppState>();
+        // 저장 연결의 비밀 키는 키체인에서 읽으며, macOS 가 접근 허용 창을 띄우면
+        // 응답할 때까지 막힌다. 동기 커맨드는 메인 스레드에서 실행되므로 반드시 여기서 읽는다.
+        let auth = match s3_auth_arg(state.inner(), connection_id.as_deref(), profile) {
+            Ok(auth) => auth,
+            Err(message) => {
+                let _ = on_event.send(S3ListEvent::Error { message });
+                state.remove_listing(list_id);
+                return;
+            }
+        };
+        let result = state.s3_pool.list_prefix_stream(
+            &auth,
+            &bucket,
+            &prefix,
+            &name_prefix,
+            &cancel,
+            &mut |page| {
+                let _ = on_event.send(S3ListEvent::Page {
+                    entries: page
+                        .into_iter()
+                        .map(|e| S3EntryDto {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            size: e.size,
+                            mtime: e.mtime,
+                        })
+                        .collect(),
+                });
+            },
+        );
+        match result {
+            Ok(summary) => {
+                let _ = on_event.send(S3ListEvent::Done {
+                    total: summary.total,
+                    truncated: summary.truncated,
+                    cancelled: summary.cancelled,
+                });
+                if let Some(id) = &connection_id {
+                    crate::s3_connections::touch_last_used(state.inner(), id);
+                }
+            }
+            Err(e) => {
+                let _ = on_event.send(S3ListEvent::Error {
+                    message: e.to_string(),
+                });
+            }
         }
-        Ok(entries)
-    })
-    .await
-    .map_err(|e| format!("S3 접두사 목록 조회 비동기 태스크 실패: {e}"))?
+        state.remove_listing(list_id);
+    });
+    Ok(list_id)
 }
 
 /// HeadObject로 S3 객체의 크기(바이트)를 반환한다.

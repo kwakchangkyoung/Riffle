@@ -171,6 +171,11 @@ pub struct AppState {
     pub searches: Mutex<HashMap<u32, Arc<SearchState>>>,
     /// ID별 활성 필터 상태 맵 (tail 스레드와 공유)
     pub filters: FilterMap,
+    /// ID별 진행 중인 원격 목록 스트리밍의 취소 플래그 맵.
+    /// 작업이 끝나면 스레드가 스스로 항목을 제거한다.
+    pub listings: Mutex<HashMap<u32, Arc<AtomicBool>>>,
+    /// 다음에 발급할 목록 스트리밍 작업 ID
+    pub next_listing_id: AtomicU32,
     /// 다음에 발급할 파일 ID
     pub next_id: AtomicU32,
     /// 다음에 발급할 검색 ID
@@ -213,6 +218,8 @@ impl Default for AppState {
             files: Mutex::new(HashMap::new()),
             searches: Mutex::new(HashMap::new()),
             filters: FilterMap::default(),
+            listings: Mutex::new(HashMap::new()),
+            next_listing_id: AtomicU32::new(1),
             next_id: AtomicU32::new(1),
             next_search_id: AtomicU32::new(1),
             next_filter_id: AtomicU32::new(1),
@@ -525,6 +532,41 @@ impl AppState {
         if let Some(f) = filters.get(&filter_id) {
             f.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// 새 목록 스트리밍 작업을 등록하고 (작업 ID, 취소 플래그)를 반환한다.
+    pub fn insert_listing(&self) -> (u32, Arc<AtomicBool>) {
+        let id = self.next_listing_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.listings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, cancel.clone());
+        (id, cancel)
+    }
+
+    /// 목록 스트리밍 작업에 취소 플래그를 세운다. 이미 끝난 ID면 아무것도 하지 않는다.
+    pub fn cancel_listing(&self, list_id: u32) {
+        let listings = self.listings.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = listings.get(&list_id) {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 목록 스트리밍 작업을 맵에서 제거한다 (작업 스레드가 종료 시 호출).
+    pub fn remove_listing(&self, list_id: u32) {
+        self.listings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&list_id);
+    }
+
+    /// 현재 관리 중인 목록 스트리밍 작업 수를 반환한다.
+    pub fn listing_count(&self) -> usize {
+        self.listings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// 최근 파일 목록을 설정한다 (파일 열기 성공 시 갱신).
@@ -1044,6 +1086,32 @@ mod tests {
         assert!(state.get_search(s3.id).is_err());
         remove_test_file(&p1);
         remove_test_file(&p2);
+    }
+
+    #[test]
+    fn test_listing_lifecycle() {
+        let state = AppState::default();
+
+        // 등록 → 취소 플래그 공유 확인
+        let (id1, cancel1) = state.insert_listing();
+        let (id2, _cancel2) = state.insert_listing();
+        assert_ne!(id1, id2);
+        assert_eq!(state.listing_count(), 2);
+        assert!(!cancel1.load(Ordering::Relaxed));
+
+        // 취소는 등록된 플래그에 반영되고 다른 작업에는 영향이 없다
+        state.cancel_listing(id1);
+        assert!(cancel1.load(Ordering::Relaxed));
+
+        // 끝난 작업 제거 후에는 취소가 무시된다
+        state.remove_listing(id1);
+        state.cancel_listing(id1);
+        assert_eq!(state.listing_count(), 1);
+
+        // 없는 ID 취소도 무시된다 (패닉 없음)
+        state.cancel_listing(999);
+        state.remove_listing(id2);
+        assert_eq!(state.listing_count(), 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use riffle_remote::{AgentEvent, AgentSession, QueryJson, RemoteError, RemoteUri}
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Manager;
+use tauri::ipc::Channel;
 
 use crate::commands::{FileInfo, IndexProgressDto, OpenedFile, QueryDto, SearchEvent};
 use crate::state::{AppState, FilterState};
@@ -31,6 +32,25 @@ pub struct RemoteEntryDto {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: Option<u64>,
+}
+
+/// sftp_list_stream 진행 이벤트 DTO (프론트 RemoteListEvent와 1:1)
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RemoteListEvent {
+    /// 항목 한 페이지 (1,000개마다, 마지막은 그 미만)
+    Page {
+        entries: Vec<RemoteEntryDto>,
+    },
+    /// 스트림 종료 (cancelled 면 이후 page 는 오지 않는다)
+    Done {
+        total: usize,
+        truncated: bool,
+        cancelled: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// 경로가 sftp:// 원격 URI이면 호스트 부분을 반환한다 (로컬 경로면 None).
@@ -302,33 +322,62 @@ pub async fn list_ssh_hosts() -> Result<Vec<SshHostDto>, String> {
     .map_err(|e| format!("호스트 목록 조회 비동기 태스크 실패: {e}"))?
 }
 
-/// 원격 디렉터리의 항목 목록을 반환한다 (이름순, 디렉터리 먼저).
+/// 원격 디렉터리 항목을 백그라운드 스레드에서 페이지 단위로 스트리밍한다.
+/// namePrefix 로 시작하는 항목만 보내며 정렬하지 않는다 (정렬은 프론트 몫).
+/// 반환값은 취소용 listId (cancel_listing). 진행은 on_event 로 흐른다.
 #[tauri::command]
-pub async fn list_remote_dir(
+pub fn sftp_list_stream(
     app: tauri::AppHandle,
     host: String,
     path: String,
-) -> Result<Vec<RemoteEntryDto>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        state
-            .remote_pool
-            .list_dir(&host, &path)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|e| RemoteEntryDto {
-                        name: e.name,
-                        is_dir: e.is_dir,
-                        size: e.size,
-                        mtime: e.mtime,
-                    })
-                    .collect()
-            })
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("디렉터리 목록 조회 비동기 태스크 실패: {e}"))?
+    name_prefix: String,
+    on_event: Channel<RemoteListEvent>,
+) -> Result<u32, String> {
+    let state = app.state::<AppState>();
+    let (list_id, cancel) = state.insert_listing();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let state = app2.state::<AppState>();
+        let result =
+            state
+                .remote_pool
+                .list_dir_stream(&host, &path, &name_prefix, &cancel, &mut |page| {
+                    let _ = on_event.send(RemoteListEvent::Page {
+                        entries: page
+                            .into_iter()
+                            .map(|e| RemoteEntryDto {
+                                name: e.name,
+                                is_dir: e.is_dir,
+                                size: e.size,
+                                mtime: e.mtime,
+                            })
+                            .collect(),
+                    });
+                });
+        match result {
+            Ok(summary) => {
+                let _ = on_event.send(RemoteListEvent::Done {
+                    total: summary.total,
+                    truncated: summary.truncated,
+                    cancelled: summary.cancelled,
+                });
+            }
+            Err(e) => {
+                let _ = on_event.send(RemoteListEvent::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+        state.remove_listing(list_id);
+    });
+    Ok(list_id)
+}
+
+/// 진행 중인 목록 스트리밍(s3_list_stream / sftp_list_stream)을 취소한다.
+/// 이미 끝난 ID면 아무것도 하지 않는다.
+#[tauri::command]
+pub fn cancel_listing(state: tauri::State<'_, AppState>, list_id: u32) {
+    state.cancel_listing(list_id);
 }
 
 /// 원격 호스트의 홈 디렉터리 절대 경로를 반환한다.

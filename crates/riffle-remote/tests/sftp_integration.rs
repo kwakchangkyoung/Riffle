@@ -428,3 +428,124 @@ fn perf_pipelined_vs_sequential() {
     p.release("local");
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// list_dir_stream
+// ---------------------------------------------------------------------------
+
+/// 디렉터리에 파일 count 개를 만든다 (이름: `<prefix><5자리 번호>`).
+fn make_files(dir: &Path, prefix: &str, count: usize) {
+    for i in 0..count {
+        fs::write(dir.join(format!("{prefix}{i:05}")), b"x").unwrap();
+    }
+}
+
+/// 15,000개 항목이 페이지 단위로 중복 없이 도착하는지 확인한다.
+#[test]
+fn list_dir_stream_all_pages() {
+    let dir = tempdir("lsstream");
+    make_files(&dir, "f", 15_000);
+    fs::create_dir(dir.join("subdir")).unwrap();
+
+    let p = pool();
+    let cancel = AtomicBool::new(false);
+    let mut pages = 0usize;
+    let mut names = std::collections::HashSet::new();
+    let summary = p
+        .list_dir_stream("local", &dir.to_string_lossy(), "", &cancel, &mut |page| {
+            pages += 1;
+            assert!(page.len() <= 1_000, "페이지 크기 초과: {}", page.len());
+            for e in page {
+                assert!(names.insert(e.name.clone()), "중복 항목: {}", e.name);
+            }
+        })
+        .expect("list_dir_stream 실패");
+
+    assert_eq!(summary.total, 15_001);
+    assert!(!summary.truncated);
+    assert!(!summary.cancelled);
+    assert_eq!(names.len(), 15_001);
+    assert!(pages >= 15, "페이지 수 부족: {pages}");
+    assert!(names.contains("subdir"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// name_prefix 로 시작하는 항목만 필터된다.
+#[test]
+fn list_dir_stream_name_prefix_filter() {
+    let dir = tempdir("lsfilter");
+    make_files(&dir, "app-", 30);
+    make_files(&dir, "sys-", 20);
+    fs::create_dir(dir.join("apple")).unwrap();
+
+    let p = pool();
+    let cancel = AtomicBool::new(false);
+    let mut got = Vec::new();
+    let summary = p
+        .list_dir_stream(
+            "local",
+            &dir.to_string_lossy(),
+            "app",
+            &cancel,
+            &mut |page| got.extend(page),
+        )
+        .unwrap();
+
+    assert_eq!(summary.total, 31);
+    assert!(got.iter().all(|e| e.name.starts_with("app")));
+    assert!(got.iter().any(|e| e.is_dir && e.name == "apple"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// on_page 안에서 취소하면 그 즉시 멈춘다 (버퍼 잔여분도 보내지 않는다).
+#[test]
+fn list_dir_stream_cancel() {
+    let dir = tempdir("lscancel");
+    make_files(&dir, "f", 3_000);
+
+    let p = pool();
+    let cancel = AtomicBool::new(false);
+    let mut pages = 0usize;
+    let summary = p
+        .list_dir_stream("local", &dir.to_string_lossy(), "", &cancel, &mut |page| {
+            pages += 1;
+            if pages == 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            drop(page);
+        })
+        .unwrap();
+
+    assert!(summary.cancelled);
+    assert!(!summary.truncated);
+    assert_eq!(summary.total, 2_000);
+    assert_eq!(pages, 2);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// 누적 상한 도달 시 그 지점까지만 보내고 truncated 를 세운다.
+#[test]
+fn list_dir_stream_truncates_at_max() {
+    let dir = tempdir("lstrunc");
+    make_files(&dir, "f", 1_500);
+
+    let p = pool();
+    let cancel = AtomicBool::new(false);
+    let mut got = Vec::new();
+    let summary = p
+        .list_dir_stream_max(
+            "local",
+            &dir.to_string_lossy(),
+            "",
+            1_000,
+            &cancel,
+            &mut |page| got.extend(page),
+        )
+        .unwrap();
+
+    assert!(summary.truncated);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.total, 1_000);
+    assert_eq!(got.len(), 1_000);
+    fs::remove_dir_all(&dir).ok();
+}

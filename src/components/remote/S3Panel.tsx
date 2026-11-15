@@ -1,10 +1,4 @@
-import React, {
-    useCallback,
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
-} from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
     deleteS3Connection,
     getS3Bookmarks,
@@ -12,22 +6,22 @@ import {
     listAwsProfiles,
     listS3Connections,
     s3ListBuckets,
-    s3ListPrefix,
+    s3ListStream,
     saveS3Connection,
     setS3Bookmarks,
     setS3Profile,
+    type ListEvent,
     type S3Connection,
     type S3Entry,
 } from "@/lib/ipc";
 import { s3ConnUriOf, s3UriOf } from "@/lib/remote";
 import { formatBytes, formatMtime } from "@/lib/format";
+import { RemoteFileList } from "@/components/remote/RemoteFileList";
 
 /** 이 크기 이상의 객체는 열기 전 데이터 전송 안내를 표시한다 (1 GiB) */
 const LARGE_OBJECT_BYTES = 1024 * 1024 * 1024;
 /** "다시 묻지 않기" localStorage 키 */
 const SKIP_CONFIRM_KEY = "riffle.s3SkipLargeConfirm";
-/** 접두사 목록 잘림 안내 기준 (백엔드 상한과 동일) */
-const MAX_PREFIX_ENTRIES = 10_000;
 
 interface S3PanelProps {
     /** 선택한 S3 객체들을 s3:// URI 목록으로 넘겨 탭으로 연다 */
@@ -139,12 +133,7 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
 
     const [bucket, setBucket] = useState<string | null>(null);
     const [prefix, setPrefix] = useState("");
-    const [entries, setEntries] = useState<S3Entry[]>([]);
     const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-
-    const [selected, setSelected] = useState<Set<string>>(new Set());
-    const anchorRef = useRef<string | null>(null);
 
     // 1GB 이상 객체 열기 확인 창 상태
     const [confirm, setConfirm] = useState<{
@@ -157,16 +146,10 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
     // 연결 탭을 보는 동안엔 선택된 연결로 인증한다
     const activeConnId = authTab === "conn" ? connId : null;
 
-    const objectEntries = useMemo(
-        () => entries.filter((e) => !e.isDir),
-        [entries],
-    );
-
     // 버킷 목록을 불러온다. 실패(권한 없음 등) 시 수동 입력으로 진행할 수 있다.
     const loadBuckets = useCallback(
         async (conn: string | null, prof: string | null) => {
             setLoading(true);
-            setError(null);
             setBucketsError(null);
             try {
                 const list = await s3ListBuckets(prof, conn);
@@ -181,35 +164,24 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
         [],
     );
 
-    // 접두사 목록을 불러오고 현재 위치를 갱신한다.
-    const loadPrefix = useCallback(
-        async (
-            conn: string | null,
-            prof: string | null,
-            bkt: string,
-            pfx: string,
-        ) => {
-            setLoading(true);
-            setError(null);
-            try {
-                const list = await s3ListPrefix(prof, conn, bkt, pfx);
-                setBucket(bkt);
-                setPrefix(pfx);
-                setEntries(list);
-                setSelected(new Set());
-                anchorRef.current = null;
-            } catch (err) {
-                // 실패해도 대상 위치를 유지해 위치 표시와 [다시 시도]가 같은 곳을 가리키게 한다
-                setBucket(bkt);
-                setPrefix(pfx);
-                setEntries([]);
-                setSelected(new Set());
-                setError(toErrorMessage(err));
-            } finally {
-                setLoading(false);
-            }
-        },
-        [],
+    // 접두사 위치로 이동한다. 목록 자체는 RemoteFileList 의 스트림이 불러온다.
+    const loadPrefix = useCallback((bkt: string, pfx: string) => {
+        setBucket(bkt);
+        setPrefix(pfx);
+    }, []);
+
+    // RemoteFileList 가 호출하는 스트림 시작 함수 (bucket 이 null 이면 렌더되지 않는다)
+    const startStream = useCallback(
+        (namePrefix: string, onEvent: (e: ListEvent<S3Entry>) => void) =>
+            s3ListStream(
+                profile,
+                activeConnId,
+                bucket ?? "",
+                prefix,
+                namePrefix,
+                onEvent,
+            ),
+        [profile, activeConnId, bucket, prefix],
     );
 
     // 연결 선택: 시작 버킷/경로가 있으면 그곳부터, 없으면 버킷 목록부터 탐색한다
@@ -221,15 +193,11 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             setConnFormError(null);
             setBucket(null);
             setPrefix("");
-            setEntries([]);
-            setSelected(new Set());
-            setError(null);
             if (conn.bucket !== null && conn.bucket.length > 0) {
                 // 시작 경로는 디렉터리 접두사로 취급한다
                 let pfx = conn.prefix ?? "";
                 if (pfx.length > 0 && !pfx.endsWith("/")) pfx = `${pfx}/`;
-                // 연결 인증이면 profile 인자는 백엔드에서 무시된다
-                void loadPrefix(conn.id, null, conn.bucket, pfx);
+                loadPrefix(conn.bucket, pfx);
             } else {
                 void loadBuckets(conn.id, null);
             }
@@ -285,9 +253,6 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                 setAuthTab("profile");
                 setBucket(null);
                 setPrefix("");
-                setEntries([]);
-                setSelected(new Set());
-                setError(null);
                 void loadBuckets(null, profile);
                 return;
             }
@@ -304,9 +269,6 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                 setConnId(null);
                 setBucket(null);
                 setPrefix("");
-                setEntries([]);
-                setSelected(new Set());
-                setError(null);
                 setBuckets([]);
                 setBucketsError(null);
             }
@@ -331,8 +293,6 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             });
             setBucket(null);
             setPrefix("");
-            setEntries([]);
-            setSelected(new Set());
             void loadBuckets(null, next);
         },
         [loadBuckets],
@@ -347,16 +307,16 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             if (loc.conn !== null) {
                 setAuthTab("conn");
                 setConnId(loc.conn);
-                void loadPrefix(loc.conn, profile, loc.bucket, loc.prefix);
+                loadPrefix(loc.bucket, loc.prefix);
                 return;
             }
             if (authTab === "conn") {
                 setAuthTab("profile");
                 setConnId(null);
             }
-            void loadPrefix(null, profile, loc.bucket, loc.prefix);
+            loadPrefix(loc.bucket, loc.prefix);
         },
-        [authTab, profile, loadPrefix],
+        [authTab, loadPrefix],
     );
 
     // 버킷 직접 입력 처리 (s3:// 접두사·슬래시는 관대하게 허용).
@@ -376,34 +336,26 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
         if (bucket === null) return;
         if (prefix.length === 0) {
             setBucket(null);
-            setEntries([]);
-            setSelected(new Set());
-            setError(null);
             return;
         }
         const trimmed = prefix.replace(/\/+$/, "");
         const idx = trimmed.lastIndexOf("/");
         const parent = idx < 0 ? "" : `${trimmed.slice(0, idx + 1)}`;
-        void loadPrefix(activeConnId, profile, bucket, parent);
-    }, [bucket, prefix, activeConnId, profile, loadPrefix]);
+        loadPrefix(bucket, parent);
+    }, [bucket, prefix, loadPrefix]);
 
     // 브레드크럼 세그먼트 이동: null이면 버킷 목록, ""이면 버킷 루트, 그 외 접두사
     const navigateTo = useCallback(
         (pfx: string | null) => {
             if (pfx === null) {
-                if (bucket !== null) {
-                    setBucket(null);
-                    setEntries([]);
-                    setSelected(new Set());
-                    setError(null);
-                }
+                setBucket(null);
                 return;
             }
             if (bucket !== null) {
-                void loadPrefix(activeConnId, profile, bucket, pfx);
+                loadPrefix(bucket, pfx);
             }
         },
-        [bucket, activeConnId, profile, loadPrefix],
+        [bucket, loadPrefix],
     );
 
     // 현재 위치의 즐겨찾기 항목 ("bucket[/prefix/]" 또는 "<연결id>@bucket[/prefix/]")
@@ -529,9 +481,6 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                 setAuthTab("profile");
                 setBucket(null);
                 setPrefix("");
-                setEntries([]);
-                setSelected(new Set());
-                setError(null);
                 void loadBuckets(null, profile);
             }
         } catch (err) {
@@ -555,43 +504,11 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
         });
     }, []);
 
-    // 객체 항목 클릭: 일반=단일 선택, Cmd/Ctrl=토글 추가, Shift=범위 선택
-    const handleEntryClick = useCallback(
-        (entry: S3Entry, e: React.MouseEvent) => {
-            if (entry.isDir) return;
-            const name = entry.name;
-            if (e.shiftKey && anchorRef.current !== null) {
-                const names = objectEntries.map((f) => f.name);
-                const a = names.indexOf(anchorRef.current);
-                const b = names.indexOf(name);
-                if (a >= 0 && b >= 0) {
-                    const [lo, hi] = a < b ? [a, b] : [b, a];
-                    setSelected(new Set(names.slice(lo, hi + 1)));
-                    return;
-                }
-            }
-            if (e.metaKey || e.ctrlKey) {
-                setSelected((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(name)) {
-                        next.delete(name);
-                    } else {
-                        next.add(name);
-                    }
-                    return next;
-                });
-            } else {
-                setSelected(new Set([name]));
-            }
-            anchorRef.current = name;
-        },
-        [objectEntries],
-    );
-
     // 객체 열기. 1GB 이상 객체가 포함되고 "다시 묻지 않기"가 꺼져 있으면
     // 데이터 전송 요금 확인 창을 먼저 표시한다.
+    // entries 는 RemoteFileList 가 넘기는 현재 목록 항목이다.
     const openObjects = useCallback(
-        (names: string[]) => {
+        (names: string[], entries: S3Entry[]) => {
             if (bucket === null || names.length === 0) return;
             const uris = names.map((n) =>
                 activeConnId !== null
@@ -613,12 +530,8 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
             onOpenPaths(uris);
             onClose();
         },
-        [bucket, prefix, entries, activeConnId, onOpenPaths, onClose],
+        [bucket, prefix, activeConnId, onOpenPaths, onClose],
     );
-
-    const handleOpenSelected = useCallback(() => {
-        openObjects([...selected]);
-    }, [openObjects, selected]);
 
     // 확인 창에서 "열기" 확정
     const handleConfirmOpen = useCallback(() => {
@@ -635,16 +548,11 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
         onClose();
     }, [confirm, dontAskAgain, onOpenPaths, onClose]);
 
-    // 에러 시 재시도: 버킷 안이면 현재 접두사, 버킷 목록이면 목록 재조회
+    // 버킷 목록 조회 실패 시 재시도
     const handleRetry = useCallback(() => {
-        if (bucket !== null) {
-            void loadPrefix(activeConnId, profile, bucket, prefix);
-        } else {
-            void loadBuckets(activeConnId, profile);
-        }
-    }, [bucket, prefix, loadPrefix, loadBuckets, activeConnId, profile]);
+        void loadBuckets(activeConnId, profile);
+    }, [loadBuckets, activeConnId, profile]);
 
-    const canOpen = selected.size > 0 && !loading;
     const prefixSegments = useMemo(
         () => prefix.split("/").filter((s) => s.length > 0),
         [prefix],
@@ -1064,237 +972,173 @@ export const S3Panel: React.FC<S3PanelProps> = ({ onOpenPaths, onClose }) => {
                 </div>
             )}
 
-            {/* 일반 에러 표시 + 재시도 */}
-            {error !== null && (
-                <div className="mx-4 mt-3 px-3 py-2 rounded-md bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900">
-                    <div className="text-xs text-rose-700 dark:text-rose-300 whitespace-pre-wrap break-all">
-                        {error}
-                    </div>
-                    <button
-                        type="button"
-                        onClick={handleRetry}
-                        className="mt-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-rose-100 dark:bg-rose-900/60 text-rose-800 dark:text-rose-200 hover:bg-rose-200 dark:hover:bg-rose-800 cursor-pointer"
-                    >
-                        다시 시도
-                    </button>
-                </div>
-            )}
-
             {/* 목록 영역: 버킷 목록 또는 접두사 항목 */}
-            <div className="flex-1 min-h-0 mt-3 mx-4 mb-3 rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden flex flex-col">
-                <div className="shrink-0 grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
-                    <span>이름</span>
-                    <span className="text-right">크기</span>
-                    <span className="text-right">수정 시각</span>
-                </div>
-                <div className="flex-1 min-h-0 overflow-auto">
-                    {loading && entries.length === 0 && buckets.length === 0 ? (
-                        <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-                            불러오는 중…
+            {bucket === null ? (
+                <>
+                    <div className="flex-1 min-h-0 mt-3 mx-4 mb-3 rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden flex flex-col">
+                        <div className="shrink-0 grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
+                            <span>이름</span>
+                            <span className="text-right">크기</span>
+                            <span className="text-right">수정 시각</span>
                         </div>
-                    ) : bucket === null ? (
-                        <>
-                            {/* 즐겨찾기 (목록 상단) */}
-                            {bookmarks.map((item) => (
-                                <div
-                                    key={`bm-${item}`}
-                                    onDoubleClick={() => enterLocation(item)}
-                                    onClick={() => enterLocation(item)}
-                                    title={`s3://${bookmarkLabel(item)}`}
-                                    className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                    style={{ height: 26 }}
-                                >
-                                    <span className="truncate flex items-center">
-                                        <button
-                                            type="button"
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                toggleBookmark(item);
-                                            }}
-                                            className="mr-1.5 shrink-0 text-amber-500 hover:text-amber-400 cursor-pointer"
-                                            title="즐겨찾기에서 제거"
+                        <div className="flex-1 min-h-0 overflow-auto">
+                            {loading && buckets.length === 0 ? (
+                                <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
+                                    불러오는 중…
+                                </div>
+                            ) : (
+                                <>
+                                    {/* 즐겨찾기 (목록 상단) */}
+                                    {bookmarks.map((item) => (
+                                        <div
+                                            key={`bm-${item}`}
+                                            onDoubleClick={() =>
+                                                enterLocation(item)
+                                            }
+                                            onClick={() => enterLocation(item)}
+                                            title={`s3://${bookmarkLabel(item)}`}
+                                            className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                            style={{ height: 26 }}
                                         >
-                                            ★
-                                        </button>
-                                        <span className="truncate">
-                                            {bookmarkLabel(item)}
-                                        </span>
-                                    </span>
-                                    <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                        -
-                                    </span>
-                                    <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                        -
-                                    </span>
-                                </div>
-                            ))}
-                            {/* 버킷 목록 */}
-                            {buckets
-                                .filter(
-                                    (b) =>
-                                        !bookmarks.includes(bookmarkKeyOf(b)),
-                                )
-                                .map((b) => (
-                                    <div
-                                        key={`bucket-${b}`}
-                                        onDoubleClick={() =>
-                                            enterLocation(bookmarkKeyOf(b))
-                                        }
-                                        onClick={() =>
-                                            enterLocation(bookmarkKeyOf(b))
-                                        }
-                                        title={`s3://${bookmarkLabel(bookmarkKeyOf(b))}`}
-                                        className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                        style={{ height: 26 }}
-                                    >
-                                        <span className="truncate flex items-center">
-                                            <button
-                                                type="button"
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    toggleBookmark(
-                                                        bookmarkKeyOf(b),
-                                                    );
-                                                }}
-                                                className="mr-1.5 shrink-0 text-zinc-400 hover:text-amber-500 cursor-pointer"
-                                                title="즐겨찾기에 추가"
-                                            >
-                                                ☆
-                                            </button>
-                                            <svg
-                                                className="w-3.5 h-3.5 mr-1.5 shrink-0 text-amber-500"
-                                                fill="currentColor"
-                                                viewBox="0 0 20 20"
-                                            >
-                                                <path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
-                                            </svg>
-                                            <span className="truncate">
-                                                {b}
+                                            <span className="truncate flex items-center">
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        toggleBookmark(item);
+                                                    }}
+                                                    className="mr-1.5 shrink-0 text-amber-500 hover:text-amber-400 cursor-pointer"
+                                                    title="즐겨찾기에서 제거"
+                                                >
+                                                    ★
+                                                </button>
+                                                <span className="truncate">
+                                                    {bookmarkLabel(item)}
+                                                </span>
                                             </span>
-                                        </span>
-                                        <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                            -
-                                        </span>
-                                        <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                            -
-                                        </span>
-                                    </div>
-                                ))}
-                            {!loading &&
-                                buckets.length === 0 &&
-                                bookmarks.length === 0 &&
-                                bucketsError === null && (
-                                    <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-                                        버킷이 없습니다
-                                    </div>
-                                )}
-                        </>
-                    ) : entries.length === 0 && error === null && !loading ? (
-                        <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-                            빈 폴더입니다
-                        </div>
-                    ) : (
-                        entries.map((entry) => {
-                            const isSel = selected.has(entry.name);
-                            return (
-                                <div
-                                    key={entry.name}
-                                    onClick={(e) => handleEntryClick(entry, e)}
-                                    onDoubleClick={() => {
-                                        if (entry.isDir) {
-                                            void loadPrefix(
-                                                activeConnId,
-                                                profile,
-                                                bucket,
-                                                `${prefix}${entry.name}/`,
-                                            );
-                                        } else {
-                                            openObjects([entry.name]);
-                                        }
-                                    }}
-                                    title={
-                                        entry.isDir
-                                            ? `${entry.name}/`
-                                            : entry.name
-                                    }
-                                    className={`grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none ${
-                                        entry.isDir
-                                            ? "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                            : isSel
-                                              ? "bg-blue-100 dark:bg-blue-900/50 text-zinc-900 dark:text-zinc-100"
-                                              : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                    }`}
-                                    style={{ height: 26 }}
-                                >
-                                    <span className="truncate flex items-center">
-                                        {entry.isDir ? (
-                                            <svg
-                                                className="w-3.5 h-3.5 mr-1.5 shrink-0 text-amber-500"
-                                                fill="currentColor"
-                                                viewBox="0 0 20 20"
+                                            <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
+                                                -
+                                            </span>
+                                            <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
+                                                -
+                                            </span>
+                                        </div>
+                                    ))}
+                                    {/* 버킷 목록 */}
+                                    {buckets
+                                        .filter(
+                                            (b) =>
+                                                !bookmarks.includes(
+                                                    bookmarkKeyOf(b),
+                                                ),
+                                        )
+                                        .map((b) => (
+                                            <div
+                                                key={`bucket-${b}`}
+                                                onDoubleClick={() =>
+                                                    enterLocation(
+                                                        bookmarkKeyOf(b),
+                                                    )
+                                                }
+                                                onClick={() =>
+                                                    enterLocation(
+                                                        bookmarkKeyOf(b),
+                                                    )
+                                                }
+                                                title={`s3://${bookmarkLabel(bookmarkKeyOf(b))}`}
+                                                className="grid grid-cols-[1fr_7rem_11rem] gap-2 px-3 items-center text-xs font-mono cursor-default select-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                                style={{ height: 26 }}
                                             >
-                                                <path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
-                                            </svg>
-                                        ) : (
-                                            <span className="w-3.5 mr-1.5 shrink-0" />
+                                                <span className="truncate flex items-center">
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            toggleBookmark(
+                                                                bookmarkKeyOf(
+                                                                    b,
+                                                                ),
+                                                            );
+                                                        }}
+                                                        className="mr-1.5 shrink-0 text-zinc-400 hover:text-amber-500 cursor-pointer"
+                                                        title="즐겨찾기에 추가"
+                                                    >
+                                                        ☆
+                                                    </button>
+                                                    <svg
+                                                        className="w-3.5 h-3.5 mr-1.5 shrink-0 text-amber-500"
+                                                        fill="currentColor"
+                                                        viewBox="0 0 20 20"
+                                                    >
+                                                        <path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
+                                                    </svg>
+                                                    <span className="truncate">
+                                                        {b}
+                                                    </span>
+                                                </span>
+                                                <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
+                                                    -
+                                                </span>
+                                                <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
+                                                    -
+                                                </span>
+                                            </div>
+                                        ))}
+                                    {!loading &&
+                                        buckets.length === 0 &&
+                                        bookmarks.length === 0 &&
+                                        bucketsError === null && (
+                                            <div className="px-3 py-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
+                                                버킷이 없습니다
+                                            </div>
                                         )}
-                                        <span className="truncate">
-                                            {entry.name}
-                                            {entry.isDir ? "/" : ""}
-                                        </span>
-                                    </span>
-                                    <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                        {entry.isDir
-                                            ? "-"
-                                            : formatBytes(entry.size)}
-                                    </span>
-                                    <span className="text-right text-zinc-500 dark:text-zinc-400 truncate">
-                                        {formatMtime(entry.mtime)}
-                                    </span>
-                                </div>
-                            );
-                        })
-                    )}
-                </div>
-                {bucket !== null && entries.length >= MAX_PREFIX_ENTRIES && (
-                    <div className="shrink-0 px-3 py-1 text-[10px] text-amber-600 dark:text-amber-400 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
-                        항목이 많아 처음{" "}
-                        {MAX_PREFIX_ENTRIES.toLocaleString("ko-KR")}개만
-                        표시합니다
+                                </>
+                            )}
+                        </div>
+                        {loading && buckets.length > 0 && (
+                            <div className="shrink-0 px-3 py-1 text-[10px] text-zinc-400 dark:text-zinc-500 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
+                                불러오는 중…
+                            </div>
+                        )}
                     </div>
-                )}
-                {loading && (entries.length > 0 || buckets.length > 0) && (
-                    <div className="shrink-0 px-3 py-1 text-[10px] text-zinc-400 dark:text-zinc-500 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
-                        불러오는 중…
-                    </div>
-                )}
-            </div>
 
-            {/* 푸터: 선택 정보 + 열기 */}
-            <div className="shrink-0 flex items-center justify-between px-4 py-2.5 border-t border-zinc-200 dark:border-zinc-800">
-                <span className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
-                    {selected.size > 0
-                        ? `${selected.size}개 객체 선택됨 (Shift/Cmd+클릭으로 다중 선택)`
-                        : "객체를 더블클릭하거나 선택 후 [열기]"}
-                </span>
-                <div className="flex items-center gap-2">
-                    <button
-                        type="button"
-                        onClick={onClose}
-                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
-                    >
-                        취소
-                    </button>
-                    <button
-                        type="button"
-                        onClick={handleOpenSelected}
-                        disabled={!canOpen}
-                        className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-900 text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 disabled:opacity-40 cursor-pointer"
-                    >
-                        열기{selected.size > 1 ? ` (${selected.size})` : ""}
-                    </button>
-                </div>
-            </div>
+                    {/* 버킷 목록 모드 푸터 */}
+                    <div className="shrink-0 flex items-center justify-between px-4 py-2.5 border-t border-zinc-200 dark:border-zinc-800">
+                        <span className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
+                            버킷을 더블클릭해 열거나 위치를 입력하세요
+                        </span>
+                        <div className="flex items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={onClose}
+                                className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer"
+                            >
+                                취소
+                            </button>
+                            <button
+                                type="button"
+                                disabled
+                                className="px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40 cursor-pointer"
+                            >
+                                열기
+                            </button>
+                        </div>
+                    </div>
+                </>
+            ) : (
+                <RemoteFileList<S3Entry>
+                    location={`${activeConnId ?? ""}\t${bucket}\t${prefix}`}
+                    startStream={startStream}
+                    onEnterDir={(name) =>
+                        loadPrefix(bucket, `${prefix}${name}/`)
+                    }
+                    onOpen={openObjects}
+                    onCancel={onClose}
+                    emptyText="빈 폴더입니다"
+                    itemName="객체"
+                    hintText="객체를 더블클릭하거나 선택 후 [열기]"
+                />
+            )}
 
             {/* 1GB 이상 객체 열기 확인 창 */}
             {confirm !== null && (
