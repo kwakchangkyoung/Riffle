@@ -76,7 +76,13 @@ fn read_connections_file(path: &Path) -> Vec<S3Connection> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let mut conns: Vec<S3Connection> = serde_json::from_str(&content).unwrap_or_default();
+    // 이전 버전에서 "/" 같은 값으로 저장된 버킷·경로도 정규화한다
+    for c in &mut conns {
+        c.bucket = normalize_bucket(&c.bucket);
+        c.prefix = normalize_prefix(&c.prefix);
+    }
+    conns
 }
 
 /// 연결 목록을 s3-connections.json 에 원자적으로 저장한다.
@@ -314,6 +320,20 @@ fn trim_opt(v: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 시작 버킷: 공백과 앞뒤 '/' 를 걷어낸다. "/" 처럼 비게 되면 None (버킷 목록부터 탐색).
+fn normalize_bucket(v: &Option<String>) -> Option<String> {
+    trim_opt(v)
+        .map(|b| b.trim_matches('/').trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// 시작 경로: 공백과 앞쪽 '/' 를 걷어낸다 (S3 키는 '/' 로 시작하지 않는다). 비면 None.
+fn normalize_prefix(v: &Option<String>) -> Option<String> {
+    trim_opt(v)
+        .map(|p| p.trim_start_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+}
+
 /// 검증 + 목록 반영 + JSON·키체인 저장. CONNS_LOCK 안에서 호출한다.
 /// 비밀 키가 있으면 키체인을 먼저 쓰고 JSON 을 저장한다
 /// (키체인 거부 시 아무것도 저장되지 않아 재시도가 깨끗하다).
@@ -331,8 +351,8 @@ fn save_connection_locked(
     }
     let secret = trim_opt(&input.secret_key);
     let region = trim_opt(&input.region);
-    let bucket = trim_opt(&input.bucket);
-    let prefix = trim_opt(&input.prefix);
+    let bucket = normalize_bucket(&input.bucket);
+    let prefix = normalize_prefix(&input.prefix);
 
     let path = connections_path(state)?;
     let mut conns = read_connections_file(&path);
@@ -436,6 +456,35 @@ pub async fn delete_s3_connection(app: tauri::AppHandle, id: String) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_bucket_and_prefix() {
+        let some = |v: &str| Some(v.to_string());
+        // Transmit 식으로 "/" 를 넣으면 버킷 없음(버킷 목록부터)
+        assert_eq!(normalize_bucket(&some("/")), None);
+        assert_eq!(normalize_bucket(&some("  ")), None);
+        assert_eq!(normalize_bucket(&None), None);
+        assert_eq!(normalize_bucket(&some(" /my-bucket/ ")), some("my-bucket"));
+        assert_eq!(normalize_prefix(&some("/")), None);
+        assert_eq!(normalize_prefix(&some("/logs/2026/")), some("logs/2026/"));
+        assert_eq!(normalize_prefix(&some("logs")), some("logs"));
+    }
+
+    #[test]
+    fn test_read_normalizes_legacy_slash_bucket() {
+        let dir = std::env::temp_dir().join(format!("riffle_conns_norm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s3-connections.json");
+        std::fs::write(
+            &path,
+            r#"[{"id":"c000000000001","name":"a","accessKeyId":"AKIA","region":null,"bucket":"/","prefix":"/x/","lastUsed":null}]"#,
+        )
+        .unwrap();
+        let conns = read_connections_file(&path);
+        assert_eq!(conns[0].bucket, None);
+        assert_eq!(conns[0].prefix.as_deref(), Some("x/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn conn(id: &str, name: &str, last_used: Option<u64>) -> S3Connection {
         S3Connection {
