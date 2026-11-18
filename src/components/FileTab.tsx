@@ -112,6 +112,8 @@ interface FileTabProps {
     isActive: boolean;
     /** 전역 글자 크기 (App 상태) */
     fontSize: number;
+    /** 구문 강조 전역 설정 (App 상태, 모든 탭 공통) */
+    syntaxEnabled: boolean;
     /** 파일 열기 완료 시 FileInfo 보고 (탭 제목/중복 경로 판정용) */
     onFileInfo: (tabId: string, info: FileInfo) => void;
     /** 인덱싱/해제/병합 구축 진행률 보고 (탭 진행률 표시용) */
@@ -138,6 +140,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         mergeSourceIds = null,
         isActive,
         fontSize,
+        syntaxEnabled,
         onFileInfo,
         onProgress,
         onTailChange,
@@ -198,6 +201,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             no: number;
         } | null>(null);
         const [findSignal, setFindSignal] = useState(0);
+        // 더블클릭으로 선택된 단어 강조 (탭별 상태, Esc/상태바 ×로 해제)
+        const [highlightWord, setHighlightWord] = useState<string | null>(null);
 
         // 북마크 상태 (Phase 15): 항목 목록(줄 번호 오름차순), stale 안내, 사이드 패널
         const [bookmarks, setBookmarkItems] = useState<Bookmark[]>([]);
@@ -1742,6 +1747,16 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
             setFullLinePanel(null);
         }, []);
 
+        // 본문 단어 더블클릭 → 보이는 줄에서 해당 단어 강조
+        const handleWordHighlight = useCallback((word: string) => {
+            setHighlightWord(word);
+        }, []);
+
+        // 단어 강조 해제 (상태바 × / Esc)
+        const handleClearWordHighlight = useCallback(() => {
+            setHighlightWord(null);
+        }, []);
+
         // 뷰포트에 전달할 정규화된 선택 범위 (일반 모드에서만)
         const selectedRange = useMemo(() => {
             if (isFilterMode || filterViewActive || lineSelection === null) {
@@ -2172,11 +2187,16 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 if (document.querySelector('[aria-modal="true"]') !== null) {
                     return;
                 }
+                // 단어 강조가 켜져 있으면 Esc는 그것부터 해제한다
+                if (highlightWord !== null) {
+                    setHighlightWord(null);
+                    return;
+                }
                 setLineSelection(null);
             };
             window.addEventListener("keydown", handleKeyDown);
             return () => window.removeEventListener("keydown", handleKeyDown);
-        }, [gotoLineOpen, fullLinePanel, bookmarkPanelOpen]);
+        }, [gotoLineOpen, fullLinePanel, bookmarkPanelOpen, highlightWord]);
 
         // 토스트 메시지는 2초 후 자동으로 사라진다
         useEffect(() => {
@@ -2544,6 +2564,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 onJumpToSource={
                                     isMergeView ? jumpToSource : undefined
                                 }
+                                syntaxEnabled={syntaxEnabled}
+                                highlightWord={highlightWord}
+                                onWordHighlight={handleWordHighlight}
                             />
                             {isActive &&
                                 fullLinePanel !== null &&
@@ -2553,6 +2576,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                         fileId={fullLinePanel.fileId}
                                         lineNo={fullLinePanel.no}
                                         onClose={handleCloseFullLinePanel}
+                                        onToast={setToast}
                                     />
                                 )}
                             {isActive && bookmarkPanelOpen && (
@@ -2611,6 +2635,8 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                             ? selectedRange.end - selectedRange.start + 1
                             : 0
                     }
+                    highlightWord={highlightWord}
+                    onClearHighlight={handleClearWordHighlight}
                     mergeSourceCount={
                         isMergeView ? mergeSourceList.length : null
                     }

@@ -34,6 +34,8 @@ interface StatusBarProps {
     tailPaused?: boolean; // tail 자동 스크롤 일시정지 여부 (사용자가 맨 아래에 있지 않음)
     copying?: boolean; // 줄 범위 복사 진행 중 여부
     selectionLines?: number; // 줄 단위 선택된 줄 수 (0이면 미표시)
+    highlightWord?: string | null; // 더블클릭으로 강조 중인 단어 (null이면 미표시)
+    onClearHighlight?: () => void; // 단어 강조 해제 (× 버튼)
     mergeSourceCount?: number | null; // 병합 뷰: 원본 개수 (병합 탭이 아니면 null/미지정)
     mergeSourcePaths?: string[]; // 병합 뷰: 원본 경로 목록 (툴팁용)
 }
@@ -57,6 +59,8 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         tailPaused,
         copying,
         selectionLines = 0,
+        highlightWord = null,
+        onClearHighlight,
         mergeSourceCount = null,
         mergeSourcePaths,
     }) => {
@@ -240,6 +244,27 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
 
                 {/* 우측: 검색 결과, 크기, 줄 수, 진행률, 현재 줄 위치 */}
                 <div className="flex items-center space-x-4 shrink-0">
+                    {highlightWord !== null && highlightWord !== "" && (
+                        <>
+                            <span
+                                className="flex items-center gap-1 text-amber-800 dark:text-amber-200 font-medium"
+                                title="더블클릭한 단어 강조 중 (Esc로 해제)"
+                            >
+                                강조: {highlightWord}
+                                <button
+                                    type="button"
+                                    onClick={onClearHighlight}
+                                    className="px-0.5 rounded hover:bg-amber-200/60 dark:hover:bg-amber-800/60 cursor-pointer leading-none"
+                                    title="단어 강조 해제"
+                                >
+                                    ×
+                                </button>
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
                     {selectionLines > 0 && (
                         <>
                             <span

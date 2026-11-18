@@ -21,6 +21,7 @@ import {
     loadFontSize,
     saveFontSize,
 } from "@/lib/fontSize";
+import { loadSyntaxEnabled, saveSyntaxEnabled } from "@/lib/syntax";
 import { FileTab } from "@/components/FileTab";
 import { TabBar, type TabMeta } from "@/components/TabBar";
 import { EmptyState } from "@/components/EmptyState";
@@ -277,6 +278,9 @@ export default function App() {
 
     // ===== 전역 상태 =====
     const [fontSize, setFontSize] = useState<number>(loadFontSize);
+    // 구문 강조: 모든 탭 공통으로 적용되는 전역 설정 (localStorage 유지)
+    const [syntaxEnabled, setSyntaxEnabled] =
+        useState<boolean>(loadSyntaxEnabled);
     const [isDragOver, setIsDragOver] = useState(false);
     const [recentFiles, setRecentFiles] = useState<string[]>([]);
     // 원격 파일 열기 대화상자 표시 여부
@@ -448,6 +452,14 @@ export default function App() {
                     break;
                 case "font_reset":
                     handleFontReset();
+                    break;
+                case "toggle_syntax":
+                    // 구문 강조 토글: 전역 상태 + localStorage (모든 탭 공통)
+                    setSyntaxEnabled((prev) => {
+                        const next = !prev;
+                        saveSyntaxEnabled(next);
+                        return next;
+                    });
                     break;
                 default:
                     break;
@@ -687,6 +699,7 @@ export default function App() {
                         mergeSourceIds={tab.mergeSourceIds ?? null}
                         isActive={tab.id === activeTabId}
                         fontSize={fontSize}
+                        syntaxEnabled={syntaxEnabled}
                         onFileInfo={handleTabFileInfo}
                         onProgress={handleTabProgress}
                         onTailChange={handleTabTailChange}

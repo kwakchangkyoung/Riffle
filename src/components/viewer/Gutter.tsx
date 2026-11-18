@@ -1,5 +1,7 @@
 import React, { useCallback, useRef } from "react";
 import type { Line } from "@/lib/ipc";
+import { lineLevel } from "@/lib/syntax";
+import { parseLineJson } from "@/lib/jsonLine";
 
 /** 거터 클릭 안내 툴팁을 보여준 횟수를 세는 localStorage 키 (처음 3회만 표시) */
 const HINT_KEY = "riffle.gutterHintShown";
@@ -23,6 +25,7 @@ interface GutterProps {
     bookmarks?: Map<number, string>; // 북마크: 실제 파일 줄 번호(0-based) → 색상
     onBookmarkToggle?: (lineNo: number) => void; // 거터 우클릭/Option+클릭 북마크 토글 (실제 파일 줄 번호)
     mergeMode?: boolean; // 병합 뷰: 줄 번호 대신 원본 줄 번호(sourceLine)를 표시
+    levelBars?: boolean; // 줄 레벨 색 막대 표시 (구문 강조 설정과 연동)
 }
 
 /**
@@ -44,6 +47,7 @@ export const Gutter: React.FC<GutterProps> = React.memo(
         bookmarks,
         onBookmarkToggle,
         mergeMode = false,
+        levelBars = false,
     }) => {
         // 전체 줄 수의 자릿수에 비례하여 폭 계산 (최소 4글자 폭 확보)
         // 모노스페이스 글자 폭은 폰트 크기의 약 0.6em이므로 fontSize에 연동한다
@@ -124,6 +128,20 @@ export const Gutter: React.FC<GutterProps> = React.memo(
             const bookmarkColor =
                 actualNo !== null ? bookmarks?.get(actualNo) : undefined;
 
+            // 줄 레벨 색 막대 (왼쪽 가장자리 3px, 북마크 점보다 바깥쪽에 둬 겹치지 않게)
+            const lvl =
+                levelBars && line !== undefined ? lineLevel(line.text) : null;
+
+            // 전체 줄 패널 진입: 잘린 줄 또는 JSON 페이로드가 있는 줄
+            const hasJson =
+                !mergeMode &&
+                line !== undefined &&
+                parseLineJson(line.text) !== null;
+            const canExpand =
+                line !== undefined &&
+                onTruncatedClick !== undefined &&
+                (line.truncated || hasJson);
+
             lines.push(
                 <div
                     key={index}
@@ -165,7 +183,14 @@ export const Gutter: React.FC<GutterProps> = React.memo(
                     }}
                 >
                     {displayNo}
-                    {/* 북마크 색 점 (줄 번호 왼쪽) */}
+                    {/* 줄 레벨 색 막대 (거터 왼쪽 가장자리) */}
+                    {lvl === "error" && (
+                        <span className="absolute left-0 top-0 bottom-0 w-[3px] bg-red-500/80 dark:bg-red-400/70" />
+                    )}
+                    {lvl === "warn" && (
+                        <span className="absolute left-0 top-0 bottom-0 w-[3px] bg-amber-500/80 dark:bg-amber-400/70" />
+                    )}
+                    {/* 북마크 색 점 (레벨 막대 안쪽) */}
                     {bookmarkColor !== undefined && (
                         <span
                             className="absolute left-1 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full"
@@ -173,22 +198,24 @@ export const Gutter: React.FC<GutterProps> = React.memo(
                             title="북마크 (⌘B 토글 · F2 이동 · ⌘⇧B 목록)"
                         />
                     )}
-                    {line !== undefined &&
-                        line.truncated &&
-                        onTruncatedClick !== undefined && (
-                            <button
-                                type="button"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    onTruncatedClick(line.no);
-                                }}
-                                className="absolute right-0.5 top-1/2 -translate-y-1/2 px-0.5 text-zinc-400 dark:text-zinc-600 hover:text-zinc-700 dark:hover:text-zinc-300 font-bold cursor-pointer leading-none"
-                                style={{ fontSize: `${fontSize - 2}px` }}
-                                title="잘린 줄 — 클릭해 전체 보기(16KB 초과)"
-                            >
-                                ↔
-                            </button>
-                        )}
+                    {canExpand && (
+                        <button
+                            type="button"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onTruncatedClick(line.no);
+                            }}
+                            className="absolute right-0.5 top-1/2 -translate-y-1/2 px-0.5 text-zinc-400 dark:text-zinc-600 hover:text-zinc-700 dark:hover:text-zinc-300 font-bold cursor-pointer leading-none"
+                            style={{ fontSize: `${fontSize - 2}px` }}
+                            title={
+                                line.truncated
+                                    ? "잘린 줄 — 클릭해 전체 보기(16KB 초과)"
+                                    : "JSON 줄 — 클릭해 트리/원문 보기"
+                            }
+                        >
+                            ↔
+                        </button>
+                    )}
                 </div>,
             );
         }

@@ -7,6 +7,14 @@ import React, {
 } from "react";
 import type { Columns, FileInfo, Line, RuleKind } from "@/lib/ipc";
 import type { LineCache } from "@/lib/lineCache";
+import {
+    findWordSpans,
+    lineLevel,
+    tokenClassName,
+    tokenizeLine,
+    wordAt,
+    type Token,
+} from "@/lib/syntax";
 import { ColumnHeader, FieldFilterMenu, type CellMenu } from "./ColumnView";
 import {
     estimateColWidths,
@@ -30,44 +38,32 @@ const EMPTY_WIDTHS: number[] = [];
 const LEVEL_TOKEN_RE = /\b(ERROR|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/;
 const LEVEL_SEARCH_CHARS = 200;
 
-interface LevelSpan {
-    start: number;
-    end: number;
-    className: string;
-}
-
 /** #rrggbb 색상 문자열에 알파를 붙인 8자리 hex를 반환한다 (규칙 하이라이트 배경용) */
 function withAlpha(hex: string): string {
     return hex.length === 7 && hex.startsWith("#") ? `${hex}40` : hex;
 }
 
 /**
- * 줄 텍스트에서 첫 로그 레벨 토큰의 범위와 색상 클래스를 찾습니다.
+ * 구문 강조가 꺼져 있을 때의 토큰 목록: 레거시 LEVEL_TOKEN_RE와 같은 대상의
+ * 첫 레벨 토큰 하나만 만든다 (배지 없이 텍스트 색만 적용한다).
  */
-function findLevelSpan(text: string): LevelSpan | null {
+function legacyLevelTokens(text: string): Token[] {
     const head = text.slice(0, LEVEL_SEARCH_CHARS);
     const match = LEVEL_TOKEN_RE.exec(head);
-    if (!match) return null;
-
-    const token = match[0];
-    let className: string;
-    if (token === "ERROR" || token === "FATAL") {
-        className = "text-red-600 dark:text-red-400 font-semibold";
-    } else if (token === "WARN" || token === "WARNING") {
-        className = "text-amber-600 dark:text-amber-400 font-semibold";
-    } else if (token === "INFO") {
-        className = "text-blue-600 dark:text-blue-400";
-    } else {
-        // DEBUG, TRACE
-        className = "text-zinc-400 dark:text-zinc-500";
-    }
-    return { start: match.index, end: match.index + token.length, className };
+    if (!match) return [];
+    return [
+        {
+            start: match.index,
+            end: match.index + match[0].length,
+            kind: "level",
+        },
+    ];
 }
 
 /**
- * 검색 하이라이트, 필터 규칙 하이라이트, 로그 레벨 토큰 범위를 경계로 잘라
- * 각 조각에 적절한 스타일을 입혀 렌더링합니다.
- * 우선순위: 검색 하이라이트(최상위) > 규칙 배경 > 레벨 색상.
+ * 검색 하이라이트, 필터 규칙 하이라이트, 더블클릭 단어 강조, 구문 토큰 범위를
+ * 경계로 잘라 각 조각에 적절한 스타일을 입혀 렌더링합니다.
+ * 우선순위(바깥 래퍼): 검색 하이라이트 > 규칙 배경 > 단어 강조 > 구문 색(안쪽).
  */
 function renderLineContent(
     text: string,
@@ -75,19 +71,28 @@ function renderLineContent(
     ruleHighlights: [number, number, number][] | undefined,
     ruleColors: string[] | undefined,
     isCurrentHit: boolean,
+    syntaxOn: boolean,
+    word: string | null,
 ): React.ReactNode {
-    const level = findLevelSpan(text);
+    const tokens = syntaxOn ? tokenizeLine(text) : legacyLevelTokens(text);
     const hl = highlights ?? [];
     const rl = ruleHighlights ?? [];
-    if (level === null && hl.length === 0 && rl.length === 0) {
+    const ws = word !== null && word !== "" ? findWordSpans(text, word) : [];
+    if (
+        tokens.length === 0 &&
+        hl.length === 0 &&
+        rl.length === 0 &&
+        ws.length === 0
+    ) {
         return text;
     }
 
-    // 하이라이트와 레벨 토큰의 모든 경계를 모아 조각 단위로 분할
+    // 하이라이트·단어·구문 토큰의 모든 경계를 모아 조각 단위로 분할한다.
+    // 토큰 경계도 포함되므로 각 조각은 어떤 토큰 안에 온전히 들어가거나 밖에 있다.
     const bounds = new Set<number>([0, text.length]);
-    if (level !== null) {
-        bounds.add(level.start);
-        bounds.add(level.end);
+    for (const t of tokens) {
+        bounds.add(t.start);
+        bounds.add(t.end);
     }
     for (const [s, e] of hl) {
         if (s >= 0 && s <= text.length) bounds.add(s);
@@ -97,9 +102,14 @@ function renderLineContent(
         if (s >= 0 && s <= text.length) bounds.add(s);
         if (e >= 0 && e <= text.length) bounds.add(e);
     }
+    for (const [s, e] of ws) {
+        bounds.add(s);
+        bounds.add(e);
+    }
     const sorted = Array.from(bounds).sort((a, b) => a - b);
 
     const nodes: React.ReactNode[] = [];
+    let tokIdx = 0;
     for (let i = 0; i < sorted.length - 1; i++) {
         const s = sorted[i];
         const e = sorted[i + 1];
@@ -107,52 +117,55 @@ function renderLineContent(
         const seg = text.slice(s, e);
         const inHighlight = hl.some(([hs, he]) => s >= hs && e <= he);
         const ruleEntry = rl.find(([rs, re]) => s >= rs && e <= re);
-        const inLevel = level !== null && s >= level.start && e <= level.end;
+        const inWord = ws.some(([ws0, we0]) => s >= ws0 && e <= we0);
+
+        // 이 조각을 온전히 감싸는 구문 토큰 (경계 분할 덕분에 최대 하나)
+        while (tokIdx < tokens.length && tokens[tokIdx].end <= s) tokIdx++;
+        const tok = tokens[tokIdx];
+        const inTok =
+            tok !== undefined && s >= tok.start && e <= tok.end ? tok : null;
+
+        let content: React.ReactNode = inTok ? (
+            <span className={tokenClassName(inTok, text, syntaxOn)}>{seg}</span>
+        ) : (
+            seg
+        );
 
         if (inHighlight) {
-            nodes.push(
+            content = (
                 <mark
-                    key={i}
                     className={
                         isCurrentHit
                             ? "bg-amber-400 text-zinc-950 dark:bg-amber-400 dark:text-zinc-950 font-semibold rounded-xs px-0.5"
                             : "bg-amber-200/90 text-zinc-900 dark:bg-amber-500/40 dark:text-zinc-100 rounded-xs px-0.5"
                     }
                 >
-                    {inLevel ? (
-                        <span className={level.className}>{seg}</span>
-                    ) : (
-                        seg
-                    )}
-                </mark>,
+                    {content}
+                </mark>
             );
         } else if (ruleEntry !== undefined) {
             const color = ruleColors?.[ruleEntry[2]];
-            nodes.push(
+            content = (
                 <span
-                    key={i}
                     style={
                         color !== undefined
                             ? { backgroundColor: withAlpha(color) }
                             : undefined
                     }
                 >
-                    {inLevel ? (
-                        <span className={level.className}>{seg}</span>
-                    ) : (
-                        seg
-                    )}
-                </span>,
+                    {content}
+                </span>
             );
-        } else if (inLevel) {
-            nodes.push(
-                <span key={i} className={level.className}>
-                    {seg}
-                </span>,
+        } else if (inWord) {
+            // 더블클릭 단어 강조: 노란 배경 (검색의 amber와 구분).
+            // 여백·테두리를 주면 고정폭 글자 위치가 밀리고 토큰 경계마다 상자가 끊기므로 배경만 쓴다.
+            content = (
+                <span className="bg-yellow-200/80 text-zinc-900 dark:bg-yellow-400/30 dark:text-zinc-100">
+                    {content}
+                </span>
             );
-        } else {
-            nodes.push(seg);
         }
+        nodes.push(<React.Fragment key={i}>{content}</React.Fragment>);
     }
 
     return nodes;
@@ -188,6 +201,9 @@ interface LogViewportProps {
     onFieldFilter?: (field: string, value: string, kind: RuleKind) => void; // 셀 우클릭 필드 필터 추가
     mergeSources?: MergeChipInfo[]; // 병합 뷰 원본 칩 정보 (비어 있지 않으면 원본 칩 열 표시)
     onJumpToSource?: (sourceIndex: number, sourceLine: number) => void; // 병합 행/칩 → 원본 탭 이동
+    syntaxEnabled?: boolean; // 구문 강조 토글 (레벨 배지·줄 레벨 배경·거터 막대도 함께 제어)
+    highlightWord?: string | null; // 더블클릭으로 선택된 강조 단어 (탭별 상태)
+    onWordHighlight?: (word: string) => void; // 본문 단어 더블클릭 → 단어 강조 설정
 }
 
 /**
@@ -224,6 +240,9 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         onFieldFilter,
         mergeSources,
         onJumpToSource,
+        syntaxEnabled = true,
+        highlightWord = null,
+        onWordHighlight,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyWrapRef = useRef<HTMLDivElement>(null);
@@ -623,6 +642,25 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         // 인덱스 기반 보기(검색 결과만 / 다중 필터) 여부
         const indexView = isFilterMode || filterViewActive;
 
+        // 더블클릭 위치의 단어를 골라 강조 콜백으로 넘긴다.
+        // 더블클릭 시점에 브라우저가 이미 단어를 선택해 두므로 selection 앵커의
+        // 문자 오프셋을 줄 텍스트 좌표로 환산한 뒤 우리 구분자 규칙으로 확장한다.
+        const pickWordAt = useCallback(
+            (e: React.MouseEvent, line: Line) => {
+                if (onWordHighlight === undefined) return;
+                const sel = window.getSelection();
+                if (sel === null || sel.anchorNode === null) return;
+                const el = e.currentTarget as HTMLElement;
+                const node = sel.anchorNode;
+                if (!el.contains(node)) return;
+                const abs = absOffsetIn(el, node, sel.anchorOffset);
+                if (abs === null) return;
+                const w = wordAt(line.text, abs);
+                if (w !== null) onWordHighlight(w.word);
+            },
+            [onWordHighlight],
+        );
+
         // 본문 행 렌더링
         const rows: React.ReactNode[] = [];
         for (let i = 0; i < rowCount; i++) {
@@ -648,13 +686,24 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                 columns.hasHeader &&
                 line?.no === 0;
 
+            // 줄 단위 레벨 표시 (구문 강조 설정과 함께 켜지고 꺼진다)
+            const lvl =
+                syntaxEnabled && line !== undefined
+                    ? lineLevel(line.text)
+                    : null;
+
             rows.push(
                 <div
                     key={index}
-                    onDoubleClick={() => {
+                    onDoubleClick={(e) => {
+                        if (line === undefined) return;
+                        // Option+더블클릭: 어떤 보기에서든 단어 강조만 수행
+                        if (e.altKey && !colViewActive) {
+                            pickWordAt(e, line);
+                            return;
+                        }
                         // 병합 뷰: 더블클릭은 원본 탭의 같은 줄로 이동 (모든 보기 모드)
                         if (
-                            line !== undefined &&
                             line.sourceLine !== null &&
                             line.sourceLine !== undefined &&
                             onJumpToSource !== undefined
@@ -662,15 +711,14 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                             onJumpToSource(line.source ?? 0, line.sourceLine);
                             return;
                         }
-                        if (isFilterMode && line && onLineDoubleClick) {
+                        if (isFilterMode && onLineDoubleClick) {
                             onLineDoubleClick(line.no);
-                        } else if (
-                            !indexView &&
-                            line !== undefined &&
-                            line.truncated
-                        ) {
+                        } else if (!indexView && line.truncated) {
                             // 잘린 줄 더블클릭: 전체 줄 패널 열기
                             onTruncatedLineClick?.(line.no);
+                        } else if (!indexView && !colViewActive) {
+                            // 일반 본문 더블클릭: 커서 아래 단어 강조
+                            pickWordAt(e, line);
                         }
                     }}
                     className={`flex font-mono select-text cursor-default ${
@@ -682,7 +730,11 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                             ? "bg-amber-100/80 dark:bg-amber-950/50 text-zinc-950 dark:text-zinc-50 border-l-2 border-amber-500"
                             : isSelected
                               ? "bg-sky-200/70 dark:bg-sky-800/50 text-zinc-900 dark:text-zinc-100"
-                              : "text-zinc-900 dark:text-zinc-100 hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40"
+                              : lvl === "error"
+                                ? "bg-red-50/70 dark:bg-red-950/30 text-zinc-900 dark:text-zinc-100"
+                                : lvl === "warn"
+                                  ? "bg-orange-50/70 dark:bg-orange-950/30 text-zinc-900 dark:text-zinc-100"
+                                  : "text-zinc-900 dark:text-zinc-100 hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40"
                     } ${isCsvHeaderRow ? "opacity-45" : ""}`}
                     style={{
                         height: rowHeight,
@@ -739,6 +791,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                                     line.ruleHighlights,
                                     ruleColors,
                                     isCurrentHit,
+                                    syntaxEnabled,
+                                    highlightWord,
                                 )
                             ) : lineCache.isLineFailed(index) ? (
                                 <span className="text-zinc-400 dark:text-zinc-600 italic">
@@ -792,6 +846,7 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                         bookmarks={bookmarks}
                         onBookmarkToggle={onBookmarkToggle}
                         mergeMode={mergeView}
+                        levelBars={syntaxEnabled}
                     />
 
                     {/* 병합 뷰: 원본 표시 칩 열 (거터 옆 고정 폭) */}
@@ -880,3 +935,36 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
 );
 
 LogViewport.displayName = "LogViewport";
+
+/**
+ * 요소 안에서 (node, offset) 위치의 전체 텍스트 기준 문자 오프셋을 계산합니다.
+ * 구문 토큰 span으로 나뉜 행 내용에서 더블클릭 지점의 줄 텍스트 좌표를 구하는 데 쓴다.
+ */
+function absOffsetIn(
+    el: HTMLElement,
+    node: Node,
+    offset: number,
+): number | null {
+    if (node.nodeType === Node.TEXT_NODE) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let total = 0;
+        let cur = walker.nextNode();
+        while (cur !== null) {
+            if (cur === node) return total + offset;
+            total += cur.nodeValue?.length ?? 0;
+            cur = walker.nextNode();
+        }
+        return null;
+    }
+    if (node.nodeType === Node.ELEMENT_NODE) {
+        // 앵커가 요소 노드면 offset은 자식 인덱스 — 앞쪽 형제의 텍스트 길이 합
+        let total = 0;
+        const kids = node.childNodes;
+        const limit = Math.min(offset, kids.length);
+        for (let i = 0; i < limit; i++) {
+            total += kids[i].textContent?.length ?? 0;
+        }
+        return total;
+    }
+    return null;
+}

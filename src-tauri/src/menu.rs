@@ -148,6 +148,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<Menu<Wry>> {
                 true,
                 Some("CmdOrCtrl+Shift+C"),
             )?,
+            &MenuItem::with_id(app, "toggle_syntax", "구문 강조", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "font_inc", "글자 크게", true, Some("CmdOrCtrl+="))?,
             &MenuItem::with_id(app, "font_dec", "글자 작게", true, Some("CmdOrCtrl+-"))?,
