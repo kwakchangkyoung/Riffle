@@ -38,6 +38,9 @@ interface StatusBarProps {
     onClearHighlight?: () => void; // 단어 강조 해제 (× 버튼)
     mergeSourceCount?: number | null; // 병합 뷰: 원본 개수 (병합 탭이 아니면 null/미지정)
     mergeSourcePaths?: string[]; // 병합 뷰: 원본 경로 목록 (툴팁용)
+    overviewFraction?: number | null; // 개요 스캔 진행률 (0~1, null이면 미표시)
+    overviewStartable?: boolean; // 수동 시작이 필요한 파일(에이전트 없는 원격) 여부
+    onStartOverview?: () => void; // "개요 계산(전체 다운로드)" 버튼 핸들러
 }
 
 /**
@@ -63,6 +66,9 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
         onClearHighlight,
         mergeSourceCount = null,
         mergeSourcePaths,
+        overviewFraction = null,
+        overviewStartable = false,
+        onStartOverview,
     }) => {
         if (!file) {
             return (
@@ -283,6 +289,34 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(
                         <>
                             <span className="text-sky-600 dark:text-sky-400 font-medium">
                                 복사 중…
+                            </span>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
+                    {overviewStartable && onStartOverview !== undefined && (
+                        <>
+                            <button
+                                type="button"
+                                onClick={onStartOverview}
+                                className="text-sky-700 dark:text-sky-300 font-medium hover:underline cursor-pointer"
+                                title="오류 분포·타임라인용 개요 계산 (파일 전체를 내려받습니다)"
+                            >
+                                개요 계산(전체 다운로드)
+                            </button>
+                            <span className="text-zinc-300 dark:text-zinc-700">
+                                |
+                            </span>
+                        </>
+                    )}
+                    {overviewFraction !== null && (
+                        <>
+                            <span
+                                className="text-amber-600 dark:text-amber-400"
+                                title="오류 분포·타임라인용 개요 계산 진행률"
+                            >
+                                개요 {Math.floor(overviewFraction * 100)}%
                             </span>
                             <span className="text-zinc-300 dark:text-zinc-700">
                                 |

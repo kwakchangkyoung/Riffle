@@ -753,6 +753,82 @@ export function setAgentEnabled(host: string, enabled: boolean): Promise<void> {
     return invoke<void>("set_agent_enabled", { host, enabled });
 }
 
+// ===== 파일 개요 스캔 (Phase 22): 오류 분포 + 시간 히스토그램 =====
+
+/** 개요 스캔 진행 이벤트 (Rust OverviewEvent와 1:1) */
+export type OverviewEvent =
+    | { kind: "progress"; fraction: number }
+    | {
+          kind: "done";
+          /** 스캔 시점의 줄 수 */
+          lineCount: number;
+          /** 줄 번호를 lineCount 기준 최대 1000 구간으로 나눈 ERROR 줄 수 */
+          posError: number[];
+          /** 같은 구간의 WARN 줄 수 */
+          posWarn: number[];
+          /** 시간 분포(타임스탬프)를 인식했는지 여부 */
+          hasTime: boolean;
+          errorTotal: number;
+          warnTotal: number;
+      }
+    | { kind: "cancelled" }
+    | { kind: "error"; message: string };
+
+/**
+ * 파일 개요 스캔을 백그라운드에서 시작합니다.
+ * 같은 파일의 이전 작업은 자동 취소·제거됩니다.
+ * localOffsetMinutes는 JS getTimezoneOffset()의 부호를 반전해 넘깁니다 (병합과 동일).
+ */
+export function startOverview(
+    id: number,
+    onEvent: (event: OverviewEvent) => void,
+): Promise<void> {
+    const channel = new Channel<OverviewEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("start_overview", {
+        id,
+        localOffsetMinutes: -new Date().getTimezoneOffset(),
+        onEvent: channel,
+    });
+}
+
+/**
+ * 파일의 진행 중인 개요 스캔을 취소합니다. 이미 끝난 작업이면 무시됩니다.
+ */
+export function cancelOverview(id: number): Promise<void> {
+    return invoke<void>("cancel_overview", { id });
+}
+
+/** get_timeline 응답의 막대 하나 (Rust TimeBucketDto와 1:1) */
+export interface TimeBucket {
+    startSec: number;
+    total: number;
+    error: number;
+    warn: number;
+    firstLine: number;
+}
+
+/** get_timeline 응답 (Rust TimelineDto와 1:1) */
+export interface Timeline {
+    /** 막대 하나가 덮는 초 수 */
+    bucketSecs: number;
+    /** 첫 막대의 시작 epoch 초 */
+    startSec: number;
+    /** 연속된 막대 목록 (빈 구간도 0으로 채움) */
+    buckets: TimeBucket[];
+}
+
+/**
+ * 완료된 개요의 시간 분포를 buckets 개 막대 히스토그램으로 조회합니다.
+ * 개요가 없거나(미실행/진행 중) 타임스탬프를 인식하지 못한 파일이면 null.
+ */
+export function getTimeline(
+    id: number,
+    buckets: number,
+): Promise<Timeline | null> {
+    return invoke<Timeline | null>("get_timeline", { id, buckets });
+}
+
 // ===== 줄 북마크 (Phase 15) =====
 
 /** 파일의 한 줄에 붙는 북마크 (Rust BookmarkDto와 1:1, camelCase) */

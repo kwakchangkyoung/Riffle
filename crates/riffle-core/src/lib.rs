@@ -6,6 +6,7 @@ pub mod index;
 pub mod lines;
 pub mod lineset;
 pub mod merge;
+pub mod overview;
 pub mod remote;
 pub mod search;
 pub mod source;
@@ -26,6 +27,7 @@ pub use index::{CHECKPOINT_INTERVAL, IndexProgress, LineIndex};
 pub use lines::{Line, LogFile, MAX_DISPLAY_BYTES, RefreshOutcome};
 pub use lineset::{LineSet, MAX_FILTER_RANGES};
 pub use merge::{MergeIndex, MergeProgress, MergedLine};
+pub use overview::{Overview, POS_BINS, SecBucket, TimeBucket, Timeline, compute_overview};
 pub use remote::RandomRead;
 pub use search::{
     MAX_RESULTS, Matcher, SearchOptions, SearchOutcome, SearchProgress, filter_lines_range,

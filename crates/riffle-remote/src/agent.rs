@@ -30,7 +30,8 @@ use crate::pool::SftpPool;
 /// 들어가므로 버전을 올리면 원격에 새 파일이 설치된다.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 지원하는 프로토콜 버전.
-const AGENT_PROTOCOL: u64 = 1;
+/// 2: overview op 추가.
+const AGENT_PROTOCOL: u64 = 2;
 /// 원격 홈 디렉터리 아래 에이전트 설치 위치.
 const REMOTE_AGENT_DIR: &str = ".cache/riffle";
 /// `Transport::Command`(로컬 테스트) 경로에서 쓰는 아키텍처 이름.
@@ -62,6 +63,8 @@ pub enum AgentEvent {
     Ranges(Vec<(u64, u64)>),
     /// 작업 완료. capped=true 이면 상한에 걸려 일부만 반환된 것.
     Done { total: u64, capped: bool },
+    /// overview 진행률 (0.0~1.0).
+    Fraction(f64),
     /// cancel 요청에 의해 중단됨.
     Cancelled,
     /// 에이전트 측 오류 (해당 작업만 실패).
@@ -365,6 +368,54 @@ impl AgentSession {
         result
     }
 
+    /// 개요 스캔을 에이전트에서 실행한다.
+    /// `local_offset_minutes` 는 시간대 없는 타임스탬프 해석에 쓴다.
+    /// 반환: Ok(Some(개요)) 완료, Ok(None) 취소.
+    /// 진행률은 `AgentEvent::Fraction` 으로 `on` 에 전달한다.
+    pub fn overview(
+        &self,
+        local_offset_minutes: i32,
+        cancel: &AtomicBool,
+        on: &mut dyn FnMut(AgentEvent),
+    ) -> Result<Option<riffle_core::Overview>, RemoteError> {
+        let (id, rx) = self.request(json!({
+            "op": "overview",
+            "localOffsetMinutes": local_offset_minutes,
+        }))?;
+        let mut cancel_sent = cancel.load(Ordering::Relaxed);
+        if cancel_sent {
+            self.send_cancel(id);
+        }
+        let result = loop {
+            match rx.recv_timeout(POLL_INTERVAL) {
+                Ok(v) => {
+                    if let Some(p) = v.get("progress") {
+                        let frac = p.get("fraction").and_then(Value::as_f64).unwrap_or(0.0);
+                        on(AgentEvent::Fraction(frac));
+                    } else if let Some(o) = v.get("overview") {
+                        break parse_overview(o).map(Some);
+                    } else if v.get("cancelled").is_some() {
+                        on(AgentEvent::Cancelled);
+                        break Ok(None);
+                    } else if let Some(e) = v.get("error") {
+                        let m = err_msg(e);
+                        on(AgentEvent::Error(m.clone()));
+                        break Err(RemoteError::Agent(m));
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if !cancel_sent && cancel.load(Ordering::Relaxed) {
+                        cancel_sent = true;
+                        self.send_cancel(id);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break Err(self.dead_err()),
+            }
+        };
+        self.finish(id);
+        result
+    }
+
     /// 스트리밍 작업(search/filter)의 이벤트를 받아 `on` 에 전달한다.
     /// 50ms 마다 `cancel` 을 확인해 한 번만 cancel 요청을 보낸다.
     fn stream_job(
@@ -427,6 +478,43 @@ fn u64_field(v: &Value, key: &str) -> u64 {
 
 fn err_msg(e: &Value) -> String {
     e.as_str().unwrap_or("알 수 없는 에이전트 오류").to_string()
+}
+
+/// 에이전트의 overview 응답 JSON 을 코어 Overview 로 변환한다.
+fn parse_overview(v: &Value) -> Result<riffle_core::Overview, RemoteError> {
+    let bad = || RemoteError::Agent(format!("overview 응답 형식 오류: {v}"));
+    let u32_vec = |key: &str| -> Result<Vec<u32>, RemoteError> {
+        let arr = v.get(key).and_then(Value::as_array).ok_or_else(bad)?;
+        arr.iter()
+            .map(|x| x.as_u64().map(|n| n as u32).ok_or_else(bad))
+            .collect()
+    };
+    let seconds = v
+        .get("seconds")
+        .and_then(Value::as_array)
+        .ok_or_else(bad)?
+        .iter()
+        .map(|b| {
+            Ok(riffle_core::SecBucket {
+                sec: b.get("sec").and_then(Value::as_i64).ok_or_else(bad)?,
+                total: b.get("total").and_then(Value::as_u64).ok_or_else(bad)? as u32,
+                error: b.get("error").and_then(Value::as_u64).ok_or_else(bad)? as u32,
+                warn: b.get("warn").and_then(Value::as_u64).ok_or_else(bad)? as u32,
+                first_line: b.get("firstLine").and_then(Value::as_u64).ok_or_else(bad)?,
+            })
+        })
+        .collect::<Result<Vec<_>, RemoteError>>()?;
+    Ok(riffle_core::Overview {
+        line_count: u64_field(v, "lineCount"),
+        pos_error: u32_vec("posError")?,
+        pos_warn: u32_vec("posWarn")?,
+        // 구형 응답에는 없을 수 있으므로 초 단위(1)가 기본값
+        granularity_secs: v
+            .get("granularitySecs")
+            .and_then(Value::as_i64)
+            .unwrap_or(1),
+        seconds,
+    })
 }
 
 fn u64_vec(v: &Value) -> Vec<u64> {
@@ -976,6 +1064,63 @@ mod tests {
         let warn_lines: u64 = (0..60_000u64).filter(|i| i % 7 == 0).count() as u64;
         let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
         assert_eq!(total, warn_lines);
+    }
+
+    #[test]
+    fn test_spawn_local_overview() {
+        // 에이전트 overview 결과가 같은 상한으로 묶은 로컬 compute_overview 와 같아야 한다.
+        let dir = tempdir("ovw");
+        let file = dir.join("app.log");
+        gen_log(&file, 80_000);
+        let cancel = AtomicBool::new(false);
+        let session = AgentSession::spawn_local(&agent_bin(), &file).expect("세션 실패");
+
+        // 에이전트 인덱싱 → 로컬 인덱스 채택 후 비교
+        let (total, lines, cps) = session.index(&mut |_| {}).expect("index 실패");
+        let local = LogFile::open(&file).unwrap();
+        local
+            .adopt_index(LineIndex::from_checkpoints(total, lines, cps))
+            .expect("adopt_index 실패");
+
+        let mut saw_progress = false;
+        let remote = session
+            .overview(0, &cancel, &mut |e| {
+                if let AgentEvent::Fraction(f) = e {
+                    assert!((0.0..=1.0).contains(&f));
+                    saw_progress = true;
+                }
+            })
+            .expect("에이전트 개요 실패")
+            .expect("취소 아님");
+
+        let ctx = riffle_core::TsContext {
+            local_offset_minutes: 0,
+            default_year: 2026,
+        };
+        // 에이전트는 시간 버킷을 50,000개 이하로 묶어 보낸다
+        let want = riffle_core::compute_overview(&local, &ctx, &cancel, &mut |_| {})
+            .expect("로컬 개요 실패")
+            .expect("취소 아님")
+            .coarsen(50_000);
+        assert_eq!(remote, want);
+        let _ = saw_progress; // 진행률은 파일 크기에 따라 0회일 수도 있다
+
+        // 시작 전 취소 → Ok(None)
+        let cancel = AtomicBool::new(true);
+        let mut saw_cancelled = false;
+        let r = session
+            .overview(0, &cancel, &mut |e| {
+                if let AgentEvent::Cancelled = e {
+                    saw_cancelled = true;
+                }
+            })
+            .expect("개요 실패");
+        // 경쟁 조건: 아주 빠르면 취소 전에 끝날 수 있다
+        if let Some(ov) = r {
+            eprintln!("참고: 취소 전에 개요가 끝났습니다 ({}줄)", ov.line_count);
+        } else {
+            assert!(saw_cancelled);
+        }
     }
 
     #[test]

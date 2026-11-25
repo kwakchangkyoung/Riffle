@@ -377,7 +377,11 @@ mod tests {
 
     impl TempFile {
         fn create(content: &[u8]) -> Self {
-            let path = crate::testutil::temp_log_path("tail_test");
+            // 공유 임시 폴더(T)는 다른 프로세스의 쓰기가 많아 디렉터리 감시 등록·이벤트가
+            // 늦어질 수 있으므로, 테스트마다 비어 있는 전용 하위 폴더를 감시하게 한다
+            let dir = crate::testutil::temp_log_path("tail_test").with_extension("d");
+            std::fs::create_dir_all(&dir).expect("임시 폴더 생성 실패");
+            let path = dir.join("tail.log");
             let mut file = std::fs::File::create(&path).expect("임시 파일 생성 실패");
             file.write_all(content).expect("임시 파일 쓰기 실패");
             file.sync_all().expect("임시 파일 플러시 실패");
@@ -391,7 +395,9 @@ mod tests {
 
     impl Drop for TempFile {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
         }
     }
 
@@ -459,7 +465,7 @@ mod tests {
 
         append_line(&temp.path, "line2");
 
-        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+        let found = wait_for_event(&events, Duration::from_secs(15), |e| {
             matches!(e, TailEvent::Appended { .. })
         });
         assert!(found, "Appended 이벤트가 도착해야 함");
@@ -514,7 +520,7 @@ mod tests {
         let moved = temp.path.with_extension("moved");
         std::fs::rename(&temp.path, &moved).expect("rename 실패");
 
-        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+        let found = wait_for_event(&events, Duration::from_secs(15), |e| {
             matches!(e, TailEvent::Rotated { .. })
         });
         assert!(found, "Rotated 이벤트가 도착해야 함");
@@ -568,7 +574,7 @@ mod tests {
             .expect("truncate 열기 실패");
         f.set_len(4).expect("truncate 실패"); // "line" 만 남김
 
-        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+        let found = wait_for_event(&events, Duration::from_secs(15), |e| {
             matches!(e, TailEvent::Rotated { .. })
         });
         assert!(found, "Rotated 이벤트가 도착해야 함");
@@ -699,7 +705,7 @@ mod tests {
         append_line(&temp.path, "ERROR new");
 
         // Appended 이벤트의 filter_count가 갱신된 필터 줄 수여야 한다
-        let found = wait_for_event(&events, Duration::from_secs(5), |e| {
+        let found = wait_for_event(&events, Duration::from_secs(15), |e| {
             matches!(
                 e,
                 TailEvent::Appended {

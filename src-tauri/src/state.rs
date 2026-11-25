@@ -162,6 +162,17 @@ impl FilterState {
 /// 활성 필터 상태 맵 (tail 스레드와 공유하므로 Arc)
 pub type FilterMap = Arc<Mutex<HashMap<u32, Arc<FilterState>>>>;
 
+/// 파일 하나의 개요 스캔 작업 상태 (파일당 최대 하나, 맵 키가 파일 ID).
+/// 완료된 개요는 result 에 보관해 get_timeline 이 재사용한다.
+pub struct OverviewJob {
+    /// 대상 파일 ID
+    pub file_id: u32,
+    /// 스캔 취소 플래그
+    pub cancel: Arc<AtomicBool>,
+    /// 완료된 개요 결과 (진행 중/취소/실패면 None)
+    pub result: Mutex<Option<Arc<riffle_core::Overview>>>,
+}
+
 /// 애플리케이션 전역 상태.
 /// 열린 파일 목록과 파일 ID 발급 카운터, 검색 상태 목록을 관리한다.
 pub struct AppState {
@@ -171,6 +182,8 @@ pub struct AppState {
     pub searches: Mutex<HashMap<u32, Arc<SearchState>>>,
     /// ID별 활성 필터 상태 맵 (tail 스레드와 공유)
     pub filters: FilterMap,
+    /// 파일 ID별 개요 스캔 작업 맵 (파일당 최대 하나)
+    pub overviews: Mutex<HashMap<u32, Arc<OverviewJob>>>,
     /// ID별 진행 중인 원격 목록 스트리밍의 취소 플래그 맵.
     /// 작업이 끝나면 스레드가 스스로 항목을 제거한다.
     pub listings: Mutex<HashMap<u32, Arc<AtomicBool>>>,
@@ -218,6 +231,7 @@ impl Default for AppState {
             files: Mutex::new(HashMap::new()),
             searches: Mutex::new(HashMap::new()),
             filters: FilterMap::default(),
+            overviews: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
             next_listing_id: AtomicU32::new(1),
             next_id: AtomicU32::new(1),
@@ -392,6 +406,17 @@ impl AppState {
                 true
             }
         });
+        drop(filters);
+
+        // 4. 해당 파일의 개요 작업도 취소하고 저장된 결과를 제거한다
+        if let Some(job) = self
+            .overviews
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id)
+        {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 현재 열려 있는 파일 수를 반환한다.
@@ -531,6 +556,53 @@ impl AppState {
         let filters = self.filters.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(f) = filters.get(&filter_id) {
             f.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 파일의 개요 스캔 작업을 등록한다.
+    /// 대상 파일이 아직 열려 있어야 하며, 같은 파일의 이전 작업은
+    /// 취소하고 맵에서 제거한다. 파일이 없으면 Err를 반환한다.
+    pub fn insert_overview(&self, file_id: u32) -> Result<Arc<OverviewJob>, String> {
+        {
+            let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+            if !files.contains_key(&file_id) {
+                return Err(format!(
+                    "ID {file_id}에 해당하는 열린 파일을 찾을 수 없습니다."
+                ));
+            }
+        }
+
+        let mut overviews = self.overviews.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = overviews.remove(&file_id) {
+            old.cancel.store(true, Ordering::Relaxed);
+        }
+        let job = Arc::new(OverviewJob {
+            file_id,
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: Mutex::new(None),
+        });
+        overviews.insert(file_id, job.clone());
+        Ok(job)
+    }
+
+    /// 파일의 개요 작업 상태를 반환한다 (없으면 None).
+    pub fn get_overview(&self, file_id: u32) -> Option<Arc<OverviewJob>> {
+        self.overviews
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&file_id)
+            .cloned()
+    }
+
+    /// 파일의 진행 중인 개요 작업을 취소한다 (이미 끝났거나 없으면 아무것도 하지 않는다).
+    pub fn cancel_overview(&self, file_id: u32) {
+        if let Some(job) = self
+            .overviews
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&file_id)
+        {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 

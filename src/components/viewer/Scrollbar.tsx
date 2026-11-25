@@ -6,6 +6,10 @@ interface ScrollbarProps {
     visibleRows: number;
     onScroll: (topLine: number) => void;
     densityBins?: number[];
+    /** 개요 스캔의 구간별 ERROR 줄 수 (lineCount 기준 최대 1000 구간) */
+    posError?: number[];
+    /** 개요 스캔의 구간별 WARN 줄 수 */
+    posWarn?: number[];
     /** 북마크 위치 마커 (실제 파일 줄 번호와 색상). 인덱스 기반 보기에서는 전달하지 않는다 */
     bookmarkMarkers?: { line: number; color: string }[];
     onTrackHeightChange?: (height: number) => void;
@@ -23,12 +27,15 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
         visibleRows,
         onScroll,
         densityBins,
+        posError,
+        posWarn,
         bookmarkMarkers,
         onTrackHeightChange,
         onDraggingChange,
     }) => {
         const trackRef = useRef<HTMLDivElement>(null);
         const canvasRef = useRef<HTMLCanvasElement>(null);
+        const errCanvasRef = useRef<HTMLCanvasElement>(null);
         const [isDragging, setIsDragging] = useState(false);
         const dragStartRef = useRef<{ clientY: number; startTopLine: number }>({
             clientY: 0,
@@ -89,6 +96,8 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
             const numBins = densityBins.length;
             const binHeightPx = canvas.height / numBins;
 
+            // 검색 밀도는 트랙 오른쪽 절반에 그린다 (왼쪽은 오류 분포 지도)
+            const dx = Math.floor(canvas.width * 0.45);
             for (let i = 0; i < numBins; i++) {
                 const count = densityBins[i];
                 if (count > 0) {
@@ -100,10 +109,68 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                     ctx.fillStyle = `rgba(245, 158, 11, ${alpha.toFixed(3)})`;
                     const y = Math.floor(i * binHeightPx);
                     const h = Math.max(1, Math.ceil(binHeightPx));
-                    ctx.fillRect(0, y, canvas.width, h);
+                    ctx.fillRect(dx, y, canvas.width - dx, h);
                 }
             }
         }, [densityBins, trackHeight]);
+
+        // 오류 분포 지도 캔버스: 트랙 왼쪽에 구간별 ERROR(빨강)/WARN(주황) 밀도를 그린다.
+        // 구간 수가 트랙 픽셀보다 많으면 픽셀당 합쳐서 그린다.
+        useEffect(() => {
+            const canvas = errCanvasRef.current;
+            if (!canvas) return;
+
+            const errs = posError ?? [];
+            const warns = posWarn ?? [];
+            const numBins = Math.max(errs.length, warns.length);
+            if (numBins === 0 || trackHeight <= 0) {
+                const ctx = canvas.getContext("2d");
+                if (ctx) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                }
+                return;
+            }
+
+            const dpr = window.devicePixelRatio || 1;
+            const width = canvas.clientWidth || 6;
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(trackHeight * dpr);
+
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            let maxCount = 0;
+            for (let i = 0; i < numBins; i++) {
+                maxCount = Math.max(maxCount, errs[i] ?? 0, warns[i] ?? 0);
+            }
+            if (maxCount === 0) return;
+
+            // 로그 스케일 진하기 (최소 0.2, 최대 1.0)
+            const logMax = Math.log1p(maxCount);
+            const alphaOf = (count: number) =>
+                Math.min(1.0, 0.2 + 0.8 * (Math.log1p(count) / logMax));
+
+            const pxRows = canvas.height;
+            const binsPerPx = numBins / pxRows;
+            for (let y = 0; y < pxRows; y++) {
+                const from = Math.floor(y * binsPerPx);
+                const to = Math.max(from + 1, Math.ceil((y + 1) * binsPerPx));
+                let err = 0;
+                let wrn = 0;
+                for (let i = from; i < to && i < numBins; i++) {
+                    err += errs[i] ?? 0;
+                    wrn += warns[i] ?? 0;
+                }
+                if (err > 0) {
+                    ctx.fillStyle = `rgba(239, 68, 68, ${alphaOf(err).toFixed(3)})`;
+                    ctx.fillRect(0, y, canvas.width, 1);
+                } else if (wrn > 0) {
+                    ctx.fillStyle = `rgba(249, 115, 22, ${alphaOf(wrn).toFixed(3)})`;
+                    ctx.fillRect(0, y, canvas.width, 1);
+                }
+            }
+        }, [posError, posWarn, trackHeight]);
 
         // Thumb 높이: max(24px, track * visible / lineCount)
         const thumbHeight =
@@ -234,7 +301,13 @@ export const Scrollbar: React.FC<ScrollbarProps> = React.memo(
                     Math.floor(topLine) + 1,
                 )}
             >
-                {/* 검색 밀도 캔버스 */}
+                {/* 오류 분포 지도 캔버스 (트랙 왼쪽 얇은 열) */}
+                <canvas
+                    ref={errCanvasRef}
+                    className="absolute left-0 top-0 bottom-0 pointer-events-none w-[40%] h-full"
+                />
+
+                {/* 검색 밀도 캔버스 (오른쪽 절반에 그려짐) */}
                 <canvas
                     ref={canvasRef}
                     className="absolute inset-0 pointer-events-none w-full h-full"

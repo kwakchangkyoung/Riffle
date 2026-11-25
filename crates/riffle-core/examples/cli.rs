@@ -23,7 +23,8 @@ fn print_usage() {
         "    cli <파일경로> filter [--or|--and] [--inc PAT]... [--exc PAT]... [--field NAME] [--level error,warn] [--regex] [--search Q]"
     );
     eprintln!("    cli <파일경로> tail");
-    eprintln!("    cli <파일경로> copy <start> <end>\n");
+    eprintln!("    cli <파일경로> copy <start> <end>");
+    eprintln!("    cli <파일경로> overview\n");
     eprintln!("서브커맨드:");
     eprintln!("    stats                인덱싱 실행 후 파일 크기, 줄 수, 소요 시간 출력");
     eprintln!("                          (.gz면 해제+인덱싱 시간, 첫 줄까지 시간, 최대 RSS 출력)");
@@ -44,6 +45,7 @@ fn print_usage() {
         "                       --field NAME은 이후 --inc/--exc 규칙을 그 컬럼 값에만 적용 (컬럼 뷰)"
     );
     eprintln!("    copy <start> <end>   [start, end] 줄 범위 원문을 stdout으로 출력 (0-based)");
+    eprintln!("    overview             개요 스캔: ERROR/WARN 합계, 시간 범위, 상위 막대 출력");
     eprintln!("    cli merge <파일>...  여러 파일을 타임스탬프 기준으로 병합한 뷰 통계 출력");
     eprintln!("                       옵션: --search Q (병합 뷰 기준 검색 결과 수)");
 }
@@ -113,6 +115,7 @@ fn main() {
         }
         "filter" => run_filter(file_path, &args[3..]),
         "tail" => run_tail(file_path),
+        "overview" => run_overview(file_path),
         "copy" => {
             if args.len() < 5 {
                 eprintln!("오류: copy 커맨드에는 start와 end 인자가 필요합니다.");
@@ -1023,5 +1026,91 @@ fn run_merge(args: &[String]) {
     println!(
         "최대 RSS: {:.1} MB",
         rss_peak_kb.load(Ordering::Relaxed) as f64 / 1024.0
+    );
+}
+
+/// overview 서브커맨드: 인덱싱 후 파일을 한 번 스캔해 개요를 만든다.
+/// 소요 시간, 줄 수, ERROR/WARN 합계, 시간 범위, timeline 구간 크기,
+/// total 상위 5개 막대를 출력한다 (대용량 파일 개요 스캔 성능 측정용).
+fn run_overview(path: &Path) {
+    let log_file = Arc::new(LogFile::open(path).unwrap_or_else(|e| {
+        eprintln!("파일 열기 실패 ({}): {}", path.display(), e);
+        process::exit(1);
+    }));
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let lf = Arc::clone(&log_file);
+    let cancel_clone = Arc::clone(&cancel);
+    let t_index = Instant::now();
+    thread::spawn(move || lf.build_index(&cancel_clone, &mut |_| {}))
+        .join()
+        .unwrap_or_else(|_| {
+            eprintln!("인덱싱 스레드 패닉");
+            process::exit(1);
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("인덱싱 오류: {}", e);
+            process::exit(1);
+        });
+    let index_elapsed = t_index.elapsed();
+
+    // 시간대 없는 타임스탬프는 UTC 간주, syslog 연도는 파일 수정 시각 (merge와 같은 규칙)
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ctx = riffle_core::TsContext {
+        local_offset_minutes: 0,
+        default_year: riffle_core::year_of_unix_secs(now_secs),
+    };
+
+    let t0 = Instant::now();
+    let ov = riffle_core::compute_overview(&log_file, &ctx, &cancel, &mut |_| {})
+        .unwrap_or_else(|e| {
+            eprintln!("개요 스캔 오류: {}", e);
+            process::exit(1);
+        })
+        .unwrap_or_else(|| {
+            eprintln!("개요 스캔이 취소되었습니다");
+            process::exit(1);
+        });
+    let scan_elapsed = t0.elapsed();
+
+    let error_total: u64 = ov.pos_error.iter().map(|&v| v as u64).sum();
+    let warn_total: u64 = ov.pos_warn.iter().map(|&v| v as u64).sum();
+
+    println!("파일: {}", path.display());
+    println!("줄 수: {}", ov.line_count);
+    println!("ERROR 합계: {} (WARN 합계: {})", error_total, warn_total);
+    if let (Some(first), Some(last)) = (ov.seconds.first(), ov.seconds.last()) {
+        println!(
+            "시간 범위: {} .. {} (초 버킷 {}개)",
+            first.sec,
+            last.sec,
+            ov.seconds.len()
+        );
+        let tl = ov.timeline(60);
+        println!(
+            "timeline: 구간 {}s, 막대 {}개 (시작 {})",
+            tl.bucket_secs,
+            tl.buckets.len(),
+            tl.start_sec
+        );
+        let mut top: Vec<_> = tl.buckets.iter().collect();
+        top.sort_by_key(|b| std::cmp::Reverse(b.total));
+        println!("상위 {}개 막대:", top.len().min(5));
+        for b in top.iter().take(5) {
+            println!(
+                "    start={} total={} error={} warn={} first_line={}",
+                b.start_sec, b.total, b.error, b.warn, b.first_line
+            );
+        }
+    } else {
+        println!("시간 범위: (타임스탬프 없음)");
+    }
+    println!(
+        "인덱싱 시간: {:.2}s, 개요 스캔 시간: {:.3}s",
+        index_elapsed.as_secs_f64(),
+        scan_elapsed.as_secs_f64()
     );
 }

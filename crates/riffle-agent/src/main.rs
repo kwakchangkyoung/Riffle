@@ -18,13 +18,15 @@ use std::time::{Duration, Instant};
 
 use riffle_core::{
     Combine, FilterRule, FilterSet, FilterSpec, Level, LineSet, LogFile, MAX_FILTER_RANGES,
-    Matcher, RuleKind, SearchOptions, detect_columns, filter_scan, is_gzip, search_filtered,
+    Matcher, RuleKind, SearchOptions, TsContext, compute_overview, detect_columns, filter_scan,
+    is_gzip, search_filtered, year_of_unix_secs,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// 프로토콜 버전. 요청/응답 형식이 바뀌면 올린다.
-const PROTOCOL_VERSION: u64 = 1;
+/// 2: overview op 추가.
+const PROTOCOL_VERSION: u64 = 2;
 /// 검색 결과 한 메시지(`batch`)에 담는 최대 줄 번호 수.
 const SEARCH_BATCH_MAX: usize = 10_000;
 /// 필터 결과 한 메시지(`ranges`)에 담는 최대 구간 수.
@@ -53,6 +55,9 @@ struct Request {
     /// cancel op 의 대상 작업 id
     #[serde(default)]
     target: Option<u64>,
+    /// overview op 의 로컬 시간대 오프셋 (분, UTC+9면 540)
+    #[serde(default, rename = "localOffsetMinutes")]
+    local_offset_minutes: Option<i32>,
 }
 
 /// search 요청의 query 객체. 앱의 QueryDto 와 같은 형식(camelCase).
@@ -268,6 +273,25 @@ fn dispatch<W: Write + Send + 'static>(session: &Arc<Session<W>>, req: Request) 
             let cancel = session.register_job(id);
             let s = session.clone();
             spawn_job(session, move || job_filter(s, id, file, spec, cancel));
+        }
+        "overview" => {
+            let Some(file) = session.file() else {
+                session.send_error(id, "파일이 열려 있지 않습니다");
+                return;
+            };
+            // syslog 연도는 compute_overview 가 파일 수정 시각으로 정한다
+            let ctx = TsContext {
+                local_offset_minutes: req.local_offset_minutes.unwrap_or(0),
+                default_year: year_of_unix_secs(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                ),
+            };
+            let cancel = session.register_job(id);
+            let s = session.clone();
+            spawn_job(session, move || job_overview(s, id, file, ctx, cancel));
         }
         "cancel" => {
             if let Some(target) = req.target
@@ -499,6 +523,56 @@ fn job_filter<W: Write + Send>(
             Err(e) => session.send_error(id, e.to_string()),
         }
     }
+}
+
+/// overview 응답의 시간 버킷 상한. 넘으면 coarsen 으로 묶어 보낸다
+/// (초 단위 수십만 항목이면 한 줄 JSON 이 수십 MB 에 달해 SSH 로 부담이 크다).
+const OVERVIEW_MAX_SECONDS: usize = 50_000;
+
+/// overview 작업: 개요 스캔을 실행하고 진행률 후 Overview 직렬화 결과를 보낸다.
+/// 시간 버킷이 OVERVIEW_MAX_SECONDS 를 넘으면 더 굵은 간격으로 묶어 보낸다.
+fn job_overview<W: Write + Send>(
+    session: Arc<Session<W>>,
+    id: u64,
+    file: Arc<LogFile>,
+    ctx: TsContext,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut last = Instant::now()
+        .checked_sub(PROGRESS_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let result = compute_overview(&file, &ctx, &cancel, &mut |frac| {
+        if last.elapsed() >= PROGRESS_INTERVAL {
+            last = Instant::now();
+            session.send(json!({"id": id, "progress": {"fraction": frac}}));
+        }
+    });
+    session.finish_job(id);
+    match result {
+        Err(e) => session.send_error(id, e.to_string()),
+        Ok(None) => session.send(json!({"id": id, "cancelled": true})),
+        Ok(Some(ov)) => {
+            let ov = ov.coarsen(OVERVIEW_MAX_SECONDS);
+            session.send(json!({"id": id, "overview": overview_json(&ov)}));
+        }
+    }
+}
+
+/// Overview 를 에이전트 응답용 JSON 으로 변환한다 (필드명은 camelCase).
+fn overview_json(ov: &riffle_core::Overview) -> Value {
+    json!({
+        "lineCount": ov.line_count,
+        "posError": ov.pos_error,
+        "posWarn": ov.pos_warn,
+        "granularitySecs": ov.granularity_secs,
+        "seconds": ov.seconds.iter().map(|b| json!({
+            "sec": b.sec,
+            "total": b.total,
+            "error": b.error,
+            "warn": b.warn,
+            "firstLine": b.first_line,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn send_ranges<W: Write + Send>(session: &Session<W>, id: u64, ranges: &[(u64, u64)]) {
@@ -874,6 +948,74 @@ mod tests {
         let (ranges, done) = collect_filter_out(&out);
         assert_eq!(ranges.as_slice(), expected.ranges());
         assert_eq!(done, Some((expected.len(), false)));
+    }
+
+    #[test]
+    fn test_job_overview() {
+        let tmp = TmpFile::new("ovw", &gen_content(4000));
+        let file = Arc::new(LogFile::open(&tmp.path).unwrap());
+        let cancel = AtomicBool::new(false);
+        file.build_index(&cancel, &mut |_| {}).unwrap();
+
+        let ctx = TsContext {
+            local_offset_minutes: 0,
+            default_year: 2026,
+        };
+        let s = test_session();
+        job_overview(
+            s.clone(),
+            12,
+            file.clone(),
+            ctx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let out = out_values(&s);
+        let last = out.last().unwrap();
+        assert_eq!(last["id"], json!(12));
+        let ovj = &last["overview"];
+
+        // 로컬 compute_overview 를 같은 상한으로 묶은 기대값과 비교
+        let local = compute_overview(&file, &ctx, &cancel, &mut |_| {})
+            .unwrap()
+            .expect("취소 아님")
+            .coarsen(OVERVIEW_MAX_SECONDS);
+        assert_eq!(ovj["lineCount"], json!(local.line_count));
+        assert_eq!(ovj["posError"], json!(local.pos_error));
+        assert_eq!(ovj["posWarn"], json!(local.pos_warn));
+        assert_eq!(ovj["granularitySecs"], json!(local.granularity_secs));
+        let secs: Vec<(i64, u64, u64, u64, u64)> = ovj["seconds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["sec"].as_i64().unwrap(),
+                    b["total"].as_u64().unwrap(),
+                    b["error"].as_u64().unwrap(),
+                    b["warn"].as_u64().unwrap(),
+                    b["firstLine"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let want: Vec<(i64, u64, u64, u64, u64)> = local
+            .seconds
+            .iter()
+            .map(|b| {
+                (
+                    b.sec,
+                    b.total as u64,
+                    b.error as u64,
+                    b.warn as u64,
+                    b.first_line,
+                )
+            })
+            .collect();
+        assert_eq!(secs, want);
+
+        // 취소된 개요 → cancelled 응답
+        let s2 = test_session();
+        job_overview(s2.clone(), 13, file, ctx, Arc::new(AtomicBool::new(true)));
+        assert_eq!(out_values(&s2).last().unwrap()["cancelled"], json!(true));
     }
 
     #[test]

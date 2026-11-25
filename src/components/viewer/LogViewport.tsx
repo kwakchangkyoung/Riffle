@@ -204,6 +204,8 @@ interface LogViewportProps {
     syntaxEnabled?: boolean; // 구문 강조 토글 (레벨 배지·줄 레벨 배경·거터 막대도 함께 제어)
     highlightWord?: string | null; // 더블클릭으로 선택된 강조 단어 (탭별 상태)
     onWordHighlight?: (word: string) => void; // 본문 단어 더블클릭 → 단어 강조 설정
+    posError?: number[]; // 개요 스캔 구간별 ERROR 줄 수 (스크롤바 오류 분포 지도)
+    posWarn?: number[]; // 개요 스캔 구간별 WARN 줄 수
 }
 
 /**
@@ -243,6 +245,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
         syntaxEnabled = true,
         highlightWord = null,
         onWordHighlight,
+        posError,
+        posWarn,
     }) => {
         const containerRef = useRef<HTMLDivElement>(null);
         const bodyWrapRef = useRef<HTMLDivElement>(null);
@@ -892,6 +896,8 @@ export const LogViewport: React.FC<LogViewportProps> = React.memo(
                         visibleRows={visibleRows}
                         onScroll={onTopLineChange}
                         densityBins={indexView ? undefined : densityBins}
+                        posError={indexView ? undefined : posError}
+                        posWarn={indexView ? undefined : posWarn}
                         bookmarkMarkers={
                             indexView ? undefined : bookmarkMarkers
                         }

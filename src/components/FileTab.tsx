@@ -8,6 +8,7 @@ import React, {
 import { listen, type Event as TauriEvent } from "@tauri-apps/api/event";
 import {
     cancelFilter,
+    cancelOverview,
     closeFile,
     copyLines,
     detectColumns,
@@ -22,6 +23,7 @@ import {
     setBookmarks as saveBookmarksIpc,
     setTail,
     startFilter,
+    startOverview,
     type Bookmark,
     type Columns,
     type FileInfo,
@@ -44,12 +46,14 @@ import { rowHeightFor } from "@/lib/fontSize";
 import { formatBytes } from "@/lib/format";
 import { DEFAULT_BOOKMARK_COLOR } from "@/lib/bookmarks";
 import { LogViewport } from "@/components/viewer/LogViewport";
+import { TimelinePanel } from "@/components/viewer/Timeline";
 import { FullLinePanel } from "@/components/viewer/FullLinePanel";
 import { BookmarkPanel } from "@/components/bookmarks/BookmarkPanel";
 import { GotoLineDialog } from "@/components/GotoLineDialog";
 import { SearchBar } from "@/components/search/SearchBar";
 import { FilterBar } from "@/components/filter/FilterBar";
 import { pickRuleColor } from "@/lib/ruleColor";
+import type { OverviewInfo } from "@/lib/overviewState";
 import {
     StatusBar,
     type FilterStatusInfo,
@@ -114,6 +118,12 @@ interface FileTabProps {
     fontSize: number;
     /** 구문 강조 전역 설정 (App 상태, 모든 탭 공통) */
     syntaxEnabled: boolean;
+    /** 스크롤바 오류 분포 지도 전역 설정 (App 상태, 모든 탭 공통) */
+    errorMapEnabled: boolean;
+    /** 타임라인 패널 전역 설정 (App 상태, 모든 탭 공통) */
+    timelineOpen: boolean;
+    /** 타임라인 패널 토글 (패널의 닫기 버튼이 호출) */
+    onToggleTimeline: () => void;
     /** 파일 열기 완료 시 FileInfo 보고 (탭 제목/중복 경로 판정용) */
     onFileInfo: (tabId: string, info: FileInfo) => void;
     /** 인덱싱/해제/병합 구축 진행률 보고 (탭 진행률 표시용) */
@@ -141,6 +151,9 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         isActive,
         fontSize,
         syntaxEnabled,
+        errorMapEnabled,
+        timelineOpen,
+        onToggleTimeline,
         onFileInfo,
         onProgress,
         onTailChange,
@@ -218,6 +231,16 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
         const [mergeSourceList, setMergeSourceList] = useState<MergeSource[]>(
             [],
         );
+
+        // 개요 스캔 상태 (Phase 22): 오류 분포 지도·타임라인의 데이터 원천.
+        // 파일 전환 시 초기화되고, tail로 줄이 늘어나도 자동 재계산하지 않는다.
+        const [overview, setOverview] = useState<OverviewInfo | null>(null);
+        // done 이벤트마다 1 증가 — TimelinePanel의 get_timeline 재요청 트리거
+        const [overviewVersion, setOverviewVersion] = useState(0);
+        // 개요 세대 번호: 파일 전환/재시작으로 옛 이벤트를 폐기한다
+        const overviewSeqRef = useRef(0);
+        // 이 파일에서 자동 시작을 이미 했는지 (인덱싱 완료 후 1회만)
+        const overviewStartedRef = useRef(false);
 
         const rowHeight = rowHeightFor(fontSize);
         // 최신 rowHeight를 ref로 유지해 안정적인 콜백(tail 핸들러 등)에서 참조한다
@@ -612,9 +635,10 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 // 같은 경로 재오픈(로테이션)이어도 항목이 유실되지 않게 닫기 전에 보낸다.
                 await flushBookmarks();
 
-                // 이전 파일이 열려있다면 닫기 요청
+                // 이전 파일이 열려있다면 닫기 요청 (진행 중인 개요 스캔도 취소)
                 if (currentFileRef.current) {
                     const prevId = currentFileRef.current.id;
+                    cancelOverview(prevId).catch(() => {});
                     closeFile(prevId).catch((err) => {
                         console.warn("이전 파일 닫기 실패:", err);
                     });
@@ -642,6 +666,11 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 setLineSelection(null);
                 setFullLinePanel(null);
                 setGotoLineOpen(false);
+
+                // 개요 스캔 상태 초기화 (이전 파일의 이벤트는 seq 증가로 폐기)
+                overviewSeqRef.current++;
+                overviewStartedRef.current = false;
+                setOverview(null);
 
                 // 북마크 상태 초기화 (저장된 목록은 파일이 열리면 다시 불러온다)
                 bookmarksDirtyRef.current = false;
@@ -865,6 +894,7 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     ) {
                         saveScrollPos(current.path, topLineRef.current);
                     }
+                    cancelOverview(current.id).catch(() => {});
                     closeFile(current.id).catch((err) => {
                         console.warn("파일 닫기 실패:", err);
                     });
@@ -897,6 +927,70 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 });
             }
         }, [queueTailCommand]);
+
+        // 개요 스캔 시작 (인덱싱 완료 자동 시작·수동 버튼·재계산 공용).
+        // 같은 파일의 이전 작업은 Rust 쪽이 취소하고, 이벤트는 seq로 폐기한다.
+        const startOverviewScan = useCallback(() => {
+            const current = currentFileRef.current;
+            if (current === null || current.source === "merge") return;
+            const fileId = current.id;
+            const seq = ++overviewSeqRef.current;
+            setOverview({ status: "running", fraction: 0 });
+            startOverview(fileId, (ev) => {
+                if (overviewSeqRef.current !== seq) return;
+                if (ev.kind === "progress") {
+                    setOverview({
+                        status: "running",
+                        fraction: ev.fraction,
+                    });
+                } else if (ev.kind === "done") {
+                    setOverview({
+                        status: "done",
+                        lineCount: ev.lineCount,
+                        posError: ev.posError,
+                        posWarn: ev.posWarn,
+                        hasTime: ev.hasTime,
+                        errorTotal: ev.errorTotal,
+                        warnTotal: ev.warnTotal,
+                    });
+                    setOverviewVersion((v) => v + 1);
+                } else if (ev.kind === "error") {
+                    setOverview({
+                        status: "error",
+                        message: ev.message,
+                    });
+                }
+                // cancelled: 파일 전환/재시작으로 이미 seq가 바뀐 뒤라 여기 도달하지 않는다
+            }).catch((err) => {
+                if (overviewSeqRef.current !== seq) return;
+                setOverview({
+                    status: "error",
+                    message:
+                        typeof err === "string"
+                            ? err
+                            : "개요 계산에 실패했습니다",
+                });
+            });
+        }, []);
+
+        // 개요 스캔 자동 시작: 로컬·gz·에이전트 원격은 인덱싱 완료 직후 1회.
+        // 에이전트 없는 원격(sftp 직접/s3)은 전체 다운로드가 필요해 수동 시작만.
+        // 병합 탭과 tail로 늘어난 줄 수에는 자동 재계산하지 않는다.
+        useEffect(() => {
+            if (file === null || file.source === "merge") return;
+            if (indexProgress?.done !== true) return;
+            if (file.remote && !file.agent) return;
+            if (overviewStartedRef.current) return;
+            overviewStartedRef.current = true;
+            startOverviewScan();
+        }, [file, indexProgress?.done, startOverviewScan]);
+
+        // 수동 시작이 필요한 파일 (에이전트 없는 원격) — 상태바/타임라인의 버튼 표시용
+        const overviewNeedsManual =
+            file !== null &&
+            file.source !== "merge" &&
+            file.remote &&
+            !file.agent;
 
         // 검색 밀도 요청 (최대 4회/초 스로틀)
         const requestDensityFetch = useCallback(
@@ -2393,6 +2487,26 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                     />
                 )}
 
+                {/* 타임라인 패널: 본문 위 접이식 시간대 히스토그램 (병합 탭 제외) */}
+                {file !== null && timelineOpen && !isMergeView && (
+                    <TimelinePanel
+                        fileId={file.id}
+                        overview={overview}
+                        overviewVersion={overviewVersion}
+                        lineCount={lineCount}
+                        topActualLine={
+                            actualTopLine !== null
+                                ? actualTopLine - 1
+                                : Math.floor(topLine)
+                        }
+                        needsManualStart={overviewNeedsManual}
+                        onNavigate={handleGotoNavigate}
+                        onRecompute={startOverviewScan}
+                        onStartOverview={startOverviewScan}
+                        onClose={onToggleTimeline}
+                    />
+                )}
+
                 {/* 병합 원본 범례: 원본별 색·이름·줄 수.
                     클릭하면 해당 원본 탭으로 이동한다 (원본 숨기기는 지원하지 않음) */}
                 {isMergeView && mergeSourceList.length > 0 && (
@@ -2488,7 +2602,11 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                 {/* 느린 열기 안내 바: 열기가 제한 시간을 넘기면 재시도를 제안한다 */}
                 {openSlow && (
                     <div className="px-4 py-2 bg-zinc-50 text-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300 text-xs flex items-center justify-between border-b border-zinc-200 dark:border-zinc-700">
-                        <span>파일을 여는 데 시간이 오래 걸립니다</span>
+                        <span>
+                            파일을 여는 데 시간이 오래 걸립니다. macOS 파일 접근
+                            권한 확인 창(외장·네트워크 볼륨)이 떠 있는지
+                            확인하세요.
+                        </span>
                         <div className="flex items-center gap-3 ml-4 shrink-0">
                             <button
                                 type="button"
@@ -2561,6 +2679,20 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                                 columnView={columnViewActive}
                                 onFieldFilter={handleFieldFilter}
                                 mergeSources={mergeChips}
+                                posError={
+                                    errorMapEnabled &&
+                                    !isMergeView &&
+                                    overview?.status === "done"
+                                        ? overview.posError
+                                        : undefined
+                                }
+                                posWarn={
+                                    errorMapEnabled &&
+                                    !isMergeView &&
+                                    overview?.status === "done"
+                                        ? overview.posWarn
+                                        : undefined
+                                }
                                 onJumpToSource={
                                     isMergeView ? jumpToSource : undefined
                                 }
@@ -2644,6 +2776,15 @@ export const FileTab: React.FC<FileTabProps> = React.memo(
                         isMergeView
                             ? mergeSourceList.map((s) => s.path)
                             : undefined
+                    }
+                    overviewFraction={
+                        overview?.status === "running"
+                            ? overview.fraction
+                            : null
+                    }
+                    overviewStartable={overviewNeedsManual && overview === null}
+                    onStartOverview={
+                        overviewNeedsManual ? startOverviewScan : undefined
                     }
                 />
 

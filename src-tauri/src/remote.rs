@@ -270,6 +270,24 @@ pub fn agent_search(
         .map_err(|e| e.to_string())
 }
 
+/// 개요 스캔을 에이전트에 위임한다.
+/// 진행률은 0~1 fraction 으로 on_progress 에 전달한다.
+/// Ok(None) 이면 취소, 통신·프로토콜 오류 시 Err — 호출자는 로컬 스캔으로 폴백한다.
+pub fn agent_overview(
+    session: &AgentSession,
+    local_offset_minutes: i32,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Option<riffle_core::Overview>, String> {
+    session
+        .overview(local_offset_minutes, cancel, &mut |e| {
+            if let AgentEvent::Fraction(f) = e {
+                on_progress(f);
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// 필터 스캔을 에이전트에 위임한다.
 /// 보이는 줄 구간은 filter_state.lines 에 누적하고 종료 이벤트는 on_event 로 전달한다.
 /// 통신·프로토콜 오류 시 Err — 호출자는 lines 를 비우고 로컬 스캔으로 폴백한다.

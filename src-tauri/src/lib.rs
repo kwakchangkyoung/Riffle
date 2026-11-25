@@ -6,6 +6,7 @@ pub mod menu;
 pub mod merge;
 #[cfg(target_os = "macos")]
 pub mod opened;
+pub mod overview;
 pub mod presets;
 pub mod recent;
 pub mod remote;
@@ -27,6 +28,7 @@ use commands::{
     validate_filter, validate_query,
 };
 use merge::{merge_position_at_time, merge_sources, open_merge};
+use overview::{cancel_overview, get_timeline, start_overview};
 use remote::{cancel_listing, list_ssh_hosts, remote_home, sftp_list_stream};
 use s3::{
     get_s3_bookmarks, list_aws_profiles, s3_head, s3_list_buckets, s3_list_stream,
@@ -98,7 +100,10 @@ pub fn run() {
             set_bookmarks,
             open_merge,
             merge_position_at_time,
-            merge_sources
+            merge_sources,
+            start_overview,
+            cancel_overview,
+            get_timeline
         ])
         .setup(|app| {
             // 이전 실행이 남긴 gzip 해제 임시 파일을 정리한다 (오류 무시)

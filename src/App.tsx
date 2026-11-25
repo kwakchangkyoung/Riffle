@@ -22,6 +22,12 @@ import {
     saveFontSize,
 } from "@/lib/fontSize";
 import { loadSyntaxEnabled, saveSyntaxEnabled } from "@/lib/syntax";
+import {
+    loadErrorMapEnabled,
+    saveErrorMapEnabled,
+    loadTimelineOpen,
+    saveTimelineOpen,
+} from "@/lib/overview";
 import { FileTab } from "@/components/FileTab";
 import { TabBar, type TabMeta } from "@/components/TabBar";
 import { EmptyState } from "@/components/EmptyState";
@@ -281,6 +287,10 @@ export default function App() {
     // 구문 강조: 모든 탭 공통으로 적용되는 전역 설정 (localStorage 유지)
     const [syntaxEnabled, setSyntaxEnabled] =
         useState<boolean>(loadSyntaxEnabled);
+    // 스크롤바 오류 분포 지도·타임라인 패널: 전역 설정 (구문 강조와 독립)
+    const [errorMapEnabled, setErrorMapEnabled] =
+        useState<boolean>(loadErrorMapEnabled);
+    const [timelineOpen, setTimelineOpen] = useState<boolean>(loadTimelineOpen);
     const [isDragOver, setIsDragOver] = useState(false);
     const [recentFiles, setRecentFiles] = useState<string[]>([]);
     // 원격 파일 열기 대화상자 표시 여부
@@ -458,6 +468,22 @@ export default function App() {
                     setSyntaxEnabled((prev) => {
                         const next = !prev;
                         saveSyntaxEnabled(next);
+                        return next;
+                    });
+                    break;
+                case "toggle_errormap":
+                    // 오류 분포 지도 토글: 전역 상태 + localStorage (모든 탭 공통)
+                    setErrorMapEnabled((prev) => {
+                        const next = !prev;
+                        saveErrorMapEnabled(next);
+                        return next;
+                    });
+                    break;
+                case "toggle_timeline":
+                    // 타임라인 패널 토글: 전역 상태 + localStorage (모든 탭 공통)
+                    setTimelineOpen((prev) => {
+                        const next = !prev;
+                        saveTimelineOpen(next);
                         return next;
                     });
                     break;
@@ -700,6 +726,15 @@ export default function App() {
                         isActive={tab.id === activeTabId}
                         fontSize={fontSize}
                         syntaxEnabled={syntaxEnabled}
+                        errorMapEnabled={errorMapEnabled}
+                        timelineOpen={timelineOpen}
+                        onToggleTimeline={() =>
+                            setTimelineOpen((prev) => {
+                                const next = !prev;
+                                saveTimelineOpen(next);
+                                return next;
+                            })
+                        }
                         onFileInfo={handleTabFileInfo}
                         onProgress={handleTabProgress}
                         onTailChange={handleTabTailChange}
